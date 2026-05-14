@@ -93,18 +93,26 @@ async def fetch_dictionary(code: int) -> dict[str, Any]:
     Returns:
         Словарь с ответом API
     """
-    url = f"{GIBDD_BASE_URL}/opendataapi/v1/dictionary/rows"
-    proxy = _get_proxy_config()
+    try:
+        url = f"{GIBDD_BASE_URL}/opendataapi/v1/dictionary/rows"
+        proxy = _get_proxy_config()
 
-    params = {"code": str(code)}
-    logger.info(f"Запрос справочника: code={code}")
+        params = {"code": str(code)}
+        logger.info(f"Запрос справочника: code={code}")
 
-    async with httpx.AsyncClient(proxy=proxy, timeout=TARGET_API_TIMEOUT, verify=False) as client:
-        response = await client.get(url, params=params)
-        response.raise_for_status()
-
-    return response.json()
-
+        async with httpx.AsyncClient(proxy=proxy, timeout=TARGET_API_TIMEOUT, verify=False) as client:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Ошибка HTTP {e.response.status_code}")
+        return None
+    except httpx.RequestError as e:
+        logger.error(f"Ошибка запроса: {type(e).__name__}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка: {type(e).__name__}: {e}")
+        return None
 
 async def fetch_regions() -> list[dict[str, str]]:
     """Получает справочник регионов (code=1). Возвращает список {code, name}."""
@@ -161,11 +169,4 @@ def extract_accident_cards(api_response: dict) -> list[dict[str, Any]]:
     except (KeyError, TypeError, AttributeError) as e:
         logger.error(f"Ошибка парсинга структуры ответа API: {e}")
         raise ValueError(f"Неожиданная структура ответа API: {e}")
-    except httpx.HTTPStatusError as e:
-    logger.error(f"Ошибка HTTP {e.response.status_code}: {e.response.text[:200]}")
-    except httpx.RequestError as e:
-    logger.error(f"Ошибка запроса: {type(e).__name__}: {e}")
-    except Exception as e:
-    logger.error(f"Ошибка: {type(e).__name__}: {e}")
-    logger.info(f"Извлечено {len(cards)} карточек ДТП")
     return cards
