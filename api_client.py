@@ -161,6 +161,11 @@ def extract_accident_cards(api_response: dict) -> list[dict[str, Any]]:
     except (KeyError, TypeError, AttributeError) as e:
         logger.error(f"Ошибка парсинга структуры ответа API: {e}")
         raise ValueError(f"Неожиданная структура ответа API: {e}")
-
+    except httpx.HTTPStatusError as e:
+    logger.error(f"Ошибка HTTP {e.response.status_code}: {e.response.text[:200]}")
+    except httpx.RequestError as e:
+    logger.error(f"Ошибка запроса: {type(e).__name__}: {e}")
+    except Exception as e:
+    logger.error(f"Ошибка: {type(e).__name__}: {e}")
     logger.info(f"Извлечено {len(cards)} карточек ДТП")
     return cards
