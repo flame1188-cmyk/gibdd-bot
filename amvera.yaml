@@ -3,9 +3,11 @@ meta:
   toolchain:
     name: pip
     version: "3.11"
-
 build:
-  builder: "python:3.11"
-
+  builder: python:3.11
+  requirementsPath: requirements.txt
 run:
-  command: "python bot.py"
+  command: python bot.py
+  persistenceMount: /data
+  containerPort: "80"
+  servicePort: "80"
