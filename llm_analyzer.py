@@ -9,6 +9,7 @@
   2. Ответы на вопросы пользователя по данным
 """
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -237,20 +238,23 @@ def build_question_prompt(
 async def ask_llm(
     user_message: str,
     system_prompt: str | None = None,
+    max_retries: int = 3,
 ) -> str:
     """
     Отправляет запрос к GLM API и возвращает текстовый ответ.
+    При 429 (Too Many Requests) автоматически повторяет с задержкой.
 
     Args:
         user_message: Текст запроса пользователя
         system_prompt: Системный промпт (если None — используется стандартный)
+        max_retries: Максимальное число повторных попыток при 429
 
     Returns:
         Текст ответа от модели
 
     Raises:
         ValueError: если LLM_API_KEY не задан
-        httpx.HTTPStatusError: при ошибке HTTP
+        httpx.HTTPStatusError: при ошибке HTTP (кроме 429 после всех попыток)
     """
     if not LLM_API_KEY:
         raise ValueError(
@@ -271,18 +275,52 @@ async def ask_llm(
         "max_tokens": 2000,
     }
 
+    headers = {
+        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
     logger.info(f"LLM запрос: модель={LLM_MODEL}, длина промпта={len(user_message)} символов")
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        response = await client.post(
-            ZHIPU_API_URL,
-            headers={
-                "Authorization": f"Bearer {LLM_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-        response.raise_for_status()
+    retry_delays = [10, 25, 45]  # секунды между попытками
+
+    for attempt in range(max_retries + 1):
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                response = await client.post(
+                    ZHIPU_API_URL,
+                    headers=headers,
+                    json=payload,
+                )
+
+            if response.status_code == 429:
+                if attempt < max_retries:
+                    wait = retry_delays[attempt]
+                    logger.warning(
+                        f"LLM 429 Too Many Requests. "
+                        f"Попытка {attempt + 1}/{max_retries}, "
+                        f"ожидание {wait} сек..."
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                else:
+                    raise httpx.HTTPStatusError(
+                        "Превышен лимит запросов к API. Подождите 1-2 минуты и попробуйте снова.",
+                        request=response.request,
+                        response=response,
+                    )
+
+            response.raise_for_status()
+
+        except httpx.HTTPStatusError:
+            raise
+        except httpx.TimeoutException:
+            if attempt < max_retries:
+                wait = 10
+                logger.warning(f"LLM таймаут. Попытка {attempt + 1}, ожидание {wait} сек...")
+                await asyncio.sleep(wait)
+                continue
+            raise
 
     data = response.json()
 

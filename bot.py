@@ -31,6 +31,7 @@ def _patched_async_client_init(self, *args, **kwargs):
 httpx.AsyncClient.__init__ = _patched_async_client_init
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Conflict, NetworkError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -1166,7 +1167,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ========================
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(f"Ошибка: {context.error}", exc_info=context.error)
+    error = context.error
+
+    if isinstance(error, Conflict):
+        logger.warning(
+            "Conflict: обнаружен другой экземпляр бота. "
+            "Если это произошло при деплое — старый инстанс ещё остановлен. "
+            "Подождите, конфликт разрешится автоматически."
+        )
+        return
+
+    if isinstance(error, NetworkError):
+        logger.warning(f"Сетевая ошибка (временная): {error}")
+        return
+
+    logger.error(f"Ошибка: {error}", exc_info=error)
 
 
 # ========================
