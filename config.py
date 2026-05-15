@@ -43,7 +43,7 @@ HTTPS_PROXY: str = os.getenv("HTTPS_PROXY", "")
 LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
 
 # Модель LLM (по умолчанию glm-5v-turbo)
-LLM_MODEL: str = os.getenv("LLM_MODEL", "glm-5v-turbo")
+LLM_MODEL: str = os.getenv("LLM_MODEL", "GLM-4.7-Flash")
 
 
 # ========================
