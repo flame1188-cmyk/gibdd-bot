@@ -1,0 +1,331 @@
+"""
+Модуль интеграции с LLM (GLM) для текстового анализа данных ДТП.
+
+Использует ZhipuAI API (https://open.bigmodel.cn) напрямую через httpx.
+Никаких дополнительных зависимостей не требуется.
+
+Функционал:
+  1. Генерация аналитического резюме по метрикам ДТП
+  2. Ответы на вопросы пользователя по данным
+"""
+
+import json
+import logging
+from typing import Any
+
+import httpx
+
+from config import LLM_API_KEY, LLM_MODEL
+
+logger = logging.getLogger(__name__)
+
+ZHIPU_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+
+# ============================================================
+# Системный промпт — определяет роль нейросети
+# ============================================================
+
+SYSTEM_PROMPT = (
+    "Ты — эксперт-аналитик в области безопасности дорожного движения "
+    "с 15-летним опытом работы в ГИБДД и МВД России. "
+    "Твоя специализация — статистический анализ ДТП, выявление тенденций "
+    "и разработка рекомендаций по повышению безопасности.\n\n"
+    "Правила:\n"
+    "1. Опирайся ТОЛЬКО на предоставленные цифры — не выдумывай данные\n"
+    "2. Указывай конкретные цифры и проценты из данных\n"
+    "3. Выделяй ключевые тенденции (рост/снижение) и их масштаб\n"
+    "4. Предлагай возможные причины выявленных изменений\n"
+    "5. Давай конкретные рекомендации по повышению безопасности\n"
+    "6. Пиши на русском языке, профессиональным но понятным стилем\n"
+    "7. Структурируй ответ: выводы, причины, рекомендации\n"
+    "8. Если данных недостаточно для вывода — так и скажи\n"
+    "9. Не используй эмодзи и markdown-форматирование\n"
+    "10. Объём ответа: 3-5 абзацев для резюме, 2-4 абзаца для ответа на вопрос"
+)
+
+
+# ============================================================
+# Форматирование данных для промпта
+# ============================================================
+
+def _format_number(val: Any) -> str:
+    """Форматирует число с разделителями разрядов."""
+    if isinstance(val, float):
+        return f"{val:.1f}"
+    if isinstance(val, int):
+        return f"{val:,}".replace(",", " ")
+    return str(val)
+
+
+def _format_change(change: float) -> str:
+    """Форматирует изменение со знаком."""
+    if change > 0:
+        return f"+{change:.1f}%"
+    elif change < 0:
+        return f"{change:.1f}%"
+    return "0%"
+
+
+def format_metrics_for_prompt(
+    comparison: dict[str, Any],
+    reg_name: str,
+    current_label: str,
+    prev_label: str,
+) -> str:
+    """
+    Форматирует результаты сравнения в текст для промпта LLM.
+    """
+    lines = []
+    lines.append(f"Регион: {reg_name}")
+    lines.append(f"Текущий период: {current_label}")
+    lines.append(f"Предыдущий период: {prev_label}")
+    lines.append("")
+
+    # Основные показатели
+    lines.append("ОСНОВНЫЕ ПОКАЗАТЕЛИ:")
+
+    metrics_info = [
+        ("Всего ДТП", comparison["total"]),
+        ("Погибло, чел.", comparison["deaths"]),
+        ("Ранено, чел.", comparison["injured"]),
+        ("ДТП с нетрезвыми водителями", comparison["alcohol"]),
+        ("ДТП с пешеходами", comparison["pedestrians"]),
+        ("Погибло на 100 ДТП", comparison["deaths_per_100"]),
+        ("Ранено на 100 ДТП", comparison["injured_per_100"]),
+    ]
+
+    for label, m in metrics_info:
+        change = _format_change(m["change"])
+        lines.append(
+            f"- {label}: {_format_number(m['current'])} "
+            f"(было {_format_number(m['previous'])}, изменение {change})"
+        )
+
+    lines.append("")
+
+    # По дням недели
+    lines.append("РАСПРЕДЕЛЕНИЕ ПО ДНЯМ НЕДЕЛИ:")
+    cur_wd = comparison["by_weekday"]["current"]
+    prev_wd = comparison["by_weekday"]["previous"]
+
+    day_names = [
+        "Понедельник", "Вторник", "Среда", "Четверг",
+        "Пятница", "Суббота", "Воскресенье",
+    ]
+
+    for day_num in range(7):
+        cur = cur_wd.get(day_num, 0)
+        prv = prev_wd.get(day_num, 0)
+        if prv > 0:
+            change = round((cur - prv) / prv * 100, 1)
+            lines.append(f"- {day_names[day_num]}: {cur} (было {prv}, {_format_change(change)})")
+        else:
+            lines.append(f"- {day_names[day_num]}: {cur}")
+
+    lines.append("")
+
+    # По часам
+    lines.append("РАСПРЕДЕЛЕНИЕ ПО ЧАСАМ СУТОК (интервалы по 3 часа):")
+    cur_hour = comparison["by_hour"]["current"]
+    prev_hour = comparison["by_hour"]["previous"]
+
+    for interval_start in range(0, 24, 3):
+        interval_end = interval_start + 2
+        interval_label = f"{interval_start:02d}:00-{interval_end:02d}:59"
+        cur = sum(cur_hour.get(h, 0) for h in range(interval_start, interval_start + 3))
+        prv = sum(prev_hour.get(h, 0) for h in range(interval_start, interval_start + 3))
+        if prv > 0:
+            change = round((cur - prv) / prv * 100, 1)
+            lines.append(f"- {interval_label}: {cur} (было {prv}, {_format_change(change)})")
+        else:
+            lines.append(f"- {interval_label}: {cur}")
+
+    lines.append("")
+
+    # По видам ДТП
+    lines.append("РАСПРЕДЕЛЕНИЕ ПО ВИДАМ ДТП:")
+    cur_type = comparison["by_type"]["current"]
+    prev_type = comparison["by_type"]["previous"]
+
+    all_types = sorted(
+        set(list(cur_type.keys()) + list(prev_type.keys())),
+        key=lambda x: cur_type.get(x, 0) + prev_type.get(x, 0),
+        reverse=True,
+    )
+
+    for tp_name in all_types[:10]:
+        cur = cur_type.get(tp_name, 0)
+        prv = prev_type.get(tp_name, 0)
+        if prv > 0:
+            change = round((cur - prv) / prv * 100, 1)
+            lines.append(f"- {tp_name}: {cur} (было {prv}, {_format_change(change)})")
+        else:
+            lines.append(f"- {tp_name}: {cur}")
+
+    lines.append("")
+
+    # По погоде
+    cur_weather = comparison["by_weather"]["current"]
+    prev_weather = comparison["by_weather"]["previous"]
+
+    if cur_weather or prev_weather:
+        lines.append("РАСПРЕДЕЛЕНИЕ ПО ПОГОДНЫМ УСЛОВИЯМ:")
+        all_w = sorted(
+            set(list(cur_weather.keys()) + list(prev_weather.keys())),
+            key=lambda x: cur_weather.get(x, 0) + prev_weather.get(x, 0),
+            reverse=True,
+        )
+        for w_name in all_w[:8]:
+            cur = cur_weather.get(w_name, 0)
+            prv = prev_weather.get(w_name, 0)
+            if prv > 0:
+                change = round((cur - prv) / prv * 100, 1)
+                lines.append(f"- {w_name}: {cur} (было {prv}, {_format_change(change)})")
+            else:
+                lines.append(f"- {w_name}: {cur}")
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# Построение промптов
+# ============================================================
+
+def build_summary_prompt(
+    comparison: dict[str, Any],
+    reg_name: str,
+    current_label: str,
+    prev_label: str,
+) -> str:
+    """Создаёт промпт для генерации аналитического резюме."""
+    metrics_text = format_metrics_for_prompt(
+        comparison, reg_name, current_label, prev_label,
+    )
+    return (
+        f"{metrics_text}\n\n"
+        f"На основе приведённых данных напиши аналитическое резюме:\n"
+        f"1. Общая оценка динамики аварийности\n"
+        f"2. Ключевые положительные и отрицательные тенденции\n"
+        f"3. Возможные причины изменений\n"
+        f"4. Рекомендации по повышению безопасности дорожного движения"
+    )
+
+
+def build_question_prompt(
+    question: str,
+    comparison: dict[str, Any],
+    reg_name: str,
+    current_label: str,
+    prev_label: str,
+) -> str:
+    """Создаёт промпт для ответа на вопрос пользователя."""
+    metrics_text = format_metrics_for_prompt(
+        comparison, reg_name, current_label, prev_label,
+    )
+    return (
+        f"{metrics_text}\n\n"
+        f"Вопрос пользователя: {question}\n\n"
+        f"Ответь на вопрос, опираясь ТОЛЬКО на приведённые данные. "
+        f"Если данных недостаточно — так и скажи."
+    )
+
+
+# ============================================================
+# Вызов LLM API
+# ============================================================
+
+async def ask_llm(
+    user_message: str,
+    system_prompt: str | None = None,
+) -> str:
+    """
+    Отправляет запрос к GLM API и возвращает текстовый ответ.
+
+    Args:
+        user_message: Текст запроса пользователя
+        system_prompt: Системный промпт (если None — используется стандартный)
+
+    Returns:
+        Текст ответа от модели
+
+    Raises:
+        ValueError: если LLM_API_KEY не задан
+        httpx.HTTPStatusError: при ошибке HTTP
+    """
+    if not LLM_API_KEY:
+        raise ValueError(
+            "LLM_API_KEY не задан. Добавьте его в .env файл. "
+            "Получить ключ: https://open.bigmodel.cn"
+        )
+
+    if system_prompt is None:
+        system_prompt = SYSTEM_PROMPT
+
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 2000,
+    }
+
+    logger.info(f"LLM запрос: модель={LLM_MODEL}, длина промпта={len(user_message)} символов")
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(
+            ZHIPU_API_URL,
+            headers={
+                "Authorization": f"Bearer {LLM_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        response.raise_for_status()
+
+    data = response.json()
+
+    if "choices" not in data or not data["choices"]:
+        raise ValueError(f"Неожиданный ответ API: {json.dumps(data, ensure_ascii=False)[:200]}")
+
+    content = data["choices"][0]["message"]["content"]
+    tokens_used = data.get("usage", {}).get("total_tokens", "?")
+    logger.info(f"LLM ответ: {len(content)} символов, токенов: {tokens_used}")
+
+    return content
+
+
+async def get_ai_summary(
+    comparison: dict[str, Any],
+    reg_name: str,
+    current_label: str,
+    prev_label: str,
+) -> str:
+    """
+    Генерирует аналитическое резюме с помощью LLM.
+
+    Returns:
+        Текст резюме от нейросети
+    """
+    prompt = build_summary_prompt(comparison, reg_name, current_label, prev_label)
+    return await ask_llm(user_message=prompt)
+
+
+async def get_ai_answer(
+    question: str,
+    comparison: dict[str, Any],
+    reg_name: str,
+    current_label: str,
+    prev_label: str,
+) -> str:
+    """
+    Отвечает на вопрос пользователя по данным с помощью LLM.
+
+    Returns:
+        Текст ответа от нейросети
+    """
+    prompt = build_question_prompt(
+        question, comparison, reg_name, current_label, prev_label,
+    )
+    return await ask_llm(user_message=prompt)

@@ -36,6 +36,17 @@ HTTPS_PROXY: str = os.getenv("HTTPS_PROXY", "")
 
 
 # ========================
+# LLM (нейросеть для анализа)
+# ========================
+# API-ключ для ZhipuAI (GLM). Получить: https://open.bigmodel.cn
+# Если не задан — функция "Анализ с ИИ" будет недоступна
+LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
+
+# Модель LLM (по умолчанию glm-5v-turbo)
+LLM_MODEL: str = os.getenv("LLM_MODEL", "glm-5v-turbo")
+
+
+# ========================
 # Логирование
 # ========================
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

@@ -40,7 +40,7 @@ from telegram.ext import (
     filters,
 )
 
-from config import validate_config, ALLOWED_USER_IDS
+from config import validate_config, ALLOWED_USER_IDS, LLM_API_KEY
 from api_client import fetch_dtp_data, fetch_regions, extract_accident_cards
 from gibdd_parser import build_file1_data, build_file2_data
 from excel_generator import generate_both_files, generate_analytics_file
@@ -51,6 +51,7 @@ from analytics import (
     build_analytics_excel_data,
     get_analytics_column_names,
 )
+from llm_analyzer import get_ai_summary, get_ai_answer
 from user_request_parser import (
     parse_user_message,
     parse_period,
@@ -492,9 +493,22 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
             return
 
-        # --- Запрос аналитики ---
+        # --- Запрос аналитики (без ИИ) ---
         if data == "do_analytics":
-            await _run_analysis(update, context)
+            await _run_analysis(update, context, use_llm=False)
+            return
+
+        # --- Запрос аналитики (с ИИ) ---
+        if data == "do_analytics_ai":
+            await _run_analysis(update, context, use_llm=True)
+            return
+
+        # --- Завершить режим вопросов ---
+        if data == "end_qa":
+            _clear_analytics_data(context.user_data)
+            await query.edit_message_text(
+                "Режим вопросов завершён.\n\nОтправьте /dtp для новой выгрузки."
+            )
             return
 
         # --- Отмена ---
@@ -672,8 +686,9 @@ async def _offer_analysis(
     current_cards: list[dict],
 ) -> None:
     """
-    После выгрузки предлагает кнопку для проведения анализа
+    После выгрузки предлагает кнопки для проведения анализа
     (сравнение с аналогичным периодом прошлого года).
+    Два режима: без ИИ и с ИИ (нейросеть GLM).
     """
     prev_year = period.year - 1
     prev_label = period.label.replace(str(period.year), str(prev_year))
@@ -685,34 +700,52 @@ async def _offer_analysis(
     context.user_data["analytics_period"] = period
     context.user_data["analytics_cards"] = current_cards
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            f"\U0001F4CA Провести анализ ({prev_label})",
-            callback_data="do_analytics",
-        )],
-    ])
+    # Формируем кнопки
+    buttons = []
+    buttons.append([InlineKeyboardButton(
+        f"\U0001F4CA Анализ ({prev_label})",
+        callback_data="do_analytics",
+    )])
+
+    if LLM_API_KEY:
+        buttons.append([InlineKeyboardButton(
+            f"\U0001F916 Анализ с ИИ ({prev_label})",
+            callback_data="do_analytics_ai",
+        )])
+
+    keyboard = InlineKeyboardMarkup(buttons)
+
+    if LLM_API_KEY:
+        text = (
+            f"\u2705 Выгрузка завершена: {len(current_cards)} ДТП.\n\n"
+            f"Хотите провести сравнительный анализ с аналогичным периодом {prev_year} года?\n\n"
+            f"\U0001F4CA <b>Без ИИ</b> — математический анализ (таблицы, проценты)\n"
+            f"\U0001F916 <b>С ИИ</b> — анализ + резюме от нейросети"
+        )
+    else:
+        text = (
+            f"\u2705 Выгрузка завершена: {len(current_cards)} ДТП.\n\n"
+            f"Хотите провести сравнительный анализ с аналогичным периодом {prev_year} года?"
+        )
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text=(
-            f"\u2705 Выгрузка завершена: {len(current_cards)} ДТП.\n\n"
-            f"Хотите провести сравнительный анализ с аналогичным периодом {prev_year} года?"
-        ),
+        text=text,
         reply_markup=keyboard,
+        parse_mode="HTML",
     )
 
 
 async def _run_analysis(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
+    use_llm: bool = False,
 ) -> None:
     """
     Выполняет сравнительный анализ текущего периода с прошлым годом.
 
-    1. Берёт карточки текущего периода из user_data
-    2. Запрашивает карточки аналогичного периода прошлого года через API
-    3. Считает метрики и сравнивает
-    4. Отправляет текстовое резюме + Excel-файл аналитики
+    Args:
+        use_llm: Если True — после расчёта метрик запрашивает резюме у GLM
     """
     chat_id = update.effective_chat.id
 
@@ -733,10 +766,12 @@ async def _run_analysis(
     prev_label = period.label.replace(str(period.year), str(prev_year))
     current_label = period.label
 
+    mode_label = "\U0001F916 AI-анализ" if use_llm else "\U0001F4CA Анализ"
+
     status_msg = await context.bot.send_message(
         chat_id=chat_id,
         text=(
-            f"\U0001F4CA Подготовка анализа...\n\n"
+            f"{mode_label}: подготовка...\n\n"
             f"Регион: {reg_name}\n"
             f"Текущий период: {current_label}\n"
             f"Сравнение: {prev_label}\n\n"
@@ -758,7 +793,7 @@ async def _run_analysis(
 
         progress = _make_progress_bar(i, len(dat_list_prev))
         await status_msg.edit_text(
-            f"\U0001F4CA Загрузка данных за {prev_year} год...\n\n"
+            f"{mode_label}: загрузка...\n\n"
             f"{progress} {i}/{len(dat_list_prev)}\n"
             f"Запрос: {month_name} {prev_year}..."
         )
@@ -782,19 +817,32 @@ async def _run_analysis(
         return
 
     # Считаем метрики
-    await status_msg.edit_text("\U0001F4CA Считаю метрики...")
+    await status_msg.edit_text(f"{mode_label}: считаю метрики...")
 
     current_metrics = calculate_metrics(current_cards)
     previous_metrics = calculate_metrics(prev_cards)
     comparison = compare_metrics(current_metrics, previous_metrics)
 
-    # Формируем текстовое сообщение
-    analytics_text = build_analytics_message(
-        comparison=comparison,
-        reg_name=reg_name,
-        current_label=current_label,
-        previous_label=prev_label,
-    )
+    # Сохраняем comparison для возможных вопросов
+    context.user_data["analytics_comparison"] = comparison
+    context.user_data["analytics_current_label"] = current_label
+    context.user_data["analytics_prev_label"] = prev_label
+
+    # --- Генерируем контент ---
+    llm_summary_text = None
+
+    if use_llm and LLM_API_KEY:
+        try:
+            await status_msg.edit_text(f"{mode_label}: нейросеть анализирует данные...")
+            llm_summary_text = await get_ai_summary(
+                comparison=comparison,
+                reg_name=reg_name,
+                current_label=current_label,
+                previous_label=prev_label,
+            )
+        except Exception as e:
+            logger.error(f"Ошибка LLM: {e}")
+            llm_summary_text = None
 
     # Генерируем Excel
     analytics_data = build_analytics_excel_data(
@@ -812,17 +860,50 @@ async def _run_analysis(
     except Exception:
         pass
 
-    # Отправляем текстовое резюме
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=analytics_text,
-        parse_mode="HTML",
-    )
+    # Отправляем результаты
+    if use_llm and llm_summary_text:
+        # Режим с ИИ: сначала LLM-резюме, потом таблица + Excel
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"\U0001F916 <b>Аналитика ИИ: {reg_name}</b>\n"
+                f"{current_label} vs {prev_label}\n\n"
+                f"<i>{llm_summary_text}</i>"
+            ),
+            parse_mode="HTML",
+        )
+        # Также отправляем математический анализ
+        analytics_text = build_analytics_message(
+            comparison=comparison,
+            reg_name=reg_name,
+            current_label=current_label,
+            previous_label=prev_label,
+        )
+        # Отправляем как отдельное сообщение (математика)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"\U0001F4CA <b>Детальные данные:</b>\n\n{analytics_text}",
+            parse_mode="HTML",
+        )
+    else:
+        # Режим без ИИ: только математический анализ
+        analytics_text = build_analytics_message(
+            comparison=comparison,
+            reg_name=reg_name,
+            current_label=current_label,
+            previous_label=prev_label,
+        )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=analytics_text,
+            parse_mode="HTML",
+        )
 
     # Отправляем Excel-файл аналитики
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_reg = reg_name.replace(" ", "_")[:30]
-    filename = f"dtp_analytics_{safe_reg}_{period.year}_vs_{prev_year}_{timestamp}.xlsx"
+    ai_suffix = "_ai" if use_llm else ""
+    filename = f"dtp_analytics{ai_suffix}_{safe_reg}_{period.year}_vs_{prev_year}_{timestamp}.xlsx"
 
     await context.bot.send_document(
         chat_id=chat_id,
@@ -835,18 +916,100 @@ async def _run_analysis(
         ),
     )
 
-    # Очищаем данные аналитики
-    context.user_data.pop("analytics_ready", None)
-    context.user_data.pop("analytics_reg_code", None)
-    context.user_data.pop("analytics_reg_name", None)
-    context.user_data.pop("analytics_period", None)
-    context.user_data.pop("analytics_cards", None)
+    # Предлагаем задать вопросы (если есть LLM-ключ)
+    if LLM_API_KEY:
+        context.user_data["qa_mode"] = True
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "\u274C Завершить问答",
+                callback_data="end_qa",
+            )],
+        ])
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "\u2753 Вы можете задавать вопросы по этим данным.\n"
+                "Просто напишите вопрос текстом, например:\n"
+                "\n"
+                "\u2022 Почему выросла тяжкость аварий?\n"
+                "\u2022 Какие рекомендации можно дать?\n"
+                "\u2022 Что происходит с нетрезвыми водителями?\n\n"
+                "Или нажмите /dtp для новой выгрузки."
+            ),
+            reply_markup=keyboard,
+        )
+    else:
+        # Без ИИ — очищаем данные аналитики
+        _clear_analytics_data(context.user_data)
 
     logger.info(
         f"Аналитика отправлена: {reg_name}, "
         f"{current_label} vs {prev_label}, "
-        f"{len(current_cards)} vs {len(prev_cards)} ДТП"
+        f"{len(current_cards)} vs {len(prev_cards)} ДТП, "
+        f"LLM={'да' if (use_llm and llm_summary_text) else 'нет'}"
     )
+
+
+def _clear_analytics_data(user_data: dict) -> None:
+    """Очищает все данные аналитики из user_data."""
+    for key in [
+        "analytics_ready", "analytics_reg_code", "analytics_reg_name",
+        "analytics_period", "analytics_cards", "analytics_comparison",
+        "analytics_current_label", "analytics_prev_label", "qa_mode",
+    ]:
+        user_data.pop(key, None)
+
+
+async def _handle_analytics_question(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    question: str,
+    comparison: dict,
+    reg_name: str,
+    current_label: str,
+    prev_label: str,
+) -> None:
+    """
+    Обрабатывает вопрос пользователя по данным аналитики.
+    Отправляет вопрос в LLM и возвращает ответ.
+    """
+    chat_id = update.effective_chat.id
+
+    # Индикатор набора
+    wait_msg = await update.message.reply_text("\U0001F916 Анализирую вопрос...")
+
+    try:
+        answer = await get_ai_answer(
+            question=question,
+            comparison=comparison,
+            reg_name=reg_name,
+            current_label=current_label,
+            previous_label=prev_label,
+        )
+
+        # Удаляем индикатор
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+
+        # Отправляем ответ
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"\U0001F916 <b>Вопрос:</b> {question}\n\n{answer}",
+            parse_mode="HTML",
+        )
+
+    except Exception as e:
+        logger.error(f"Ошибка при ответе на вопрос: {e}")
+        try:
+            await wait_msg.edit_text(
+                f"\u26A0\uFE0F Не удалось получить ответ от нейросети.\n\n"
+                f"Ошибка: {e}\n\n"
+                f"Попробуйте переформулировать вопрос или нажмите кнопку ниже."
+            )
+        except Exception:
+            pass
 
 
 def _make_progress_bar(current: int, total: int, width: int = 20) -> str:
@@ -890,6 +1053,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         reg_code = parsed.region_code
         reg_name = parsed.region_name
         period = parsed.period
+
+        # Очищаем контекст аналитики от предыдущего запроса
+        _clear_analytics_data(context.user_data)
 
         logger.info(
             f"Распознан запрос: регион={reg_name} ({reg_code}), "
@@ -953,6 +1119,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if region is None and period is not None:
         # Период найден, но регион — нет
+        # Очищаем контекст аналитики при новой выгрузке
+        _clear_analytics_data(context.user_data)
+
         await update.message.reply_text(
             f"Период распознан: {period.label}\n\n"
             f"Но не удалось определить регион.\n"
@@ -960,6 +1129,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Или используйте /dtp для выбора через кнопки."
         )
         return
+
+    # --- Режим вопрос-ответ по данным аналитики ---
+    if context.user_data.get("qa_mode") and LLM_API_KEY:
+        comparison = context.user_data.get("analytics_comparison")
+        reg_name = context.user_data.get("analytics_reg_name", "")
+        current_label = context.user_data.get("analytics_current_label", "")
+        prev_label = context.user_data.get("analytics_prev_label", "")
+
+        if comparison:
+            await _handle_analytics_question(
+                update, context, user_text,
+                comparison, reg_name, current_label, prev_label,
+            )
+            return
 
     # Ничего не распознано — подсказка
     await update.message.reply_text(
