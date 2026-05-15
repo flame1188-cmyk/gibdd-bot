@@ -21,6 +21,14 @@ from datetime import datetime
 # SSL: otkluchaem proverku sertifikatov (dlya korporativnogo fayervola)
 # Patentiruem httpx DO importa telegram
 # ============================================================
+import httpx
+_orig_async_client_init = httpx.AsyncClient.__init__
+
+def _patched_async_client_init(self, *args, **kwargs):
+    kwargs.setdefault('verify', False)
+    _orig_async_client_init(self, *args, **kwargs)
+
+httpx.AsyncClient.__init__ = _patched_async_client_init
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import Conflict, NetworkError
@@ -36,7 +44,7 @@ from telegram.ext import (
 from config import validate_config, ALLOWED_USER_IDS, LLM_API_KEY, ENABLE_NEWS_SEARCH
 from api_client import fetch_dtp_data, fetch_regions, extract_accident_cards
 from gibdd_parser import build_file1_data, build_file2_data
-from excel_generator import generate_both_files, generate_analytics_file
+from excel_generator import generate_both_files, generate_analytics_file, generate_concentration_file
 from analytics import (
     calculate_metrics,
     compare_metrics,
@@ -47,6 +55,11 @@ from analytics import (
 )
 from llm_analyzer import get_ai_summary, get_ai_answer
 from news_fetcher import fetch_news_context
+from concentration_points import (
+    calculate_concentration_points,
+    build_concentration_excel_data,
+    get_concentration_column_names,
+)
 from user_request_parser import (
     parse_user_message,
     parse_period,
@@ -498,6 +511,11 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await _run_analysis(update, context, use_llm=True)
             return
 
+        # --- Расчёт очагов ДТП ---
+        if data == "do_concentration":
+            await _run_concentration_points(update, context)
+            return
+
         # --- Завершить режим вопросов ---
         if data == "end_qa":
             _clear_analytics_data(context.user_data)
@@ -708,6 +726,11 @@ async def _offer_analysis(
             callback_data="do_analytics_ai",
         )])
 
+    buttons.append([InlineKeyboardButton(
+        "\U0001F525 Очаги ДТП",
+        callback_data="do_concentration",
+    )])
+
     keyboard = InlineKeyboardMarkup(buttons)
 
     if LLM_API_KEY:
@@ -715,12 +738,14 @@ async def _offer_analysis(
             f"\u2705 Выгрузка завершена: {len(current_cards)} ДТП.\n\n"
             f"Хотите провести сравнительный анализ с аналогичным периодом {prev_year} года?\n\n"
             f"\U0001F4CA <b>Без ИИ</b> — математический анализ (таблицы, проценты)\n"
-            f"\U0001F916 <b>С ИИ</b> — анализ + резюме от нейросети"
+            f"\U0001F916 <b>С ИИ</b> — анализ + резюме от нейросети\n"
+            f"\U0001F525 <b>Очаги ДТП</b> — места концентрации аварийности"
         )
     else:
         text = (
             f"\u2705 Выгрузка завершена: {len(current_cards)} ДТП.\n\n"
-            f"Хотите провести сравнительный анализ с аналогичным периодом {prev_year} года?"
+            f"Хотите провести сравнительный анализ с аналогичным периодом {prev_year} года?\n\n"
+            f"\U0001F525 <b>Очаги ДТП</b> — места концентрации аварийности"
         )
 
     await context.bot.send_message(
@@ -977,6 +1002,138 @@ def _clear_analytics_data(user_data: dict) -> None:
         "analytics_current_label", "analytics_prev_label", "qa_mode",
     ]:
         user_data.pop(key, None)
+
+
+async def _run_concentration_points(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Рассчитывает очаги концентрации ДТП и отправляет Excel-файл.
+    """
+    chat_id = update.effective_chat.id
+
+    reg_name = context.user_data.get("analytics_reg_name", "")
+    period = context.user_data.get("analytics_period")
+    current_cards = context.user_data.get("analytics_cards", [])
+
+    if not period or not current_cards:
+        await update.callback_query.edit_message_text(
+            "Данные для расчёта очагов не найдены. "
+            "Пожалуйста, выполните выгрузку заново."
+        )
+        return
+
+    current_label = period.label
+
+    status_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "\U0001F525 Очаги ДТП: подготовка...\n\n"
+            f"Регион: {reg_name}\n"
+            f"Период: {current_label}\n"
+            f"ДТП: {len(current_cards)}\n\n"
+            f"\u26A0\uFE0F Расчёт может занять 1-3 минуты\n"
+            f"(зависит от количества ДТП и загрузки OSM)"
+        ),
+    )
+
+    async def progress_callback(text: str) -> None:
+        """Обновляет статусное сообщение."""
+        try:
+            await status_msg.edit_text(
+                f"\U0001F525 Очаги ДТП\n\n"
+                f"Регион: {reg_name}\n"
+                f"Период: {current_label}\n\n"
+                f"{text}"
+            )
+        except Exception:
+            pass
+
+    try:
+        clusters = await calculate_concentration_points(
+            current_cards, progress_callback,
+        )
+
+        if not clusters:
+            await status_msg.edit_text(
+                "\U0001F525 Очаги ДТП\n\n"
+                "Очаги концентрации ДТП не найдены.\n\n"
+                "Возможные причины:\n"
+                "\u2022 Мало ДТП за выбранный период\n"
+                "\u2022 ДТП распределены равномерно (нет концентрации)\n"
+                "\u2022 У большинства ДТП нет координат"
+            )
+            return
+
+        # Генерируем Excel
+        conc_data = build_concentration_excel_data(clusters)
+        conc_columns = get_concentration_column_names()
+        conc_bytes = generate_concentration_file(conc_data, conc_columns)
+
+        # Статистика
+        np_count = sum(1 for c in clusters if c["zone_type"].startswith("settlement"))
+        nonp_count = sum(1 for c in clusters if c["zone_type"] == "nonsettlement")
+        total_deaths = sum(c["deaths"] for c in clusters)
+        total_injured = sum(c["injured"] for c in clusters)
+        total_in_clusters = sum(c["total_accidents"] for c in clusters)
+
+        # Удаляем статус
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+        # Текстовое резюме
+        summary_lines = [
+            f"\U0001F525 <b>Очаги ДТП: {reg_name}</b>",
+            f"Период: {current_label}",
+            f"Всего ДТП: {len(current_cards)}",
+            "",
+            f"Найдено очагов: <b>{len(clusters)}</b>",
+            f"  \u2022 В НП: {np_count}",
+            f"  \u2022 Вне НП: {nonp_count}",
+            f"  \u2022 ДТП в очагах: {total_in_clusters}",
+            f"  \u2022 Погибло в очагах: {total_deaths}",
+            f"  \u2022 Ранено в очагах: {total_injured}",
+        ]
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="\n".join(summary_lines),
+            parse_mode="HTML",
+        )
+
+        # Отправляем Excel
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_reg = reg_name.replace(" ", "_")[:30]
+        filename = f"dtp_ochagi_{safe_reg}_{period.year}_{timestamp}.xlsx"
+
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=conc_bytes,
+            filename=filename,
+            caption=(
+                f"\U0001F525 Очаги ДТП: {reg_name}\n"
+                f"{current_label}\n"
+                f"Очагов: {len(clusters)} | ДТП в очагах: {total_in_clusters}"
+            ),
+        )
+
+        logger.info(
+            f"Очаги отправлены: {reg_name}, {current_label}, "
+            f"{len(clusters)} очагов из {len(current_cards)} ДТП"
+        )
+
+    except Exception as e:
+        logger.exception(f"Ошибка расчёта очагов: {e}")
+        try:
+            await status_msg.edit_text(
+                f"\u26A0\uFE0F Ошибка при расчёте очагов ДТП:\n\n{e}\n\n"
+                f"Попробуйте позже или выберите другой период."
+            )
+        except Exception:
+            pass
 
 
 async def _handle_analytics_question(

@@ -255,3 +255,90 @@ def generate_analytics_file(
     ws.freeze_panes = "A2"
 
     return workbook_to_bytes(wb)
+
+
+# ========================
+# Очаги концентрации ДТП
+# ========================
+
+# Специальные стили для очагов
+ZONE_NP_FILL = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+ZONE_NONP_FILL = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
+
+
+def generate_concentration_file(
+    concentration_data: list[dict[str, str]],
+    column_names: list[str],
+) -> bytes:
+    """
+    Генерирует Excel-файл с очагами концентрации ДТП.
+
+    Args:
+        concentration_data: Данные от concentration_points.build_concentration_excel_data()
+        column_names: Названия колонок от concentration_points.get_concentration_column_names()
+
+    Returns:
+        Байты xlsx-файла
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Очаги ДТП"
+
+    col_count = len(column_names)
+
+    # Заголовки
+    for col_idx, col_name in enumerate(column_names, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = HEADER_ALIGNMENT
+        cell.border = THIN_BORDER
+
+    # Данные
+    for row_idx, row_data in enumerate(concentration_data, start=2):
+        for col_idx, col_name in enumerate(column_names, start=1):
+            value = row_data.get(col_name, "")
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.alignment = CELL_ALIGNMENT
+            cell.border = THIN_BORDER
+
+        # Цветовое кодирование по типу зоны
+        zone = row_data.get("Тип зоны", "")
+        fill = None
+        if zone.startswith("НП"):
+            fill = ZONE_NP_FILL
+        elif zone.startswith("Вне"):
+            fill = ZONE_NONP_FILL
+
+        if fill:
+            for col_idx in range(1, col_count + 1):
+                ws.cell(row=row_idx, column=col_idx).fill = fill
+
+    # Ширина колонок
+    col_widths = {
+        "№ очага": 8,
+        "Тип зоны": 22,
+        "Дорога/Улица": 30,
+        "Начало пикетажа": 16,
+        "Конец пикетажа": 16,
+        "Широта первого ДТП": 16,
+        "Долгота первого ДТП": 16,
+        "Широта последнего ДТП": 16,
+        "Долгота последнего ДТП": 16,
+        "Кол-во ДТП": 10,
+        "Виды ДТП (детализация)": 45,
+        "Доминирующий вид": 25,
+        "Погибло": 8,
+        "Ранено": 8,
+        "Даты ДТП": 50,
+    }
+    for col_idx, col_name in enumerate(column_names, start=1):
+        col_letter = ws.cell(row=1, column=col_idx).column_letter
+        ws.column_dimensions[col_letter].width = col_widths.get(col_name, 20)
+
+    ws.freeze_panes = "A2"
+
+    if concentration_data:
+        ws.auto_filter.ref = ws.dimensions
+
+    return workbook_to_bytes(wb)
