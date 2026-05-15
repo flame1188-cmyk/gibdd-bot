@@ -12,6 +12,7 @@
 import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -21,6 +22,12 @@ from config import LLM_API_KEY, LLM_MODEL
 logger = logging.getLogger(__name__)
 
 ZHIPU_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+
+# ============================================================
+# Глобальный rate limiter — минимальный интервал между ЛЮБЫМИ LLM-вызовами
+# ============================================================
+_last_llm_call_time: float = 0.0
+_MIN_LLM_INTERVAL: float = 20.0  # секунды между запросами
 
 # ============================================================
 # Системный промпт — определяет роль нейросети
@@ -280,13 +287,23 @@ async def ask_llm(
         "Content-Type": "application/json",
     }
 
+    # --- Глобальный rate limiter: ждём, если с предыдущего вызова прошло мало времени ---
+    global _last_llm_call_time
+    now = time.monotonic()
+    elapsed_since_last = now - _last_llm_call_time
+    if elapsed_since_last < _MIN_LLM_INTERVAL and _last_llm_call_time > 0:
+        cooldown = _MIN_LLM_INTERVAL - elapsed_since_last
+        logger.info(f"Rate limiter: ждём {cooldown:.0f} сек между LLM-вызовами...")
+        await asyncio.sleep(cooldown)
+
     logger.info(f"LLM запрос: модель={LLM_MODEL}, длина промпта={len(user_message)} символов")
 
-    retry_delays = [10, 25, 45]  # секунды между попытками
+    # Задержки при 429: 30, 60, 90 сек (суммарно до 3 мин ожидания)
+    retry_delays = [30, 60, 90]
 
     for attempt in range(max_retries + 1):
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
+            async with httpx.AsyncClient(timeout=90) as client:
                 response = await client.post(
                     ZHIPU_API_URL,
                     headers=headers,
@@ -305,18 +322,21 @@ async def ask_llm(
                     continue
                 else:
                     raise httpx.HTTPStatusError(
-                        "Превышен лимит запросов к API. Подождите 1-2 минуты и попробуйте снова.",
+                        "Превышен лимит запросов к API. Подождите 2-3 минуты и попробуйте снова.",
                         request=response.request,
                         response=response,
                     )
 
             response.raise_for_status()
 
+            # Успешный запрос — обновляем время последнего вызова
+            _last_llm_call_time = time.monotonic()
+
         except httpx.HTTPStatusError:
             raise
         except httpx.TimeoutException:
             if attempt < max_retries:
-                wait = 10
+                wait = 15
                 logger.warning(f"LLM таймаут. Попытка {attempt + 1}, ожидание {wait} сек...")
                 await asyncio.sleep(wait)
                 continue

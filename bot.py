@@ -834,7 +834,10 @@ async def _run_analysis(
 
     if use_llm and LLM_API_KEY:
         try:
-            await status_msg.edit_text(f"{mode_label}: нейросеть анализирует данные...")
+            await status_msg.edit_text(
+                f"{mode_label}: нейросеть анализирует данные...\n"
+                f"⏳ Это может занять до 1-3 минут при высокой нагрузке."
+            )
             llm_summary_text = await get_ai_summary(
                 comparison=comparison,
                 reg_name=reg_name,
@@ -977,7 +980,10 @@ async def _handle_analytics_question(
     chat_id = update.effective_chat.id
 
     # Индикатор набора
-    wait_msg = await update.message.reply_text("\U0001F916 Анализирую вопрос...")
+    wait_msg = await update.message.reply_text(
+        "\U0001F916 Анализирую вопрос...\n"
+        "⏳ Это может занять до 1-3 минут."
+    )
 
     try:
         answer = await get_ai_answer(
