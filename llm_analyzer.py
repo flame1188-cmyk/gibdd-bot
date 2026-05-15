@@ -298,7 +298,7 @@ async def ask_llm(
             {"role": "user", "content": user_message},
         ],
         "temperature": 0.7,
-        "max_tokens": 4000,
+        "max_tokens": 70000,
     }
 
     headers = {
@@ -393,14 +393,29 @@ async def ask_llm(
     if "choices" not in data or not data["choices"]:
         raise ValueError(f"Неожидаемый ответ API: {json.dumps(data, ensure_ascii=False)[:200]}")
 
-    content = data["choices"][0]["message"].get("content", "") or ""
+    message = data["choices"][0]["message"]
+    content = message.get("content", "") or ""
+    reasoning = message.get("reasoning_content", "") or ""
 
-    # Если content пустой — логируем полный message для диагностики
-    if not content:
-        msg_keys = list(data["choices"][0]["message"].keys())
+    # Если content пустой — пробуем извлечь ответ из reasoning_content
+    if not content and reasoning:
         logger.warning(
-            f"LLM вернул пустой content. Ключи message: {msg_keys}, "
-            f"полный ответ: {json.dumps(data, ensure_ascii=False)[:500]}"
+            f"LLM вернул пустой content, но есть reasoning_content ({len(reasoning)} симв.). "
+            f"Пытаюсь извлечь ответ..."
+        )
+        # reasoning_content обычно содержит цепочку мыслей + итоговый ответ в конце.
+        # Ищем последний осмысленный абзац как ответ.
+        paragraphs = [p.strip() for p in reasoning.split("\n") if p.strip()]
+        if paragraphs:
+            # Берём последние абзацы (обычно итог там)
+            content = "\n".join(paragraphs[-5:]) if len(paragraphs) > 5 else "\n".join(paragraphs)
+            logger.info(f"Извлечён ответ из reasoning: {len(content)} симв.")
+
+    if not content:
+        msg_keys = list(message.keys())
+        logger.warning(
+            f"LLM вернул пустой ответ. Ключи message: {msg_keys}, "
+            f"finish_reason={data['choices'][0].get('finish_reason')}"
         )
         raise ValueError("LLM вернул пустой ответ (content='')")
 
