@@ -115,22 +115,28 @@ async def fetch_dictionary(code: int) -> dict[str, Any]:
         return None
 
 async def fetch_regions() -> list[dict[str, str]]:
-    """Получает справочник регионов (code=1). Возвращает список {code, name}."""
     data = await fetch_dictionary(1)
+    if data is None:
+        logger.error("Справочник регионов недоступен")
+        return []
     rows = data.get("results", [{}])[0].get("dict_rows", [])
     return [{"code": r["rows_code"], "name": r["rows_name"]} for r in rows]
 
 
 async def fetch_indicators() -> list[dict[str, str]]:
-    """Получает справочник показателей аварийности (code=2). Возвращает список {code, name}."""
     data = await fetch_dictionary(2)
+    if data is None:
+        logger.error("Справочник показателей недоступен")
+        return []
     rows = data.get("results", [{}])[0].get("dict_rows", [])
     return [{"code": r["rows_code"], "name": r["rows_name"]} for r in rows]
 
 
 async def fetch_federal_roads() -> list[dict[str, str]]:
-    """Получает справочник федеральных дорог (code=3). Возвращает список {code, name}."""
     data = await fetch_dictionary(3)
+    if data is None:
+        logger.error("Справочник дорог недоступен")
+        return []
     rows = data.get("results", [{}])[0].get("dict_rows", [])
     return [{"code": r["rows_code"], "name": r["rows_name"]} for r in rows]
 
