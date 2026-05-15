@@ -245,7 +245,7 @@ def build_question_prompt(
 async def ask_llm(
     user_message: str,
     system_prompt: str | None = None,
-    max_retries: int = 3,
+    max_retries: int = 5,
 ) -> str:
     """
     Отправляет запрос к GLM API и возвращает текстовый ответ.
@@ -299,7 +299,7 @@ async def ask_llm(
     logger.info(f"LLM запрос: модель={LLM_MODEL}, длина промпта={len(user_message)} символов")
 
     # Задержки при 429: 30, 60, 90 сек (суммарно до 3 мин ожидания)
-    retry_delays = [30, 60, 90]
+    retry_delays = [30, 60, 90, 120, 150]
 
     for attempt in range(max_retries + 1):
         try:
