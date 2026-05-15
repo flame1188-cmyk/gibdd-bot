@@ -1,8 +1,9 @@
 """
-Генерация двух Excel-файлов на основе данных ДТП:
+Генерация Excel-файлов на основе данных ДТП:
 
-  1. dtp_cards.xlsx  — одна строка = одно ДТП (все поля карточки)
-  2. dtp_uch.xlsx    — одна строка = один участник ДТП
+  1. dtp_cards.xlsx     — одна строка = одно ДТП (все поля карточки)
+  2. dtp_uch.xlsx       — одна строка = один участник ДТП
+  3. dtp_analytics.xlsx — аналитика: сравнение периодов
 """
 
 import io
@@ -183,3 +184,74 @@ def generate_both_files(
     file2_bytes = generate_file2(file2_data)
     logger.info(f"Файл 1: {len(file1_bytes)} байт, Файл 2: {len(file2_bytes)} байт")
     return file1_bytes, file2_bytes
+
+
+# Стили для разделительных строк аналитики
+SECTION_FONT = Font(bold=True, size=11)
+POSITIVE_FILL = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+NEGATIVE_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+
+def generate_analytics_file(
+    analytics_data: list[dict[str, str]],
+    column_names: list[str],
+) -> bytes:
+    """
+    Генерирует Excel-файл с аналитикой (сравнение периодов).
+
+    Args:
+        analytics_data: Данные от analytics.build_analytics_excel_data()
+        column_names: Названия колонок от analytics.get_analytics_column_names()
+
+    Returns:
+        Байты xlsx-файла
+    """
+    from openpyxl.styles import numbers
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Аналитика"
+
+    col_count = len(column_names)
+
+    # Заголовки
+    for col_idx, col_name in enumerate(column_names, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = HEADER_ALIGNMENT
+        cell.border = THIN_BORDER
+
+    # Данные
+    for row_idx, row_data in enumerate(analytics_data, start=2):
+        for col_idx, col_name in enumerate(column_names, start=1):
+            value = row_data.get(col_name, "")
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.alignment = CELL_ALIGNMENT
+            cell.border = THIN_BORDER
+
+        # Выделяем разделительные строки (заголовки секций)
+        indicator = row_data.get("Показатель", "")
+        if indicator and indicator == indicator.upper() and indicator.strip():
+            for col_idx in range(1, col_count + 1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                cell.font = SECTION_FONT
+
+        # Цветовое кодирование колонки "Изменение, %"
+        change_cell = ws.cell(row=row_idx, column=4)
+        change_val = row_data.get("Изменение, %", "")
+        if isinstance(change_val, (int, float)) and change_val != 0:
+            if change_val > 0:
+                change_cell.fill = NEGATIVE_FILL  # Рост показателя = красный
+            elif change_val < 0:
+                change_cell.fill = POSITIVE_FILL  # Снижение показателя = зелёный
+
+    # Ширина колонок
+    ws.column_dimensions["A"].width = 35
+    for col_idx in range(2, col_count + 1):
+        col_letter = ws.cell(row=1, column=col_idx).column_letter
+        ws.column_dimensions[col_letter].width = 22
+
+    ws.freeze_panes = "A2"
+
+    return workbook_to_bytes(wb)

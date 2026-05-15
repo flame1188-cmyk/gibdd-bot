@@ -12,7 +12,6 @@
 """
 
 import asyncio
-import time
 import logging
 import os
 import sys
@@ -22,6 +21,14 @@ from datetime import datetime
 # SSL: otkluchaem proverku sertifikatov (dlya korporativnogo fayervola)
 # Patentiruem httpx DO importa telegram
 # ============================================================
+import httpx
+_orig_async_client_init = httpx.AsyncClient.__init__
+
+def _patched_async_client_init(self, *args, **kwargs):
+    kwargs.setdefault('verify', False)
+    _orig_async_client_init(self, *args, **kwargs)
+
+httpx.AsyncClient.__init__ = _patched_async_client_init
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -36,7 +43,14 @@ from telegram.ext import (
 from config import validate_config, ALLOWED_USER_IDS
 from api_client import fetch_dtp_data, fetch_regions, extract_accident_cards
 from gibdd_parser import build_file1_data, build_file2_data
-from excel_generator import generate_both_files
+from excel_generator import generate_both_files, generate_analytics_file
+from analytics import (
+    calculate_metrics,
+    compare_metrics,
+    build_analytics_message,
+    build_analytics_excel_data,
+    get_analytics_column_names,
+)
 from user_request_parser import (
     parse_user_message,
     parse_period,
@@ -214,6 +228,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Результат: 2 Excel-файла\n"
         "  1. Карточки ДТП (1 строка = 1 ДТП)\n"
         "  2. Участники ДТП (1 строка = 1 участник)\n\n"
+        "После выгрузки бот предложит провести анализ —\n"
+        "сравнение с аналогичным периодом прошлого года.\n\n"
         "Команды:\n"
         "/dtp — начать выгрузку через кнопки\n"
         "/help — справка\n"
@@ -238,6 +254,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  за полугодие 2025 Москва\n\n"
         "--- Способ 3: Строгий формат ---\n"
         "  2.2024 1101  (месяц.год код_региона)\n\n"
+        "--- Аналитика ---\n"
+        "После выгрузки данных бот предложит кнопку\n"
+        "\U0001F4CA Провести анализ — сравнение текущего\n"
+        "периода с аналогичным периодом прошлого года.\n"
+        "Результат: текстовое резюме + Excel-файл\n\n"
         "--- Команды ---\n"
         "/dtp — выгрузка через кнопки\n"
         "/regions — список регионов\n"
@@ -245,7 +266,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "--- Результат ---\n"
         "Бот вернёт 2 Excel-файла:\n"
         "  1. dtp_cards.xlsx — карточки ДТП\n"
-        "  2. dtp_uch.xlsx — участники ДТП"
+        "  2. dtp_uch.xlsx — участники ДТП\n"
+        "И при запросе анализа:\n"
+        "  3. dtp_analytics.xlsx — аналитика"
     )
 
 
@@ -469,6 +492,11 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
             return
 
+        # --- Запрос аналитики ---
+        if data == "do_analytics":
+            await _run_analysis(update, context)
+            return
+
         # --- Отмена ---
         if data == "cancel":
             context.user_data.clear()
@@ -617,6 +645,9 @@ async def _start_fetching(
 
         logger.info(f"Файлы отправлены: {len(all_cards)} ДТП, {len(file2_data)} участников")
 
+        # Предлагаем провести анализ
+        await _offer_analysis(context, chat_id, reg_name, reg_code, period, all_cards)
+
     except Exception as e:
         logger.exception(f"Ошибка генерации/отправки файлов: {e}")
         try:
@@ -625,7 +656,197 @@ async def _start_fetching(
             pass
 
     finally:
-        context.user_data.clear()
+        # НЕ очищаем user_data полностью, потому что _offer_analysis
+        # сохранил данные аналитики (analytics_reg_code, analytics_cards и т.д.)
+        # Удаляем только данные выгрузки, оставляем данные аналитики
+        for key in ["reg_code", "reg_name", "sel_year"]:
+            context.user_data.pop(key, None)
+
+
+async def _offer_analysis(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    reg_name: str,
+    reg_code: str,
+    period: ParsedPeriod,
+    current_cards: list[dict],
+) -> None:
+    """
+    После выгрузки предлагает кнопку для проведения анализа
+    (сравнение с аналогичным периодом прошлого года).
+    """
+    prev_year = period.year - 1
+    prev_label = period.label.replace(str(period.year), str(prev_year))
+
+    # Сохраняем данные для аналитики в user_data
+    context.user_data["analytics_ready"] = True
+    context.user_data["analytics_reg_code"] = reg_code
+    context.user_data["analytics_reg_name"] = reg_name
+    context.user_data["analytics_period"] = period
+    context.user_data["analytics_cards"] = current_cards
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"\U0001F4CA Провести анализ ({prev_label})",
+            callback_data="do_analytics",
+        )],
+    ])
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"\u2705 Выгрузка завершена: {len(current_cards)} ДТП.\n\n"
+            f"Хотите провести сравнительный анализ с аналогичным периодом {prev_year} года?"
+        ),
+        reply_markup=keyboard,
+    )
+
+
+async def _run_analysis(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Выполняет сравнительный анализ текущего периода с прошлым годом.
+
+    1. Берёт карточки текущего периода из user_data
+    2. Запрашивает карточки аналогичного периода прошлого года через API
+    3. Считает метрики и сравнивает
+    4. Отправляет текстовое резюме + Excel-файл аналитики
+    """
+    chat_id = update.effective_chat.id
+
+    reg_code = context.user_data.get("analytics_reg_code", "")
+    reg_name = context.user_data.get("analytics_reg_name", "")
+    period = context.user_data.get("analytics_period")
+    current_cards = context.user_data.get("analytics_cards", [])
+
+    if not reg_code or not period or not current_cards:
+        await update.callback_query.edit_message_text(
+            "Данные для анализа не найдены. Пожалуйста, выполните выгрузку заново."
+        )
+        return
+
+    # Период прошлого года
+    prev_year = period.year - 1
+    dat_list_prev = [f"{m}.{prev_year}" for m in period.months]
+    prev_label = period.label.replace(str(period.year), str(prev_year))
+    current_label = period.label
+
+    status_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"\U0001F4CA Подготовка анализа...\n\n"
+            f"Регион: {reg_name}\n"
+            f"Текущий период: {current_label}\n"
+            f"Сравнение: {prev_label}\n\n"
+            f"Загрузка данных за {prev_year} год..."
+        ),
+    )
+
+    # Запрашиваем данные за прошлый год
+    prev_cards = []
+    errors = []
+
+    for i, dat in enumerate(dat_list_prev, start=1):
+        month_num = int(dat.split(".")[0])
+        month_name = {
+            1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
+            5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
+            9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
+        }.get(month_num, dat)
+
+        progress = _make_progress_bar(i, len(dat_list_prev))
+        await status_msg.edit_text(
+            f"\U0001F4CA Загрузка данных за {prev_year} год...\n\n"
+            f"{progress} {i}/{len(dat_list_prev)}\n"
+            f"Запрос: {month_name} {prev_year}..."
+        )
+
+        try:
+            api_response = await fetch_dtp_data(dat=dat, reg=reg_code, pok="1")
+            cards = extract_accident_cards(api_response)
+            prev_cards.extend(cards)
+            logger.info(f"  Аналитика: {dat} -> {len(cards)} ДТП")
+        except Exception as e:
+            errors.append(f"{month_name} {prev_year}: {e}")
+            logger.error(f"  Аналитика: {dat} -> ОШИБКА {e}")
+
+    if not prev_cards:
+        error_text = "\n".join(f"- {e}" for e in errors) if errors else "Нет данных"
+        await status_msg.edit_text(
+            f"\u26A0\uFE0F Не удалось загрузить данные за {prev_label}.\n\n"
+            f"Ошибки:\n{error_text}\n\n"
+            f"Возможно, данные за этот период ещё не опубликованы."
+        )
+        return
+
+    # Считаем метрики
+    await status_msg.edit_text("\U0001F4CA Считаю метрики...")
+
+    current_metrics = calculate_metrics(current_cards)
+    previous_metrics = calculate_metrics(prev_cards)
+    comparison = compare_metrics(current_metrics, previous_metrics)
+
+    # Формируем текстовое сообщение
+    analytics_text = build_analytics_message(
+        comparison=comparison,
+        reg_name=reg_name,
+        current_label=current_label,
+        previous_label=prev_label,
+    )
+
+    # Генерируем Excel
+    analytics_data = build_analytics_excel_data(
+        comparison=comparison,
+        reg_name=reg_name,
+        current_label=current_label,
+        previous_label=prev_label,
+    )
+    column_names = get_analytics_column_names(current_label, prev_label)
+    analytics_bytes = generate_analytics_file(analytics_data, column_names)
+
+    # Удаляем сообщение о статусе
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+    # Отправляем текстовое резюме
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=analytics_text,
+        parse_mode="HTML",
+    )
+
+    # Отправляем Excel-файл аналитики
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_reg = reg_name.replace(" ", "_")[:30]
+    filename = f"dtp_analytics_{safe_reg}_{period.year}_vs_{prev_year}_{timestamp}.xlsx"
+
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=analytics_bytes,
+        filename=filename,
+        caption=(
+            f"\U0001F4CA Аналитика: {reg_name}\n"
+            f"{current_label} vs {prev_label}\n"
+            f"Текущий: {len(current_cards)} ДТП | Прошлый: {len(prev_cards)} ДТП"
+        ),
+    )
+
+    # Очищаем данные аналитики
+    context.user_data.pop("analytics_ready", None)
+    context.user_data.pop("analytics_reg_code", None)
+    context.user_data.pop("analytics_reg_name", None)
+    context.user_data.pop("analytics_period", None)
+    context.user_data.pop("analytics_cards", None)
+
+    logger.info(
+        f"Аналитика отправлена: {reg_name}, "
+        f"{current_label} vs {prev_label}, "
+        f"{len(current_cards)} vs {len(prev_cards)} ДТП"
+    )
 
 
 def _make_progress_bar(current: int, total: int, width: int = 20) -> str:
@@ -781,7 +1002,7 @@ def main() -> None:
         sys.exit(1)
 
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    time.sleep(2)  # ← ДОБАВИТЬ ЭТУ СТРОКУ
+
     app = Application.builder().token(token).build()
 
     # Команды
