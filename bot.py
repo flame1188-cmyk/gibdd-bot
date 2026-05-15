@@ -840,7 +840,7 @@ async def _run_analysis(
         try:
             await status_msg.edit_text(
                 f"{mode_label}: нейросеть анализирует данные...\n"
-                f"⏳ Это может занять 1-5 минут при высокой нагрузке API."
+                f"⏳ Обычно занимает 15-30 секунд."
             )
 
             # Формируем дополнение из сырых карточек
@@ -992,17 +992,18 @@ async def _handle_analytics_question(
     # Индикатор набора
     wait_msg = await update.message.reply_text(
         "\U0001F916 Анализирую вопрос...\n"
-        "⏳ Это может занять 1-5 минут при высокой нагрузке API."
+        "⏳ Обычно занимает 15-30 секунд."
     )
 
     try:
         # Формируем дополнение из сырых карточек (если есть)
+        # Для вопросов берём меньше карточек — только статистику + 15 самых тяжёлых
         raw_sup = ""
         current_cards = context.user_data.get("analytics_cards", [])
         prev_cards = context.user_data.get("analytics_prev_cards", [])
         if current_cards or prev_cards:
-            raw_sup = extract_raw_supplement(current_cards, current_label, max_cards=30)
-            raw_sup += extract_raw_supplement(prev_cards, prev_label, max_cards=30)
+            raw_sup = extract_raw_supplement(current_cards, current_label, max_cards=15)
+            raw_sup += extract_raw_supplement(prev_cards, prev_label, max_cards=15)
 
         answer = await get_ai_answer(
             question=question,
