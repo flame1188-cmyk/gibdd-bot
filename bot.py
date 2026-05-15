@@ -51,6 +51,7 @@ from analytics import (
     build_analytics_message,
     build_analytics_excel_data,
     get_analytics_column_names,
+    extract_raw_supplement,
 )
 from llm_analyzer import get_ai_summary, get_ai_answer
 from user_request_parser import (
@@ -829,6 +830,9 @@ async def _run_analysis(
     context.user_data["analytics_current_label"] = current_label
     context.user_data["analytics_prev_label"] = prev_label
 
+    # Сохраняем сырые карточки для детальных ответов LLM
+    context.user_data["analytics_prev_cards"] = prev_cards
+
     # --- Генерируем контент ---
     llm_summary_text = None
 
@@ -836,13 +840,19 @@ async def _run_analysis(
         try:
             await status_msg.edit_text(
                 f"{mode_label}: нейросеть анализирует данные...\n"
-                f"⏳ Это может занять до 1-3 минут при высокой нагрузке."
+                f"⏳ Это может занять 1-5 минут при высокой нагрузке API."
             )
+
+            # Формируем дополнение из сырых карточек
+            raw_sup = extract_raw_supplement(current_cards, current_label, max_cards=50)
+            raw_sup += extract_raw_supplement(prev_cards, prev_label, max_cards=50)
+
             llm_summary_text = await get_ai_summary(
                 comparison=comparison,
                 reg_name=reg_name,
                 current_label=current_label,
                 prev_label=prev_label,
+                raw_supplement=raw_sup,
             )
         except Exception as e:
             logger.error(f"Ошибка LLM: {e}")
@@ -982,16 +992,25 @@ async def _handle_analytics_question(
     # Индикатор набора
     wait_msg = await update.message.reply_text(
         "\U0001F916 Анализирую вопрос...\n"
-        "⏳ Это может занять до 1-3 минут."
+        "⏳ Это может занять 1-5 минут при высокой нагрузке API."
     )
 
     try:
+        # Формируем дополнение из сырых карточек (если есть)
+        raw_sup = ""
+        current_cards = context.user_data.get("analytics_cards", [])
+        prev_cards = context.user_data.get("analytics_prev_cards", [])
+        if current_cards or prev_cards:
+            raw_sup = extract_raw_supplement(current_cards, current_label, max_cards=30)
+            raw_sup += extract_raw_supplement(prev_cards, prev_label, max_cards=30)
+
         answer = await get_ai_answer(
             question=question,
             comparison=comparison,
             reg_name=reg_name,
             current_label=current_label,
             prev_label=prev_label,
+            raw_supplement=raw_sup,
         )
 
         # Удаляем индикатор

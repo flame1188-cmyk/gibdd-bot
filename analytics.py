@@ -668,3 +668,204 @@ def get_analytics_column_names(
 ) -> list[str]:
     """Возвращает названия колонок для Excel-файла аналитики."""
     return ["Показатель", current_label, previous_label, "Изменение, %", "Изменение, абс."]
+
+
+# ============================================================
+# Извлечение детальных данных из сырых карточек для LLM
+# ============================================================
+
+def _get_card_alcohol_detail(card: dict) -> str | None:
+    """Извлекает детали по алкоголю из карточки."""
+    ts_list = card.get("ts_info", []) or []
+    for ts in ts_list:
+        ts_uch_list = ts.get("ts_uch", []) or []
+        for uch in ts_uch_list:
+            kt = str(uch.get("kt_uch", "")).lower()
+            alco = str(uch.get("alco", "")).strip()
+            if kt == "водитель" and alco and alco not in ("0", "00", ""):
+                return alco
+    return None
+
+
+def _get_card_violations(card: dict) -> list[str]:
+    """Извлекает нарушения ПДД из карточки."""
+    violations = []
+    for ts in (card.get("ts_info", []) or []):
+        for uch in (ts.get("ts_uch", []) or []):
+            npdd_list = uch.get("npdd", []) or []
+            if isinstance(npdd_list, list):
+                violations.extend(str(v).strip() for v in npdd_list if str(v).strip())
+    for uch in (card.get("uch_info", []) or []):
+        npdd_list = uch.get("npdd", []) or []
+        if isinstance(npdd_list, list):
+            violations.extend(str(v).strip() for v in npdd_list if str(v).strip())
+    return violations
+
+
+def _get_card_vehicles(card: dict) -> list[str]:
+    """Извлекает типы ТС из карточки."""
+    vehicles = []
+    for ts in (card.get("ts_info", []) or []):
+        t_ts = str(ts.get("t_ts", "")).strip()
+        if t_ts:
+            vehicles.append(t_ts)
+    return vehicles
+
+
+def _get_card_road_state(card: dict) -> list[str]:
+    """Извлекает состояние дороги из карточки."""
+    states = []
+    dor_usl = card.get("dor_usl", {}) or {}
+    sdor = dor_usl.get("sdor", []) or []
+    if isinstance(sdor, list):
+        states.extend(str(s).strip() for s in sdor if str(s).strip())
+    return states
+
+
+def extract_raw_supplement(
+    cards: list[dict[str, Any]],
+    label: str,
+    max_cards: int = 50,
+) -> str:
+    """
+    Извлекает из сырых карточек дополнительные данные,
+    которых нет в базовой агрегации.
+
+    Включает:
+      - Типы ТС (статистика)
+      - Нарушения ПДД (статистика, топ-15)
+      - Состояние дороги (статистика)
+      - Районы/населённые пункты (топ-15)
+      - Детали смертельных ДТП
+      - Детали ДТП с нетрезвыми
+      - Детали ДТП с пешеходами
+      - Контрольные суммы по агрегации
+
+    Args:
+        cards: Список сырых карточек ДТП
+        label: Подпись периода (например "I квартал 2026")
+        max_cards: Максимум карточек в деталях (срез по тяжести)
+
+    Returns:
+        Текстовый блок для добавления в промпт LLM
+    """
+    if not cards:
+        return f"\nПОДРОБНЫЕ ДАННЫЕ ({label}): нет данных\n"
+
+    lines = []
+    lines.append(f"\nПОДРОБНЫЕ ДАННЫЕ ({label}):")
+
+    # --- Типы ТС ---
+    vehicle_counter = Counter()
+    for card in cards:
+        for v in _get_card_vehicles(card):
+            vehicle_counter[v] += 1
+    if vehicle_counter:
+        lines.append("\nТипы транспортных средств:")
+        for v, cnt in vehicle_counter.most_common(12):
+            lines.append(f"  - {v}: {cnt}")
+
+    # --- Нарушения ПДД ---
+    violation_counter = Counter()
+    for card in cards:
+        for v in _get_card_violations(card):
+            violation_counter[v] += 1
+    if violation_counter:
+        lines.append("\nНарушения ПДД (топ-15):")
+        for v, cnt in violation_counter.most_common(15):
+            lines.append(f"  - {v}: {cnt}")
+
+    # --- Состояние дороги ---
+    road_counter = Counter()
+    for card in cards:
+        for r in _get_card_road_state(card):
+            road_counter[r] += 1
+    if road_counter:
+        lines.append("\nСостояние дорожного покрытия:")
+        for r, cnt in road_counter.most_common(10):
+            lines.append(f"  - {r}: {cnt}")
+
+    # --- Районы / населённые пункты ---
+    district_counter = Counter()
+    for card in cards:
+        d = str(card.get("district", "")).strip()
+        np_val = str(card.get("np", "")).strip()
+        loc = d if d else np_val
+        if loc:
+            district_counter[loc] += 1
+    if district_counter:
+        lines.append("\nРайоны/населённые пункты (топ-15):")
+        for d, cnt in district_counter.most_common(15):
+            lines.append(f"  - {d}: {cnt}")
+
+    # --- Детали по категории: смертельные, алкоголь, пешеходы ---
+    fatal_cards = [c for c in cards if _safe_int(c.get("pog")) > 0]
+    alcohol_cards = [c for c in cards if _has_alcohol(c)]
+    ped_cards = [c for c in cards if _has_pedestrian(c)]
+
+    # Собираем уникальные ID, чтобы не дублировать
+    detailed_ids = set()
+    detailed_cards = []
+
+    # Приоритет: смертельные + алкоголь > смертельные > алкоголь > пешеходные
+    priority_cards = []
+    for c in fatal_cards:
+        if c.get("empt_number") not in detailed_ids:
+            detailed_ids.add(c.get("empt_number"))
+            priority_cards.append((c, 0 if _has_alcohol(c) else 1))
+    for c in alcohol_cards:
+        if c.get("empt_number") not in detailed_ids:
+            detailed_ids.add(c.get("empt_number"))
+            priority_cards.append((c, 2))
+    for c in ped_cards:
+        if c.get("empt_number") not in detailed_ids:
+            detailed_ids.add(c.get("empt_number"))
+            priority_cards.append((c, 3))
+
+    # Сортируем по приоритету и берём max_cards
+    priority_cards.sort(key=lambda x: x[1])
+    detailed_cards = [c for c, _ in priority_cards[:max_cards]]
+
+    if detailed_cards:
+        lines.append(f"\nДетали ДТП (смертельные/алкогольные/с пешеходами, {len(detailed_cards)} шт.):")
+        for card in detailed_cards:
+            date = str(card.get("date_dtp", "")).strip()
+            time = str(card.get("time", "")).strip()
+            dtp_type = str(card.get("dtpv", "")).strip()
+            deaths = _safe_int(card.get("pog"))
+            injured = _safe_int(card.get("ran"))
+            district = str(card.get("district", "")).strip() or str(card.get("np", "")).strip()
+            street = str(card.get("street", "")).strip()
+            viol = ", ".join(_get_card_violations(card)[:3])
+            alco = _get_card_alcohol_detail(card)
+            vehicles = ", ".join(_get_card_vehicles(card)[:3])
+            road = ", ".join(_get_card_road_state(card)[:2])
+
+            tags = []
+            if deaths > 0:
+                tags.append(f"погибло={deaths}")
+            if injured > 0:
+                tags.append(f"ранено={injured}")
+            if alco:
+                tags.append(f"алкоголь={alco} промилле")
+            if _has_pedestrian(card):
+                tags.append("пешеход")
+
+            location = district
+            if street:
+                location = f"{location}, {street}" if location else street
+
+            line = f"  [{date} {time}] {dtp_type} | {'; '.join(tags)}"
+            if location:
+                line += f" | {location}"
+            if viol:
+                line += f" | нарушение: {viol}"
+            if vehicles:
+                line += f" | ТС: {vehicles}"
+            if road:
+                line += f" | дорога: {road}"
+            lines.append(line)
+
+    text = "\n".join(lines)
+    logger.info(f"Raw supplement для LLM ({label}): {len(cards)} карточек, {len(text)} символов")
+    return text

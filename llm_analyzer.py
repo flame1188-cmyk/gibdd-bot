@@ -204,12 +204,13 @@ def build_summary_prompt(
     reg_name: str,
     current_label: str,
     prev_label: str,
+    raw_supplement: str = "",
 ) -> str:
     """Создаёт промпт для генерации аналитического резюме."""
     metrics_text = format_metrics_for_prompt(
         comparison, reg_name, current_label, prev_label,
     )
-    return (
+    prompt = (
         f"{metrics_text}\n\n"
         f"На основе приведённых данных напиши аналитическое резюме:\n"
         f"1. Общая оценка динамики аварийности\n"
@@ -217,6 +218,9 @@ def build_summary_prompt(
         f"3. Возможные причины изменений\n"
         f"4. Рекомендации по повышению безопасности дорожного движения"
     )
+    if raw_supplement:
+        prompt += f"\n\n{raw_supplement}"
+    return prompt
 
 
 def build_question_prompt(
@@ -225,17 +229,21 @@ def build_question_prompt(
     reg_name: str,
     current_label: str,
     prev_label: str,
+    raw_supplement: str = "",
 ) -> str:
     """Создаёт промпт для ответа на вопрос пользователя."""
     metrics_text = format_metrics_for_prompt(
         comparison, reg_name, current_label, prev_label,
     )
-    return (
+    prompt = (
         f"{metrics_text}\n\n"
         f"Вопрос пользователя: {question}\n\n"
         f"Ответь на вопрос, опираясь ТОЛЬКО на приведённые данные. "
         f"Если данных недостаточно — так и скажи."
     )
+    if raw_supplement:
+        prompt += f"\n\n{raw_supplement}"
+    return prompt
 
 
 # ============================================================
@@ -279,7 +287,7 @@ async def ask_llm(
             {"role": "user", "content": user_message},
         ],
         "temperature": 0.7,
-        "max_tokens": 15000,
+        "max_tokens": 4000,
     }
 
     headers = {
@@ -396,14 +404,21 @@ async def get_ai_summary(
     reg_name: str,
     current_label: str,
     prev_label: str,
+    raw_supplement: str = "",
 ) -> str:
     """
     Генерирует аналитическое резюме с помощью LLM.
 
+    Args:
+        raw_supplement: Дополнительные данные из сырых карточек ДТП
+
     Returns:
         Текст резюме от нейросети
     """
-    prompt = build_summary_prompt(comparison, reg_name, current_label, prev_label)
+    prompt = build_summary_prompt(
+        comparison, reg_name, current_label, prev_label,
+        raw_supplement=raw_supplement,
+    )
     return await ask_llm(user_message=prompt)
 
 
@@ -413,14 +428,19 @@ async def get_ai_answer(
     reg_name: str,
     current_label: str,
     prev_label: str,
+    raw_supplement: str = "",
 ) -> str:
     """
     Отвечает на вопрос пользователя по данным с помощью LLM.
+
+    Args:
+        raw_supplement: Дополнительные данные из сырых карточек ДТП
 
     Returns:
         Текст ответа от нейросети
     """
     prompt = build_question_prompt(
         question, comparison, reg_name, current_label, prev_label,
+        raw_supplement=raw_supplement,
     )
     return await ask_llm(user_message=prompt)
