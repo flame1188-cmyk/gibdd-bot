@@ -205,6 +205,7 @@ def build_summary_prompt(
     current_label: str,
     prev_label: str,
     raw_supplement: str = "",
+    news_context: str = "",
 ) -> str:
     """Создаёт промпт для генерации аналитического резюме."""
     metrics_text = format_metrics_for_prompt(
@@ -220,6 +221,13 @@ def build_summary_prompt(
     )
     if raw_supplement:
         prompt += f"\n\n{raw_supplement}"
+    if news_context:
+        prompt += (
+            f"\n\n{news_context}\n\n"
+            f"Примечание: используй новостной контекст для подтверждения статистических данных, "
+            f"упоминания резонансных ДТП и реальных событий. "
+            f"Если новость противоречит статистике — укажи на это."
+        )
     return prompt
 
 
@@ -230,6 +238,7 @@ def build_question_prompt(
     current_label: str,
     prev_label: str,
     raw_supplement: str = "",
+    news_context: str = "",
 ) -> str:
     """Создаёт промпт для ответа на вопрос пользователя."""
     metrics_text = format_metrics_for_prompt(
@@ -238,11 +247,13 @@ def build_question_prompt(
     prompt = (
         f"{metrics_text}\n\n"
         f"Вопрос пользователя: {question}\n\n"
-        f"Ответь на вопрос, опираясь ТОЛЬКО на приведённые данные. "
+        f"Ответь на вопрос, опираясь на приведённые данные. "
         f"Если данных недостаточно — так и скажи."
     )
     if raw_supplement:
         prompt += f"\n\n{raw_supplement}"
+    if news_context:
+        prompt += f"\n\n{news_context}"
     return prompt
 
 
@@ -405,12 +416,14 @@ async def get_ai_summary(
     current_label: str,
     prev_label: str,
     raw_supplement: str = "",
+    news_context: str = "",
 ) -> str:
     """
     Генерирует аналитическое резюме с помощью LLM.
 
     Args:
         raw_supplement: Дополнительные данные из сырых карточек ДТП
+        news_context: Новостной контекст из открытых источников
 
     Returns:
         Текст резюме от нейросети
@@ -418,6 +431,7 @@ async def get_ai_summary(
     prompt = build_summary_prompt(
         comparison, reg_name, current_label, prev_label,
         raw_supplement=raw_supplement,
+        news_context=news_context,
     )
     return await ask_llm(user_message=prompt)
 
@@ -429,12 +443,14 @@ async def get_ai_answer(
     current_label: str,
     prev_label: str,
     raw_supplement: str = "",
+    news_context: str = "",
 ) -> str:
     """
     Отвечает на вопрос пользователя по данным с помощью LLM.
 
     Args:
         raw_supplement: Дополнительные данные из сырых карточек ДТП
+        news_context: Новостной контекст из открытых источников
 
     Returns:
         Текст ответа от нейросети
@@ -442,5 +458,6 @@ async def get_ai_answer(
     prompt = build_question_prompt(
         question, comparison, reg_name, current_label, prev_label,
         raw_supplement=raw_supplement,
+        news_context=news_context,
     )
     return await ask_llm(user_message=prompt)

@@ -42,8 +42,14 @@ HTTPS_PROXY: str = os.getenv("HTTPS_PROXY", "")
 # Если не задан — функция "Анализ с ИИ" будет недоступна
 LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
 
-# Модель LLM (по умолчанию glm-5v-turbo)
-LLM_MODEL: str = os.getenv("LLM_MODEL", "GLM-4.7-Flash")
+# Модель LLM (по умолчанию glm-4.7-flash — бесплатная, безлимитная, 200K контекст)
+# Другие бесплатные: glm-4.5-flash, glm-4-flash-250414
+# Платные: glm-5v-turbo, glm-5.1 (имеют строгие rate limits)
+LLM_MODEL: str = os.getenv("LLM_MODEL", "glm-4.7-flash")
+
+# Включать ли поиск новостей из открытых источников (Google News RSS + DuckDuckGo)
+# Если "false" — нейросеть будет анализировать только данные stat.gibdd.ru
+ENABLE_NEWS_SEARCH: bool = os.getenv("ENABLE_NEWS_SEARCH", "true").lower() == "true"
 
 
 # ========================

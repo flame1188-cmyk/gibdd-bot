@@ -41,7 +41,7 @@ from telegram.ext import (
     filters,
 )
 
-from config import validate_config, ALLOWED_USER_IDS, LLM_API_KEY
+from config import validate_config, ALLOWED_USER_IDS, LLM_API_KEY, ENABLE_NEWS_SEARCH
 from api_client import fetch_dtp_data, fetch_regions, extract_accident_cards
 from gibdd_parser import build_file1_data, build_file2_data
 from excel_generator import generate_both_files, generate_analytics_file
@@ -54,6 +54,7 @@ from analytics import (
     extract_raw_supplement,
 )
 from llm_analyzer import get_ai_summary, get_ai_answer
+from news_fetcher import fetch_news_context
 from user_request_parser import (
     parse_user_message,
     parse_period,
@@ -839,13 +840,24 @@ async def _run_analysis(
     if use_llm and LLM_API_KEY:
         try:
             await status_msg.edit_text(
-                f"{mode_label}: нейросеть анализирует данные...\n"
-                f"⏳ Обычно занимает 15-30 секунд."
+                f"{mode_label}: собираю данные и ищу новости..."
             )
 
             # Формируем дополнение из сырых карточек
             raw_sup = extract_raw_supplement(current_cards, current_label, max_cards=50)
             raw_sup += extract_raw_supplement(prev_cards, prev_label, max_cards=50)
+
+            # Ищем новости из открытых источников (если включено)
+            news_ctx = ""
+            if ENABLE_NEWS_SEARCH:
+                news_ctx = await fetch_news_context(reg_name, current_label, prev_label)
+            # Сохраняем для вопросов
+            context.user_data["analytics_news_context"] = news_ctx
+
+            await status_msg.edit_text(
+                f"{mode_label}: нейросеть анализирует данные...\n"
+                f"⏳ Обычно занимает 15-30 секунд."
+            )
 
             llm_summary_text = await get_ai_summary(
                 comparison=comparison,
@@ -853,6 +865,7 @@ async def _run_analysis(
                 current_label=current_label,
                 prev_label=prev_label,
                 raw_supplement=raw_sup,
+                news_context=news_ctx,
             )
         except Exception as e:
             logger.error(f"Ошибка LLM: {e}")
@@ -1012,6 +1025,7 @@ async def _handle_analytics_question(
             current_label=current_label,
             prev_label=prev_label,
             raw_supplement=raw_sup,
+            news_context=context.user_data.get("analytics_news_context", ""),
         )
 
         # Удаляем индикатор
