@@ -1,0 +1,11 @@
+meta:
+  environment: python
+  toolchain:
+    name: pip
+    version: "3.11"
+
+build:
+  builder: "python:3.11"
+
+run:
+  command: "python bot.py"
