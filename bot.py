@@ -21,14 +21,6 @@ from datetime import datetime
 # SSL: otkluchaem proverku sertifikatov (dlya korporativnogo fayervola)
 # Patentiruem httpx DO importa telegram
 # ============================================================
-import httpx
-_orig_async_client_init = httpx.AsyncClient.__init__
-
-def _patched_async_client_init(self, *args, **kwargs):
-    kwargs.setdefault('verify', False)
-    _orig_async_client_init(self, *args, **kwargs)
-
-httpx.AsyncClient.__init__ = _patched_async_client_init
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import Conflict, NetworkError
