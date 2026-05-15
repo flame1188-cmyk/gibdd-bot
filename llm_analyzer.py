@@ -27,7 +27,7 @@ ZHIPU_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 # Глобальный rate limiter — минимальный интервал между ЛЮБЫМИ LLM-вызовами
 # ============================================================
 _last_llm_call_time: float = 0.0
-_MIN_LLM_INTERVAL: float = 20.0  # секунды между запросами
+_MIN_LLM_INTERVAL: float = 60.0  # секунды между запросами (1 мин)
 
 # ============================================================
 # Системный промпт — определяет роль нейросети
@@ -298,7 +298,7 @@ async def ask_llm(
 
     logger.info(f"LLM запрос: модель={LLM_MODEL}, длина промпта={len(user_message)} символов")
 
-    # Задержки при 429: 30, 60, 90 сек (суммарно до 3 мин ожидания)
+    # Фоллбэк-задержки при 429 (если нет заголовка Retry-After)
     retry_delays = [30, 60, 90, 120, 150]
 
     for attempt in range(max_retries + 1):
@@ -312,17 +312,30 @@ async def ask_llm(
 
             if response.status_code == 429:
                 if attempt < max_retries:
-                    wait = retry_delays[attempt]
+                    # Пытаемся прочитать точное время ожидания из заголовка
+                    retry_after = response.headers.get("Retry-After") or response.headers.get("retry-after")
+                    if retry_after:
+                        try:
+                            wait = int(retry_after) + 5  # +5 сек запас
+                        except ValueError:
+                            wait = retry_delays[attempt]
+                    else:
+                        wait = retry_delays[attempt]
+
+                    # Минимум 30 сек, даже если Retry-After маленький
+                    wait = max(wait, 30)
+
                     logger.warning(
                         f"LLM 429 Too Many Requests. "
                         f"Попытка {attempt + 1}/{max_retries}, "
                         f"ожидание {wait} сек..."
+                        + (f" (Retry-After: {retry_after})" if retry_after else "")
                     )
                     await asyncio.sleep(wait)
                     continue
                 else:
                     raise httpx.HTTPStatusError(
-                        "Превышен лимит запросов к API. Подождите 2-3 минуты и попробуйте снова.",
+                        "Превышен лимит запросов к API. Подождите 5 минут и попробуйте снова.",
                         request=response.request,
                         response=response,
                     )
@@ -336,7 +349,7 @@ async def ask_llm(
             raise
         except httpx.TimeoutException:
             if attempt < max_retries:
-                wait = 15
+                wait = 20
                 logger.warning(f"LLM таймаут. Попытка {attempt + 1}, ожидание {wait} сек...")
                 await asyncio.sleep(wait)
                 continue
@@ -344,10 +357,34 @@ async def ask_llm(
 
     data = response.json()
 
-    if "choices" not in data or not data["choices"]:
-        raise ValueError(f"Неожиданный ответ API: {json.dumps(data, ensure_ascii=False)[:200]}")
+    # Диагностика: логируем структуру ответа (без полного content для экономии)
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"LLM полный ответ: {json.dumps(data, ensure_ascii=False)[:500]}")
+    else:
+        # Даже на INFO логируем ключи и структуру choices
+        choice = data.get("choices", [{}])[0].get("message", {})
+        content_preview = str(choice.get("content", ""))[:100]
+        logger.info(
+            f"LLM ответ структура: keys={list(data.keys())}, "
+            f"finish_reason={data.get('choices', [{}])[0].get('finish_reason')}, "
+            f"content_type={type(choice.get('content')).__name__}, "
+            f"content_preview={repr(content_preview)}"
+        )
 
-    content = data["choices"][0]["message"]["content"]
+    if "choices" not in data or not data["choices"]:
+        raise ValueError(f"Неожидаемый ответ API: {json.dumps(data, ensure_ascii=False)[:200]}")
+
+    content = data["choices"][0]["message"].get("content", "") or ""
+
+    # Если content пустой — логируем полный message для диагностики
+    if not content:
+        msg_keys = list(data["choices"][0]["message"].keys())
+        logger.warning(
+            f"LLM вернул пустой content. Ключи message: {msg_keys}, "
+            f"полный ответ: {json.dumps(data, ensure_ascii=False)[:500]}"
+        )
+        raise ValueError("LLM вернул пустой ответ (content='')")
+
     tokens_used = data.get("usage", {}).get("total_tokens", "?")
     logger.info(f"LLM ответ: {len(content)} символов, токенов: {tokens_used}")
 
