@@ -12,6 +12,7 @@
 """
 
 import asyncio
+import time
 import logging
 import os
 import sys
@@ -780,7 +781,7 @@ def main() -> None:
         sys.exit(1)
 
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    await asyncio.sleep(2)  # ← ДОБАВИТЬ ЭТУ СТРОКУ
+    time.sleep(2)  # ← ДОБАВИТЬ ЭТУ СТРОКУ
     app = Application.builder().token(token).build()
 
     # Команды
