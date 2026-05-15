@@ -838,7 +838,7 @@ async def _run_analysis(
                 comparison=comparison,
                 reg_name=reg_name,
                 current_label=current_label,
-                previous_label=prev_label,
+                prev_label=prev_label,
             )
         except Exception as e:
             logger.error(f"Ошибка LLM: {e}")
@@ -984,7 +984,7 @@ async def _handle_analytics_question(
             comparison=comparison,
             reg_name=reg_name,
             current_label=current_label,
-            previous_label=prev_label,
+            prev_label=prev_label,
         )
 
         # Удаляем индикатор
