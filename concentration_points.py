@@ -177,46 +177,73 @@ async def fetch_settlement_boundaries(
     query = (
         "[out:json][timeout:90];\n"
         "(\n"
-        '  relation["place"~"city|town|village"](bbox);\n'
-        '  way["place"~"city|town|village"](bbox);\n'
+        '  relation["place"~"city|town|village"](' + bbox + ');\n'
+        '  way["place"~"city|town|village"](' + bbox + ');\n'
         ");\n"
         "out bb;\n"
     )
 
-    url = "https://overpass-api.de/api/interpreter"
+    # Список зеркал Overpass API с резервными серверами
+    overpass_urls = [
+        "https://overpass-api.de/api/interpreter",
+        "https://lz4.overpass-api.de/api/interpreter",
+        "https://z.overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+    ]
 
-    try:
-        if progress_callback:
-            await progress_callback(
-                f"Загрузка границ НП из OpenStreetMap...\n"
-                f"BBOX: {bbox}"
-            )
+    headers = {
+        "User-Agent": "GIBDD-DTP-Bot/1.0 (traffic-accident-analysis)",
+        "Accept": "application/json",
+    }
 
-        async with httpx.AsyncClient(verify=False) as client:
-            resp = await client.post(
-                url, data={"data": query}, timeout=120,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-        bboxes = []
-        for element in data.get("elements", []):
-            if "bounds" in element:
-                b = element["bounds"]
-                bboxes.append((
-                    b["minlat"], b["minlon"],
-                    b["maxlat"], b["maxlon"],
-                ))
-
-        logger.info(
-            f"Overpass API: {len(bboxes)} границ НП "
-            f"для bbox {lat_min:.3f},{lon_min:.3f},{lat_max:.3f},{lon_max:.3f}"
+    if progress_callback:
+        await progress_callback(
+            f"Загрузка границ НП из OpenStreetMap...\n"
+            f"BBOX: {bbox}"
         )
-        return bboxes
 
-    except Exception as e:
-        logger.error(f"Ошибка Overpass API: {e}")
-        return []
+    for url in overpass_urls:
+        try:
+            logger.info(f"Попытка запроса к Overpass API: {url}")
+            async with httpx.AsyncClient(
+                verify=False,
+                headers=headers,
+            ) as client:
+                resp = await client.post(
+                    url, data={"data": query}, timeout=120,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            bboxes = []
+            for element in data.get("elements", []):
+                if "bounds" in element:
+                    b = element["bounds"]
+                    bboxes.append((
+                        b["minlat"], b["minlon"],
+                        b["maxlat"], b["maxlon"],
+                    ))
+
+            logger.info(
+                f"Overpass API ({url}): {len(bboxes)} границ НП "
+                f"для bbox {lat_min:.3f},{lon_min:.3f},{lat_max:.3f},{lon_max:.3f}"
+            )
+            return bboxes
+
+        except httpx.HTTPStatusError as e:
+            logger.warning(
+                f"Overpass API ({url}): HTTP {e.response.status_code}"
+            )
+            continue
+        except Exception as e:
+            logger.warning(f"Overpass API ({url}): {e}")
+            continue
+
+    logger.error(
+        "Все зеркала Overpass API недоступны. "
+        "Не удалось получить границы НП."
+    )
+    return []
 
 
 def _point_in_any_bbox(
