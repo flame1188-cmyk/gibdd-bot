@@ -17,18 +17,6 @@ import os
 import sys
 from datetime import datetime
 
-# ============================================================
-# SSL: otkluchaem proverku sertifikatov (dlya korporativnogo fayervola)
-# Patentiruem httpx DO importa telegram
-# ============================================================
-import httpx
-_orig_async_client_init = httpx.AsyncClient.__init__
-
-def _patched_async_client_init(self, *args, **kwargs):
-    kwargs.setdefault('verify', False)
-    _orig_async_client_init(self, *args, **kwargs)
-
-httpx.AsyncClient.__init__ = _patched_async_client_init
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import Conflict, NetworkError
@@ -58,7 +46,9 @@ from news_fetcher import fetch_news_context
 from concentration_points import (
     calculate_concentration_points,
     build_concentration_excel_data,
+    build_concentration_detail_data,
     get_concentration_column_names,
+    get_detail_column_names,
 )
 from user_request_parser import (
     parse_user_message,
@@ -277,7 +267,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  1. dtp_cards.xlsx — карточки ДТП\n"
         "  2. dtp_uch.xlsx — участники ДТП\n"
         "И при запросе анализа:\n"
-        "  3. dtp_analytics.xlsx — аналитика"
+        "  3. dtp_analytics.xlsx — аналитика\n"
+        "При наличии вопросов или предложений\n"
+        "контакты для связи: @flame1290 @Julich_Vorobevich"
     )
 
 
@@ -1069,7 +1061,11 @@ async def _run_concentration_points(
         # Генерируем Excel
         conc_data = build_concentration_excel_data(clusters)
         conc_columns = get_concentration_column_names()
-        conc_bytes = generate_concentration_file(conc_data, conc_columns)
+        detail_data = build_concentration_detail_data(clusters)
+        detail_columns = get_detail_column_names()
+        conc_bytes = generate_concentration_file(
+            conc_data, conc_columns, detail_data, detail_columns,
+        )
 
         # Статистика
         np_count = sum(1 for c in clusters if c["zone_type"].startswith("settlement"))

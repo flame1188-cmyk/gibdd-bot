@@ -2,9 +2,12 @@
 Модуль расчёта очагов концентрации ДТП (мест концентрации аварийности).
 
 Два алгоритма:
-  1. Населённые пункты (НП):
-     - Перекрёстки: радиус 50 м
-     - Остальные участки: радиус 100 м
+  1. Населённые пункты (НП) — 3 прохода:
+     - 1-й проход: перекрёстки (obj_dtp содержит «перекрёсток»), радиус 50 м
+     - 2-й проход: дороги с наименованием и пикетажем, скользящее окно 200 м
+     - 3-й проход: радиус 100 м от точки, с проверкой пикетажа:
+       если центр ДТП и другое ДТП в радиусе 100 м имеют одинаковое
+       наименование дороги и пикетаж, проверяется окно 200 м по пикетажу
      - Порог: 3+ ДТП одного вида ИЛИ 5+ ДТП любых видов
   2. Вне НП (автодороги):
      - Группировка по названию дороги
@@ -35,6 +38,9 @@ EARTH_RADIUS_KM = 6371.0
 # Радиусы для НП (метры)
 SETTLEMENT_INTERSECTION_RADIUS_M = 50
 SETTLEMENT_OTHER_RADIUS_M = 100
+
+# Окно для дорог с пикетажем в НП (км)
+SETTLEMENT_ROAD_WINDOW_KM = 0.2  # 200 метров
 
 # Окно для вне НП (км)
 NON_SETTLEMENT_WINDOW_KM = 1.0
@@ -122,6 +128,11 @@ def _get_km_m(card: dict) -> float | None:
         except ValueError:
             pass
     return None
+
+
+def _has_road_and_piketazh(card: dict) -> bool:
+    """Есть ли у карточки наименование дороги И пикетаж."""
+    return bool(_get_road_name(card)) and _get_km_m(card) is not None
 
 
 def _check_cluster_criteria(
@@ -380,10 +391,12 @@ def _cluster_cards_by_radius(
 
 def find_settlement_concentration_points(cards: list[dict]) -> list[dict]:
     """
-    Поиск очагов в населённых пунктах.
+    Поиск очагов в населённых пунктах — 3 прохода.
 
     1-й проход: перекрёстки (50 м)
-    2-й проход: остальные участки (100 м)
+    2-й проход: дороги с наименованием + пикетажем, окно 200 м
+    3-й проход: радиус 100 м с проверкой пикетажа (200 м для ДТП
+               с одинаковой дорогой и пикетажем)
     """
     if not cards:
         return []
@@ -405,7 +418,6 @@ def find_settlement_concentration_points(cards: list[dict]) -> list[dict]:
         if not _is_intersection(card):
             continue
 
-        # Список кандидатов: неассигнированные + с координатами
         candidates = [
             (j, c) for j, c in indexed_with_coords
             if j not in assigned
@@ -425,7 +437,79 @@ def find_settlement_concentration_points(cards: list[dict]) -> list[dict]:
                 _build_cluster(group_cards, center, "settlement_intersection")
             )
 
-    # --- 2-й проход: остальные участки (100 м) ---
+    # --- 2-й проход: дороги с наименованием и пикетажем, окно 200 м ---
+    road_cards_with_km = [
+        (idx, card) for idx, card in indexed_with_coords
+        if idx not in assigned and _has_road_and_piketazh(card)
+    ]
+
+    # Группируем по названию дороги
+    road_groups: dict[str, list[tuple[int, dict]]] = {}
+    for idx, card in road_cards_with_km:
+        road = _get_road_name(card)
+        road_groups.setdefault(road, []).append((idx, card))
+
+    pass2_found = False
+
+    for road_name, items in road_groups.items():
+        # Подготавливаем (idx, card, pos_km)
+        items_pos: list[tuple[int, dict, float]] = []
+        for idx, card in items:
+            pos = _get_km_m(card)
+            if pos is not None:
+                items_pos.append((idx, card, pos))
+
+        if not items_pos:
+            continue
+
+        # Сортируем по пикетажу
+        items_pos.sort(key=lambda x: x[2])
+
+        # Скользящее окно 200 м
+        for i, (idx, card, pos) in enumerate(items_pos):
+            if idx in assigned:
+                continue
+
+            window_end = pos + SETTLEMENT_ROAD_WINDOW_KM
+
+            group_indices = [idx]
+            group_cards = [card]
+
+            for j in range(i + 1, len(items_pos)):
+                other_idx, other_card, other_pos = items_pos[j]
+                if other_idx in assigned:
+                    continue
+                if other_pos <= window_end:
+                    group_indices.append(other_idx)
+                    group_cards.append(other_card)
+
+            type_counter = Counter(_get_dtp_type(c) for c in group_cards)
+            is_cluster, _ = _check_cluster_criteria(
+                type_counter, len(group_cards),
+            )
+
+            if is_cluster:
+                assigned.update(group_indices)
+                group_cards.sort(key=lambda c: _get_date(c))
+                center = _parse_coords(card)
+                clusters.append(
+                    _build_cluster(
+                        group_cards, center, "settlement_road",
+                        road_name=road_name,
+                        start_pos=pos,
+                        end_pos=window_end,
+                    )
+                )
+                pass2_found = True
+            # Неассигнированные карточки переходят в 3-й проход
+
+    logger.info(
+        f"НП 2-й проход (пикетаж): "
+        f"{len(clusters)} очагов найдено" if pass2_found
+        else "НП 2-й проход: очагов не найдено"
+    )
+
+    # --- 3-й проход: радиус 100 м с проверкой пикетажа ---
     for idx, card in indexed_with_coords:
         if idx in assigned:
             continue
@@ -435,21 +519,52 @@ def find_settlement_concentration_points(cards: list[dict]) -> list[dict]:
             assigned.add(idx)
             continue
 
-        radius = SETTLEMENT_INTERSECTION_RADIUS_M if _is_intersection(card) else SETTLEMENT_OTHER_RADIUS_M
+        center_road = _get_road_name(card)
+        center_km = _get_km_m(card)
+        center_has_road_km = bool(center_road) and center_km is not None
 
+        # Собираем кандидатов в радиусе 100 м
         candidates = [
             (j, c) for j, c in indexed_with_coords
             if j not in assigned and j != idx
         ]
-        group = _cluster_cards_by_radius(
-            [(idx, card)] + candidates,
-            radius,
-            assigned,
-        )
 
-        if group is not None:
-            assigned.update(group)
-            group_cards = [cards[j] for j in group]
+        group_indices = [idx]
+        group_cards = [card]
+
+        for j, c in candidates:
+            coords = _parse_coords(c)
+            if coords is None:
+                continue
+            dist = haversine_meters(
+                center[0], center[1], coords[0], coords[1],
+            )
+            if dist > SETTLEMENT_OTHER_RADIUS_M:
+                continue
+
+            # Проверка пикетажа: если центр и кандидат на одной дороге
+            # и оба имеют пикетаж — проверяем окно 200 м
+            other_road = _get_road_name(c)
+            other_km = _get_km_m(c)
+
+            if (
+                center_has_road_km
+                and other_road == center_road
+                and other_km is not None
+            ):
+                piketazh_diff_m = abs(other_km - center_km) * 1000.0
+                if piketazh_diff_m > SETTLEMENT_ROAD_WINDOW_KM * 1000.0:
+                    # Пикетаж различается более чем на 200 м — исключаем
+                    continue
+
+            group_indices.append(j)
+            group_cards.append(c)
+
+        type_counter = Counter(_get_dtp_type(c) for c in group_cards)
+        is_cluster, _ = _check_cluster_criteria(type_counter, len(group_cards))
+
+        if is_cluster:
+            assigned.update(group_indices)
             group_cards.sort(key=lambda c: _get_date(c))
             clusters.append(
                 _build_cluster(group_cards, center, "settlement_segment")
@@ -457,7 +572,7 @@ def find_settlement_concentration_points(cards: list[dict]) -> list[dict]:
         else:
             assigned.add(idx)
 
-    logger.info(f"Очаги в НП: {len(clusters)} найдено")
+    logger.info(f"Очаги в НП (итого): {len(clusters)} найдено")
     return clusters
 
 
@@ -573,6 +688,7 @@ def find_nonsettlement_concentration_points(cards: list[dict]) -> list[dict]:
 
 ZONE_TYPE_LABELS = {
     "settlement_intersection": "НП - Перекрёсток",
+    "settlement_road": "НП - Участок дороги (пикетаж)",
     "settlement_segment": "НП - Участок дороги",
     "nonsettlement": "Вне НП",
 }
@@ -581,8 +697,8 @@ CONCENTRATION_COLUMNS = [
     "№ очага",
     "Тип зоны",
     "Дорога/Улица",
-    "Начало пикетажа",
-    "Конец пикетажа",
+    "Пикетаж начало",
+    "Пикетаж конец",
     "Широта первого ДТП",
     "Долгота первого ДТП",
     "Широта последнего ДТП",
@@ -592,13 +708,55 @@ CONCENTRATION_COLUMNS = [
     "Доминирующий вид",
     "Погибло",
     "Ранено",
-    "Даты ДТП",
+    "Дата первого ДТП",
+    "Дата последнего ДТП",
 ]
+
+DETAIL_COLUMNS = [
+    "№ очага",
+    "Дата ДТП",
+    "Вид ДТП",
+    "Дорога/Улица",
+    "Пикетаж",
+    "Широта",
+    "Долгота",
+    "Погибло",
+    "Ранено",
+]
+
+
+def _format_piketazh(pos: float | None) -> str:
+    """Форматирует пикетаж из км.ddd в строку «КК+МММ»."""
+    if pos is None:
+        return ""
+    km = int(pos)
+    m = round((pos - km) * 1000)
+    return f"{km}+{m:03d}"
+
+
+def _first_last_piketazh(cards: list[dict]) -> tuple[float | None, float | None]:
+    """
+    Возвращает (пикетаж_первого_ДТП, пикетаж_последнего_ДТП)
+    по минимальному и максимальному пикетажу среди карточек.
+    """
+    positions = []
+    for card in cards:
+        pos = _get_km_m(card)
+        if pos is not None:
+            positions.append(pos)
+    if not positions:
+        return None, None
+    return min(positions), max(positions)
 
 
 def get_concentration_column_names() -> list[str]:
     """Названия колонок для Excel-файла очагов."""
     return list(CONCENTRATION_COLUMNS)
+
+
+def get_detail_column_names() -> list[str]:
+    """Названия колонок для листа детализации ДТП в очагах."""
+    return list(DETAIL_COLUMNS)
 
 
 def build_concentration_excel_data(
@@ -608,9 +766,6 @@ def build_concentration_excel_data(
     rows = []
 
     for i, cluster in enumerate(clusters, start=1):
-        # Даты
-        dates_str = "; ".join(cluster["dates"])
-
         # Виды ДТП
         types_parts = [
             f"{t}: {c}" for t, c in cluster["type_counter"].items()
@@ -625,22 +780,15 @@ def build_concentration_excel_data(
         last_lat = f"{lc[0]:.6f}" if lc else ""
         last_lon = f"{lc[1]:.6f}" if lc else ""
 
-        # Пикетаж
-        sp = cluster.get("start_pos")
-        ep = cluster.get("end_pos")
-        if sp is not None:
-            sk = int(sp)
-            sm = round((sp - sk) * 1000)
-            start_str = f"{sk}+{sm:03d}"
-        else:
-            start_str = ""
+        # Пикетаж: первое и последнее ДТП в очаге
+        start_pos, end_pos = _first_last_piketazh(cluster["cards"])
+        start_str = _format_piketazh(start_pos)
+        end_str = _format_piketazh(end_pos)
 
-        if ep is not None:
-            ek = int(ep)
-            em = round((ep - ek) * 1000)
-            end_str = f"{ek}+{em:03d}"
-        else:
-            end_str = ""
+        # Даты: первое и последнее ДТП
+        dates = cluster["dates"]
+        first_date = dates[0] if dates else ""
+        last_date = dates[-1] if dates else ""
 
         zone_label = ZONE_TYPE_LABELS.get(
             cluster["zone_type"], cluster["zone_type"],
@@ -650,8 +798,8 @@ def build_concentration_excel_data(
             "№ очага": str(i),
             "Тип зоны": zone_label,
             "Дорога/Улица": cluster["road"],
-            "Начало пикетажа": start_str,
-            "Конец пикетажа": end_str,
+            "Пикетаж начало": start_str,
+            "Пикетаж конец": end_str,
             "Широта первого ДТП": first_lat,
             "Долгота первого ДТП": first_lon,
             "Широта последнего ДТП": last_lat,
@@ -661,8 +809,42 @@ def build_concentration_excel_data(
             "Доминирующий вид": cluster.get("dominant_type", ""),
             "Погибло": str(cluster["deaths"]),
             "Ранено": str(cluster["injured"]),
-            "Даты ДТП": dates_str,
+            "Дата первого ДТП": first_date,
+            "Дата последнего ДТП": last_date,
         })
+
+    return rows
+
+
+def build_concentration_detail_data(
+    clusters: list[dict],
+) -> list[dict[str, str]]:
+    """
+    Строит данные для листа детализации:
+    все ДТП, попавшие в очаги, с указанием номера очага.
+    """
+    rows = []
+
+    for i, cluster in enumerate(clusters, start=1):
+        for card in cluster["cards"]:
+            coords = _parse_coords(card)
+            pos = _get_km_m(card)
+            piketazh_str = _format_piketazh(pos)
+
+            lat_str = f"{coords[0]:.6f}" if coords else ""
+            lon_str = f"{coords[1]:.6f}" if coords else ""
+
+            rows.append({
+                "№ очага": str(i),
+                "Дата ДТП": _get_date(card),
+                "Вид ДТП": _get_dtp_type(card),
+                "Дорога/Улица": _get_road_name(card),
+                "Пикетаж": piketazh_str,
+                "Широта": lat_str,
+                "Долгота": lon_str,
+                "Погибло": str(_safe_int(card.get("pog"))),
+                "Ранено": str(_safe_int(card.get("ran"))),
+            })
 
     return rows
 

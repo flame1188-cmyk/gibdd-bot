@@ -269,13 +269,18 @@ ZONE_NONP_FILL = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type
 def generate_concentration_file(
     concentration_data: list[dict[str, str]],
     column_names: list[str],
+    detail_data: list[dict[str, str]] | None = None,
+    detail_columns: list[str] | None = None,
 ) -> bytes:
     """
     Генерирует Excel-файл с очагами концентрации ДТП.
+    Лист 1 — сводка очагов, Лист 2 — детализация ДТП.
 
     Args:
         concentration_data: Данные от concentration_points.build_concentration_excel_data()
         column_names: Названия колонок от concentration_points.get_concentration_column_names()
+        detail_data: Данные от concentration_points.build_concentration_detail_data() (опционально)
+        detail_columns: Названия колонок от concentration_points.get_detail_column_names() (опционально)
 
     Returns:
         Байты xlsx-файла
@@ -317,10 +322,10 @@ def generate_concentration_file(
     # Ширина колонок
     col_widths = {
         "№ очага": 8,
-        "Тип зоны": 22,
+        "Тип зоны": 28,
         "Дорога/Улица": 30,
-        "Начало пикетажа": 16,
-        "Конец пикетажа": 16,
+        "Пикетаж начало": 14,
+        "Пикетаж конец": 14,
         "Широта первого ДТП": 16,
         "Долгота первого ДТП": 16,
         "Широта последнего ДТП": 16,
@@ -330,7 +335,8 @@ def generate_concentration_file(
         "Доминирующий вид": 25,
         "Погибло": 8,
         "Ранено": 8,
-        "Даты ДТП": 50,
+        "Дата первого ДТП": 14,
+        "Дата последнего ДТП": 14,
     }
     for col_idx, col_name in enumerate(column_names, start=1):
         col_letter = ws.cell(row=1, column=col_idx).column_letter
@@ -340,5 +346,48 @@ def generate_concentration_file(
 
     if concentration_data:
         ws.auto_filter.ref = ws.dimensions
+
+    # --- Лист 2: Детализация ДТП в очагах ---
+    if detail_data and detail_columns:
+        ws2 = wb.create_sheet("Детализация ДТП")
+
+        det_col_count = len(detail_columns)
+
+        # Заголовки
+        for col_idx, col_name in enumerate(detail_columns, start=1):
+            cell = ws2.cell(row=1, column=col_idx, value=col_name)
+            cell.font = HEADER_FONT
+            cell.fill = HEADER_FILL
+            cell.alignment = HEADER_ALIGNMENT
+            cell.border = THIN_BORDER
+
+        # Данные
+        for row_idx, row_data in enumerate(detail_data, start=2):
+            for col_idx, col_name in enumerate(detail_columns, start=1):
+                value = row_data.get(col_name, "")
+                cell = ws2.cell(row=row_idx, column=col_idx, value=value)
+                cell.alignment = CELL_ALIGNMENT
+                cell.border = THIN_BORDER
+
+        # Ширина колонок
+        det_widths = {
+            "№ очага": 8,
+            "Дата ДТП": 14,
+            "Вид ДТП": 25,
+            "Дорога/Улица": 30,
+            "Пикетаж": 14,
+            "Широта": 16,
+            "Долгота": 16,
+            "Погибло": 8,
+            "Ранено": 8,
+        }
+        for col_idx, col_name in enumerate(detail_columns, start=1):
+            col_letter = ws2.cell(row=1, column=col_idx).column_letter
+            ws2.column_dimensions[col_letter].width = det_widths.get(col_name, 20)
+
+        ws2.freeze_panes = "A2"
+
+        if detail_data:
+            ws2.auto_filter.ref = ws2.dimensions
 
     return workbook_to_bytes(wb)
