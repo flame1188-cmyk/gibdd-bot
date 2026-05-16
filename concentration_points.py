@@ -117,14 +117,24 @@ def _get_date(card: dict) -> str:
 
 
 def _get_km_m(card: dict) -> float | None:
-    """Пикетаж как float (км.ddd). km=12, m=500 -> 12.500"""
+    """
+    Пикетаж как float (км.ddd). km=12, m=500 -> 12.500
+
+    Возвращает None если:
+      - поле km пустое
+      - оба значения равны 0 (0+000 = «не указан»)
+    """
     km_str = str(card.get("km", "")).strip()
     m_str = str(card.get("m", "")).strip()
     if km_str:
         try:
             km_val = float(km_str)
             m_val = float(m_str) if m_str else 0.0
-            return km_val + m_val / 1000.0
+            total = km_val + m_val / 1000.0
+            # 0+000 означает «пикетаж не указан»
+            if total == 0.0:
+                return None
+            return total
         except ValueError:
             pass
     return None
