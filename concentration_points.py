@@ -14,15 +14,23 @@
      - Скользящее окно 1 км
      - Порог: 3+ ДТП одного вида ИЛИ 5+ ДТП любых видов
 
-Определение НП/не НП через Overpass API (OpenStreetMap).
+Определение НП/не НП через OSM Overpass API с реальными полигонами (Shapely).
+Границы кэшируются на диске (TTL 24 ч).
 """
 
 import math
+import json
+import os
+import time
+import hashlib
 import logging
 from collections import Counter
 from typing import Any, Callable, Awaitable
 
 import httpx
+from shapely.geometry import Polygon, MultiPolygon, Point, LineString
+from shapely.ops import linemerge, polygonize, unary_union
+from shapely.prepared import prep
 
 from analytics import _safe_int
 
@@ -53,6 +61,10 @@ ANY_TYPE_THRESHOLD = 5    # 5+ ДТП любых видов = очаг
 INTERSECTION_KEYWORDS = [
     "перекрёсток", "перекресток", "перекрёстка", "перекрестка",
 ]
+
+# Кэширование границ НП
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+CACHE_TTL_SECONDS = 24 * 60 * 60  # 24 часа
 
 
 # ========================
@@ -165,18 +177,266 @@ def _check_cluster_criteria(
 
 
 # ========================
+# Кэширование границ НП
+# ========================
+
+def _cache_path(bbox_str: str) -> str:
+    """Путь к файлу кэша для данного BBOX."""
+    h = hashlib.md5(bbox_str.encode()).hexdigest()[:12]
+    return os.path.join(CACHE_DIR, f"settlements_{h}.json")
+
+
+def _load_cache(bbox_str: str) -> list[dict] | None:
+    """
+    Загружает кэшированный ответ Overpass API.
+
+    Returns:
+        Список elements из Overpass или None, если кэш отсутствует/просрочен.
+    """
+    path = _cache_path(bbox_str)
+    if not os.path.exists(path):
+        return None
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        age = time.time() - data.get("timestamp", 0)
+        if age > CACHE_TTL_SECONDS:
+            logger.info(
+                f"Кэш границ НП просрочен: {path} "
+                f"(возраст: {age / 3600:.1f} ч)"
+            )
+            return None
+
+        logger.info(
+            f"Кэш границ НП загружен: {path} "
+            f"(возраст: {age / 3600:.1f} ч, "
+            f"{data.get('count', 0)} элементов)"
+        )
+        return data.get("elements", [])
+    except Exception as e:
+        logger.warning(f"Ошибка чтения кэша: {e}")
+        return None
+
+
+def _save_cache(bbox_str: str, elements: list[dict]) -> None:
+    """Сохраняет ответ Overpass API в кэш."""
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        path = _cache_path(bbox_str)
+        data = {
+            "timestamp": time.time(),
+            "bbox": bbox_str,
+            "count": len(elements),
+            "elements": elements,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        logger.info(
+            f"Кэш границ НП сохранён: {path} "
+            f"({len(elements)} элементов)"
+        )
+    except Exception as e:
+        logger.warning(f"Ошибка записи кэша: {e}")
+
+
+# ========================
+# OSM: Разбор полигонов
+# ========================
+
+def _way_to_polygon(element: dict) -> Polygon | None:
+    """
+    Преобразует way-элемент Overpass (out geom) в Shapely Polygon.
+
+    Shapely использует (x, y) = (lon, lat), поэтому координаты
+    переставляются при создании полигона.
+    """
+    geom = element.get("geometry", [])
+    if len(geom) < 4:
+        return None
+
+    try:
+        coords = [(n["lon"], n["lat"]) for n in geom]
+        poly = Polygon(coords)
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        if poly.is_empty or poly.area < 1e-10:
+            return None
+        return poly
+    except Exception:
+        return None
+
+
+def _relation_to_polygon(
+    element: dict,
+) -> Polygon | MultiPolygon | None:
+    """
+    Преобразует relation-элемент Overpass (out geom) в Shapely Polygon.
+
+    Алгоритм:
+    1. Собирает outer-кольца из member-ов (role=outer или без роли)
+    2. Объединяет через linemerge → замкнутые кольца
+    3. polygonize → список Polygon
+    4. Inner-кольца (role=inner) вычитаются как отверстия (holes)
+    """
+    members = element.get("members", [])
+    if not members:
+        return None
+
+    outer_rings: list[list[tuple[float, float]]] = []
+    inner_rings: list[list[tuple[float, float]]] = []
+
+    for member in members:
+        geom = member.get("geometry", [])
+        if len(geom) < 2:
+            continue
+
+        coords = [(n["lon"], n["lat"]) for n in geom]
+        role = member.get("role", "outer")
+
+        if role == "inner":
+            inner_rings.append(coords)
+        else:
+            outer_rings.append(coords)
+
+    if not outer_rings:
+        return None
+
+    try:
+        outer_lines = [LineString(ring) for ring in outer_rings]
+        merged = linemerge(outer_lines)
+
+        polygons: list[Polygon] = []
+
+        if merged.geom_type == "LineString":
+            if merged.is_closed:
+                polygons.append(Polygon(merged))
+        elif merged.geom_type == "MultiLineString":
+            polygons.extend(polygonize(merged))
+        else:
+            return None
+
+        if not polygons:
+            return None
+
+        # Обработка отверстий (inner-кольца)
+        if inner_rings:
+            for i, poly in enumerate(polygons):
+                for hole_coords in inner_rings:
+                    try:
+                        hole_line = LineString(hole_coords)
+                        if hole_line.is_closed and poly.contains(hole_line):
+                            hole_poly = Polygon(hole_coords)
+                            polygons[i] = poly.difference(hole_poly)
+                    except Exception:
+                        pass
+
+        # Валидация
+        valid_polygons: list[Polygon] = []
+        for p in polygons:
+            if not p.is_valid:
+                p = p.buffer(0)
+            if not p.is_empty and p.area > 1e-10:
+                valid_polygons.append(p)
+
+        if not valid_polygons:
+            return None
+
+        if len(valid_polygons) == 1:
+            return valid_polygons[0]
+        return MultiPolygon(valid_polygons)
+
+    except Exception as e:
+        logger.debug(
+            f"Не удалось разобрать relation id={element.get('id')}: {e}"
+        )
+        return None
+
+
+def _parse_overpass_elements(
+    elements: list[dict],
+) -> list[Polygon | MultiPolygon]:
+    """
+    Преобразует элементы Overpass API в список Shapely-полигонов.
+
+    Поддерживает два формата ответа:
+    - «out geom»: поля geometry (ways) / members (relations)
+    - «out bb»: поля bounds (прямоугольные оболочки)
+
+    Приоритет: geom > bb. Если geom-данные есть — используются они,
+    если нет — падаем обратно на bounding boxes (совместимость).
+    """
+    polygons: list[Polygon | MultiPolygon] = []
+
+    # Первый проход: проверяем, есть ли geom-данные
+    has_geom = False
+    for element in elements:
+        if element.get("type") == "way" and element.get("geometry"):
+            has_geom = True
+        elif element.get("type") == "relation" and element.get("members"):
+            has_geom = True
+
+    if has_geom:
+        for element in elements:
+            if element.get("type") == "way":
+                poly = _way_to_polygon(element)
+                if poly is not None:
+                    polygons.append(poly)
+            elif element.get("type") == "relation":
+                poly = _relation_to_polygon(element)
+                if poly is not None:
+                    polygons.append(poly)
+
+    if polygons:
+        logger.info(
+            f"Разобрано {len(polygons)} полигонов НП из OSM (out geom)"
+        )
+        return polygons
+
+    # Fallback: bounding boxes (out bb)
+    for element in elements:
+        if "bounds" in element:
+            b = element["bounds"]
+            coords = [
+                (b["minlon"], b["minlat"]),
+                (b["maxlon"], b["minlat"]),
+                (b["maxlon"], b["maxlat"]),
+                (b["minlon"], b["maxlat"]),
+            ]
+            try:
+                poly = Polygon(coords)
+                if poly.is_valid and poly.area > 0:
+                    polygons.append(poly)
+            except Exception:
+                pass
+
+    logger.info(
+        f"Разобрано {len(polygons)} bounding boxes из OSM "
+        f"(out bb fallback)"
+    )
+    return polygons
+
+
+# ========================
 # OSM: Определение границ НП
 # ========================
 
 async def fetch_settlement_boundaries(
     cards: list[dict],
     progress_callback: Callable[[str], Awaitable[None]] | None = None,
-) -> list[tuple[float, float, float, float]]:
+) -> list[Polygon | MultiPolygon]:
     """
-    Получает bounding boxes границ населённых пунктов через Overpass API.
+    Получает полигоны границ населённых пунктов через Overpass API.
+
+    Порядок работы:
+    1. Проверка дискового кэша (TTL 24 ч)
+    2. Запрос к Overpass API с «out geom» (реальные полигоны)
+    3. Fallback: запрос с «out bb» (прямоугольные оболочки)
+    4. Кэширование результата
 
     Returns:
-        Список кортежей (lat_min, lon_min, lat_max, lon_max).
+        Список Shapely-полигонов (Polygon или MultiPolygon).
     """
     valid_coords = [_parse_coords(c) for c in cards]
     valid_coords = [c for c in valid_coords if c is not None]
@@ -195,14 +455,18 @@ async def fetch_settlement_boundaries(
 
     bbox = f"{lat_min},{lon_min},{lat_max},{lon_max}"
 
-    query = (
-        "[out:json][timeout:90];\n"
-        "(\n"
-        '  relation["place"~"city|town|village"](' + bbox + ');\n'
-        '  way["place"~"city|town|village"](' + bbox + ');\n'
-        ");\n"
-        "out bb;\n"
-    )
+    # Шаг 1: Проверка кэша
+    cached_elements = _load_cache(bbox)
+    if cached_elements is not None:
+        polygons = _parse_overpass_elements(cached_elements)
+        if polygons:
+            return polygons
+
+    if progress_callback:
+        await progress_callback(
+            f"Загрузка границ НП из OpenStreetMap...\n"
+            f"BBOX: {bbox}"
+        )
 
     # Список зеркал Overpass API с резервными серверами
     overpass_urls = [
@@ -217,48 +481,57 @@ async def fetch_settlement_boundaries(
         "Accept": "application/json",
     }
 
-    if progress_callback:
-        await progress_callback(
-            f"Загрузка границ НП из OpenStreetMap...\n"
-            f"BBOX: {bbox}"
-        )
+    # Типы населённых пунктов: city, town, village + hamlet (деревни/хутора)
+    place_filter = "city|town|village|hamlet"
+
+    # Шаг 2: Запрос с out geom (реальные полигоны)
+    geom_query = (
+        "[out:json][timeout:90];\n"
+        "(\n"
+        f'  relation["place"~"{place_filter}"]({bbox});\n'
+        f'  way["place"~"{place_filter}"]({bbox});\n'
+        ");\n"
+        "out geom;\n"
+    )
+
+    # Шаг 3 (fallback): запрос с out bb (прямоугольники)
+    bb_query = (
+        "[out:json][timeout:90];\n"
+        "(\n"
+        f'  relation["place"~"{place_filter}"]({bbox});\n'
+        f'  way["place"~"{place_filter}"]({bbox});\n'
+        ");\n"
+        "out bb;\n"
+    )
 
     for url in overpass_urls:
-        try:
-            logger.info(f"Попытка запроса к Overpass API: {url}")
-            async with httpx.AsyncClient(
-                verify=False,
-                headers=headers,
-            ) as client:
-                resp = await client.post(
-                    url, data={"data": query}, timeout=120,
+        # Сначала пробуем out geom
+        elements = await _overpass_request(
+            url, geom_query, headers, "geom",
+        )
+        if elements is not None:
+            polygons = _parse_overpass_elements(elements)
+            if polygons:
+                _save_cache(bbox, elements)
+                logger.info(
+                    f"Overpass API ({url}): {len(polygons)} полигонов НП "
+                    f"(out geom) для bbox {bbox}"
                 )
-                resp.raise_for_status()
-                data = resp.json()
+                return polygons
 
-            bboxes = []
-            for element in data.get("elements", []):
-                if "bounds" in element:
-                    b = element["bounds"]
-                    bboxes.append((
-                        b["minlat"], b["minlon"],
-                        b["maxlat"], b["maxlon"],
-                    ))
-
-            logger.info(
-                f"Overpass API ({url}): {len(bboxes)} границ НП "
-                f"для bbox {lat_min:.3f},{lon_min:.3f},{lat_max:.3f},{lon_max:.3f}"
-            )
-            return bboxes
-
-        except httpx.HTTPStatusError as e:
-            logger.warning(
-                f"Overpass API ({url}): HTTP {e.response.status_code}"
-            )
-            continue
-        except Exception as e:
-            logger.warning(f"Overpass API ({url}): {e}")
-            continue
+        # Fallback: out bb
+        elements = await _overpass_request(
+            url, bb_query, headers, "bb",
+        )
+        if elements is not None:
+            polygons = _parse_overpass_elements(elements)
+            if polygons:
+                _save_cache(bbox, elements)
+                logger.info(
+                    f"Overpass API ({url}): {len(polygons)} bounding boxes НП "
+                    f"(out bb fallback) для bbox {bbox}"
+                )
+                return polygons
 
     logger.error(
         "Все зеркала Overpass API недоступны. "
@@ -267,37 +540,141 @@ async def fetch_settlement_boundaries(
     return []
 
 
-def _point_in_any_bbox(
+async def _overpass_request(
+    url: str,
+    query: str,
+    headers: dict,
+    mode: str,
+) -> list[dict] | None:
+    """
+    Выполняет единичный запрос к Overpass API.
+
+    Args:
+        url: URL зеркала Overpass
+        query: Overpass QL запрос
+        headers: HTTP-заголовки
+        mode: «geom» или «bb» (для логирования)
+
+    Returns:
+        Список elements или None при ошибке.
+    """
+    try:
+        logger.info(
+            f"Overpass API ({url}): запрос (mode={mode})..."
+        )
+        async with httpx.AsyncClient(
+            verify=False,
+            headers=headers,
+        ) as client:
+            resp = await client.post(
+                url, data={"data": query}, timeout=120,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        elements = data.get("elements", [])
+        logger.info(
+            f"Overpass API ({url}): получено "
+            f"{len(elements)} элементов (mode={mode})"
+        )
+        return elements
+
+    except httpx.HTTPStatusError as e:
+        logger.warning(
+            f"Overpass API ({url}, mode={mode}): "
+            f"HTTP {e.response.status_code}"
+        )
+        return None
+    except Exception as e:
+        logger.warning(
+            f"Overpass API ({url}, mode={mode}): {e}"
+        )
+        return None
+
+
+# ========================
+# Классификация ДТП: НП / вне НП
+# ========================
+
+def _point_in_any_polygon(
     lat: float,
     lon: float,
-    bboxes: list[tuple[float, float, float, float]],
+    polygons: list[Polygon | MultiPolygon],
 ) -> bool:
-    """Попадает ли точка хотя бы в один bounding box."""
-    for lat_min, lon_min, lat_max, lon_max in bboxes:
-        if lat_min <= lat <= lat_max and lon_min <= lon <= lon_max:
-            return True
+    """
+    Попадает ли точка хотя бы в один полигон НП.
+
+    Использует Shapely Point.contains для точной проверки.
+    Shapely: (x, y) = (lon, lat).
+    """
+    point = Point(lon, lat)
+    for poly in polygons:
+        try:
+            if poly.contains(point):
+                return True
+        except Exception:
+            continue
     return False
 
 
 def classify_cards(
     cards: list[dict],
-    settlement_bboxes: list[tuple[float, float, float, float]],
+    settlement_polygons: list[Polygon | MultiPolygon],
 ) -> tuple[list[dict], list[dict]]:
     """
     Разделяет карточки на две группы: НП и вне НП.
 
+    Использует Shapely unary_union + prepared geometry
+    для быстрой проверки O(1) на точку после инициализации.
+
+    Args:
+        cards: Карточки ДТП с координатами
+        settlement_polygons: Список Shapely-полигонов границ НП
+
     Returns:
         (settlement_cards, non_settlement_cards)
     """
+    if not settlement_polygons:
+        return [], list(cards)
+
     settlement_cards = []
     non_settlement_cards = []
+
+    # Объединяем все полигоны в одну геометрию и подготавливаем
+    # для O(1) проверки contains на каждую точку
+    try:
+        merged = unary_union(settlement_polygons)
+        prepared = prep(merged)
+        use_prepared = True
+    except Exception as e:
+        logger.warning(
+            f"Не удалось создать prepared geometry: {e}. "
+            f"Используется поцикличная проверка."
+        )
+        prepared = None
+        use_prepared = False
 
     for card in cards:
         coords = _parse_coords(card)
         if coords is None:
             non_settlement_cards.append(card)
             continue
-        if _point_in_any_bbox(coords[0], coords[1], settlement_bboxes):
+
+        # Shapely: (x, y) = (lon, lat)
+        point = Point(coords[1], coords[0])
+        in_settlement = False
+
+        try:
+            if use_prepared and prepared is not None:
+                in_settlement = prepared.contains(point)
+            else:
+                in_settlement = _point_in_any_polygon(
+                    coords[0], coords[1], settlement_polygons,
+                )
+        except Exception:
+            pass
+
+        if in_settlement:
             settlement_cards.append(card)
         else:
             non_settlement_cards.append(card)
@@ -305,7 +682,7 @@ def classify_cards(
     logger.info(
         f"Классификация: {len(settlement_cards)} в НП, "
         f"{len(non_settlement_cards)} вне НП "
-        f"(всего {len(cards)})"
+        f"(всего {len(cards)}, полигонов: {len(settlement_polygons)})"
     )
     return settlement_cards, non_settlement_cards
 
@@ -891,12 +1268,12 @@ async def calculate_concentration_points(
         logger.warning("Нет карточек с координатами — расчёт невозможен")
         return []
 
-    # Шаг 2: Границы НП из Overpass API
-    settlement_bboxes = await fetch_settlement_boundaries(
+    # Шаг 2: Границы НП из Overpass API (полигоны, с кэшем)
+    settlement_polygons = await fetch_settlement_boundaries(
         cards_with_coords, progress_callback,
     )
 
-    if not settlement_bboxes:
+    if not settlement_polygons:
         logger.warning(
             "Не удалось получить границы НП из OSM. "
             "Все ДТП будут обработаны как вне НП."
@@ -909,9 +1286,9 @@ async def calculate_concentration_points(
             f"Всего с координатами: {len(cards_with_coords)}"
         )
 
-    if settlement_bboxes:
+    if settlement_polygons:
         settlement_cards, non_settlement_cards = classify_cards(
-            cards_with_coords, settlement_bboxes,
+            cards_with_coords, settlement_polygons,
         )
     else:
         # Fallback: все как вне НП
