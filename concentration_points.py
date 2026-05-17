@@ -3,7 +3,14 @@
 
 Два алгоритма:
   1. Населённые пункты (НП) — 3 прохода:
-     - 1-й проход: перекрёстки (obj_dtp содержит «перекрёсток»), радиус 50 м
+     - 1-й проход: перекрёстки (sdor содержит «перекрёсток»):
+       Шаг 1a: ДТП на дороге с пикетажем — сначала проверка
+       по пикетажу (±50 м по той же дороге, только «перекрёстки»);
+       если очаг не сформирован — радиус 50 м по GPS (только «перекрёстки»)
+       с проверкой пикетажа (ДТП на той же дороге с piketаж > 50 м
+       исключаются)
+       Шаг 1b: ДТП без пикетажа — стандартный радиус 50 м по GPS
+       (только «перекрёстки»)
      - 2-й проход: дороги с наименованием и пикетажем, скользящее окно 200 м
      - 3-й проход: радиус 100 м от точки, с проверкой пикетажа:
        если центр ДТП и другое ДТП в радиусе 100 м имеют одинаковое
@@ -98,15 +105,20 @@ def _parse_coords(card: dict) -> tuple[float, float] | None:
 
 
 def _is_intersection(card: dict) -> bool:
-    """Является ли место ДТП перекрёстком (по полю obj_dtp)."""
-    dor_usl = card.get("dor_usl", {}) or {}
-    obj_dtp_list = dor_usl.get("obj_dtp", []) or []
-    if isinstance(obj_dtp_list, str):
-        obj_dtp_list = [obj_dtp_list]
-    obj_text = " ".join(str(o).lower() for o in obj_dtp_list)
-    for keyword in INTERSECTION_KEYWORDS:
-        if keyword in obj_text:
-            return True
+    """Является ли место ДТП перекрёстком (по полю sdor).
+
+    Поле sdor содержит объект УДС на месте ДТП: перекрёсток,
+    перегон, пешеходный переход и т.д.
+    Данные лежат внутри card["dor_usl"]["sdor"] — это массив строк.
+    """
+    dor_usl = card.get("dor_usl") or {}
+    sdor_list = dor_usl.get("sdor") or []
+    if isinstance(sdor_list, list):
+        for item in sdor_list:
+            item_lower = str(item).strip().lower()
+            for keyword in INTERSECTION_KEYWORDS:
+                if keyword in item_lower:
+                    return True
     return False
 
 
@@ -780,7 +792,10 @@ def find_settlement_concentration_points(cards: list[dict]) -> list[dict]:
     """
     Поиск очагов в населённых пунктах — 3 прохода.
 
-    1-й проход: перекрёстки (50 м)
+    1-й проход: перекрёстки (50 м) с проверкой пикетажа:
+      Шаг 1a: ДТП с дорогой+пикетажем — сначала по пикетажу (±50 м),
+              затем fallback радиус 50 м по GPS с piketаж-фильтром
+      Шаг 1b: ДТП без пикетажа — стандартный радиус 50 м по GPS
     2-й проход: дороги с наименованием + пикетажем, окно 200 м
     3-й проход: радиус 100 м с проверкой пикетажа (200 м для ДТП
                с одинаковой дорогой и пикетажем)
@@ -798,28 +813,157 @@ def find_settlement_concentration_points(cards: list[dict]) -> list[dict]:
     assigned: set[int] = set()
     clusters: list[dict] = []
 
-    # --- 1-й проход: перекрёстки (50 м) ---
+    # --- 1-й проход: перекрёстки (50 м) с проверкой пикетажа ---
+
+    # Шаг 1a: Перекрёстки С наименованием дороги и пикетажем
     for idx, card in indexed_with_coords:
         if idx in assigned:
             continue
         if not _is_intersection(card):
             continue
+        if not _has_road_and_piketazh(card):
+            continue
 
-        candidates = [
+        center_road = _get_road_name(card)
+        center_km = _get_km_m(card)
+        center = _parse_coords(card)
+        if center is None:
+            continue
+
+        # 1a-1: Проверка по пикетажу: ±50 м по той же дороге,
+        #        только ДТП с «перекрёсток»
+        piketazh_candidates = []
+        for j, c in indexed_with_coords:
+            if j in assigned or j == idx:
+                continue
+            if _get_road_name(c) != center_road:
+                continue
+            other_km = _get_km_m(c)
+            if other_km is None:
+                continue
+            if abs(center_km - other_km) * 1000.0 > SETTLEMENT_INTERSECTION_RADIUS_M:
+                continue
+            if not _is_intersection(c):
+                continue
+            piketazh_candidates.append((j, c))
+
+        if piketazh_candidates:
+            group_cards = [card] + [c for _, c in piketazh_candidates]
+            type_counter = Counter(
+                _get_dtp_type(c) for c in group_cards
+            )
+            is_cluster, _ = _check_cluster_criteria(
+                type_counter, len(group_cards),
+            )
+            if is_cluster:
+                assigned.add(idx)
+                for j, _ in piketazh_candidates:
+                    assigned.add(j)
+                group_cards.sort(key=lambda c: _get_date(c))
+                clusters.append(
+                    _build_cluster(
+                        group_cards, center, "settlement_intersection"
+                    )
+                )
+                continue
+
+        # 1a-2: Fallback — радиус 50 м по GPS (только «перекрёстки»),
+        #        с проверкой пикетажа для ДТП на той же дороге
+        gps_candidates = [
             (j, c) for j, c in indexed_with_coords
-            if j not in assigned
+            if j not in assigned and j != idx
         ]
-        group = _cluster_cards_by_radius(
-            [(idx, card)] + [(j, c) for j, c in candidates if j != idx],
-            SETTLEMENT_INTERSECTION_RADIUS_M,
-            assigned,
+
+        group_indices = [idx]
+        group_cards = [card]
+
+        for j, c in gps_candidates:
+            if not _is_intersection(c):
+                continue
+            coords = _parse_coords(c)
+            if coords is None:
+                continue
+            dist = haversine_meters(
+                center[0], center[1], coords[0], coords[1],
+            )
+            if dist > SETTLEMENT_INTERSECTION_RADIUS_M:
+                continue
+
+            # Проверка пикетажа: если ДТП на той же дороге
+            # и имеет пикетаж — проверяем окно 50 м
+            other_road = _get_road_name(c)
+            other_km = _get_km_m(c)
+            if (
+                other_road == center_road
+                and other_km is not None
+            ):
+                piketazh_diff_m = abs(other_km - center_km) * 1000.0
+                if piketazh_diff_m > SETTLEMENT_INTERSECTION_RADIUS_M:
+                    # Пикетаж различается более чем на 50 м — исключаем
+                    continue
+
+            group_indices.append(j)
+            group_cards.append(c)
+
+        type_counter = Counter(
+            _get_dtp_type(c) for c in group_cards
+        )
+        is_cluster, _ = _check_cluster_criteria(
+            type_counter, len(group_cards),
+        )
+        if is_cluster:
+            assigned.update(group_indices)
+            group_cards.sort(key=lambda c: _get_date(c))
+            clusters.append(
+                _build_cluster(
+                    group_cards, center, "settlement_intersection"
+                )
+            )
+
+    # Шаг 1b: Перекрёстки БЕЗ пикетажа — радиус 50 м по GPS
+    # (с пикетажем уже обработаны в шаге 1a)
+    # Кандидаты должны быть тоже «перекрёстками» (sdor)
+    for idx, card in indexed_with_coords:
+        if idx in assigned:
+            continue
+        if not _is_intersection(card):
+            continue
+        if _has_road_and_piketazh(card):
+            continue  # уже обработаны в шаге 1a
+
+        center = _parse_coords(card)
+        if center is None:
+            continue
+
+        # Собираем кандидатов в радиусе 50 м (только «перекрёстки»)
+        group_indices = [idx]
+        group_cards = [card]
+
+        for j, c in indexed_with_coords:
+            if j in assigned or j == idx:
+                continue
+            if not _is_intersection(c):
+                continue
+            coords = _parse_coords(c)
+            if coords is None:
+                continue
+            dist = haversine_meters(
+                center[0], center[1], coords[0], coords[1],
+            )
+            if dist <= SETTLEMENT_INTERSECTION_RADIUS_M:
+                group_indices.append(j)
+                group_cards.append(c)
+
+        type_counter = Counter(
+            _get_dtp_type(c) for c in group_cards
+        )
+        is_cluster, _ = _check_cluster_criteria(
+            type_counter, len(group_cards),
         )
 
-        if group is not None:
-            assigned.update(group)
-            group_cards = [cards[j] for j in group]
+        if is_cluster:
+            assigned.update(group_indices)
             group_cards.sort(key=lambda c: _get_date(c))
-            center = _parse_coords(cards[idx])
             clusters.append(
                 _build_cluster(group_cards, center, "settlement_intersection")
             )
