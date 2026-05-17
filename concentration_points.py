@@ -66,7 +66,22 @@ ANY_TYPE_THRESHOLD = 5    # 5+ ДТП любых видов = очаг
 
 # Ключевые слова для определения перекрёстка
 INTERSECTION_KEYWORDS = [
-    "перекрёсток", "перекресток", "перекрёстка", "перекрестка",
+    # перекрёсток — разные падежи/окончания
+    "перекрёсток", "перекресток",
+    "перекрёстка", "перекрестка",
+    "перекрёстку", "перекрестку",
+    "перекрёстке", "перекрестке",
+    "перекрёстков", "перекрестков",
+    # круговое движение — разные формы
+    "круговое движение",
+    "круговым движением",
+]
+
+# ДТП на этих объектах УДС исключаются из расчёта очагов
+# (произошли не на дороге)
+EXCLUDED_SDOR_KEYWORDS = [
+    "внутридворовая территория",
+    "отделенная от проезжей части",
 ]
 
 # Кэширование границ НП
@@ -117,6 +132,23 @@ def _is_intersection(card: dict) -> bool:
         for item in sdor_list:
             item_lower = str(item).strip().lower()
             for keyword in INTERSECTION_KEYWORDS:
+                if keyword in item_lower:
+                    return True
+    return False
+
+
+def _is_off_road(card: dict) -> bool:
+    """Произошло ли ДТП вне дороги (внутридворовая территория, автостоянка).
+
+    Такие ДТП не могут входить в очаги аварийности.
+    Поле sdor находится внутри card["dor_usl"]["sdor"] — массив строк.
+    """
+    dor_usl = card.get("dor_usl") or {}
+    sdor_list = dor_usl.get("sdor") or []
+    if isinstance(sdor_list, list):
+        for item in sdor_list:
+            item_lower = str(item).strip().lower()
+            for keyword in EXCLUDED_SDOR_KEYWORDS:
                 if keyword in item_lower:
                     return True
     return False
@@ -1402,11 +1434,15 @@ async def calculate_concentration_points(
         return []
 
     # Шаг 1: Фильтр — только карточки с координатами
-    cards_with_coords = [c for c in cards if _parse_coords(c)]
+    #   и исключаем ДТП вне дороги (внутридворовые, автостоянки)
+    cards_with_coords = [
+        c for c in cards
+        if _parse_coords(c) and not _is_off_road(c)
+    ]
     no_coords = len(cards) - len(cards_with_coords)
 
     if no_coords > 0:
-        logger.warning(f"{no_coords} карточек без координат пропущены")
+        logger.warning(f"{no_coords} карточек без координат или вне дороги пропущены")
 
     if not cards_with_coords:
         logger.warning("Нет карточек с координатами — расчёт невозможен")

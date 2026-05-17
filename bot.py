@@ -17,6 +17,18 @@ import os
 import sys
 from datetime import datetime
 
+# ============================================================
+# SSL: otkluchaem proverku sertifikatov (dlya korporativnogo fayervola)
+# Patentiruem httpx DO importa telegram
+# ============================================================
+import httpx
+_orig_async_client_init = httpx.AsyncClient.__init__
+
+def _patched_async_client_init(self, *args, **kwargs):
+    kwargs.setdefault('verify', False)
+    _orig_async_client_init(self, *args, **kwargs)
+
+httpx.AsyncClient.__init__ = _patched_async_client_init
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import Conflict, NetworkError
@@ -227,8 +239,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Результат: 2 Excel-файла\n"
         "  1. Карточки ДТП (1 строка = 1 ДТП)\n"
         "  2. Участники ДТП (1 строка = 1 участник)\n\n"
-        "После выгрузки бот предложит провести анализ —\n"
-        "сравнение с аналогичным периодом прошлого года.\n\n"
+        "После выгрузки бот предложит:\n"
+        "\U0001F4CA Анализ — сравнение с прошлым годом\n"
+        "\U0001F916 Анализ с ИИ — анализ + резюме нейросети\n"
+        "\U0001F525 Очаги ДТП — места концентрации аварийности\n\n"
         "Команды:\n"
         "/dtp — начать выгрузку через кнопки\n"
         "/help — справка\n"
@@ -254,22 +268,28 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "--- Способ 3: Строгий формат ---\n"
         "  2.2024 1101  (месяц.год код_региона)\n\n"
         "--- Аналитика ---\n"
-        "После выгрузки данных бот предложит кнопку\n"
-        "\U0001F4CA Провести анализ — сравнение текущего\n"
-        "периода с аналогичным периодом прошлого года.\n"
-        "Результат: текстовое резюме + Excel-файл\n\n"
+        "После выгрузки данных бот предложит:\n\n"
+        "\U0001F4CA <b>Анализ</b> — математическое сравнение\n"
+        "текущего периода с аналогичным периодом\n"
+        "прошлого года. Результат: текстовое резюме + Excel-файл.\n\n"
+        "\U0001F916 <b>Анализ с ИИ</b> — то же самое +\n"
+        "текстовое резюме от нейросети GLM\n"
+        "и возможность задавать вопросы по данным.\n\n"
+        "\U0001F525 <b>Очаги ДТП</b> — выявление мест\n"
+        "концентрации аварийности (перекрёстки, участки дорог).\n"
+        "Результат: Excel-файл с описанием очагов и подробностями.\n\n"
         "--- Команды ---\n"
         "/dtp — выгрузка через кнопки\n"
         "/regions — список регионов\n"
         "/help — эта справка\n\n"
-        "--- Результат ---\n"
+        "--- Результат выгрузки ---\n"
         "Бот вернёт 2 Excel-файла:\n"
         "  1. dtp_cards.xlsx — карточки ДТП\n"
-        "  2. dtp_uch.xlsx — участники ДТП\n"
-        "И при запросе анализа:\n"
-        "  3. dtp_analytics.xlsx — аналитика\n"
-        "При наличии вопросов или предложений\n"
-        "контакты для связи: @flame1290 @Julich_Vorobevich"
+        "  2. dtp_uch.xlsx — участники ДТП\n\n"
+        "--- Контакты ---\n"
+        "Вопросы и предложения по работе бота:\n"
+        "@flame1290 и @Julich_Vorobevich",
+        parse_mode="HTML",
     )
 
 
