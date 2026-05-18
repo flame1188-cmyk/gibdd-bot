@@ -77,13 +77,9 @@ INTERSECTION_KEYWORDS = [
     "круговым движением",
 ]
 
-# ДТП на этих объектах УДС исключаются из расчёта очагов
-# (произошли не на дороге)
-EXCLUDED_SDOR_KEYWORDS = [
-    "внутридворовая территория",
-    "отделенная от проезжей части",
-    "иное место",
-]
+# ДТП с k_ul = "Иные места" исключаются из расчёта очагов
+# (произошли не на дороге — дворы, автостоянки, паркинги и т.д.)
+EXCLUDED_K_UL = "иные места"
 
 # Кэширование границ НП
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
@@ -142,17 +138,10 @@ def _is_off_road(card: dict) -> bool:
     """Произошло ли ДТП вне дороги (внутридворовая территория, автостоянка).
 
     Такие ДТП не могут входить в очаги аварийности.
-    Поле sdor находится внутри card["dor_usl"]["sdor"] — массив строк.
+    Определяется по полю card["k_ul"] — категория улицы/дороги.
+    Значение "Иные места" означает, что ДТП произошло не на дороге.
     """
-    dor_usl = card.get("dor_usl") or {}
-    sdor_list = dor_usl.get("sdor") or []
-    if isinstance(sdor_list, list):
-        for item in sdor_list:
-            item_lower = str(item).strip().lower()
-            for keyword in EXCLUDED_SDOR_KEYWORDS:
-                if keyword in item_lower:
-                    return True
-    return False
+    return str(card.get("k_ul", "")).strip().lower() == EXCLUDED_K_UL
 
 
 def _get_dtp_type(card: dict) -> str:
@@ -1435,7 +1424,7 @@ async def calculate_concentration_points(
         return []
 
     # Шаг 1: Фильтр — только карточки с координатами
-    #   и исключаем ДТП вне дороги (внутридворовые, автостоянки, иное место)
+    #   и исключаем ДТП вне дороги (k_ul = "Иные места")
     off_road_count = 0
     no_coords_count = 0
     cards_with_coords = []
@@ -1445,12 +1434,12 @@ async def calculate_concentration_points(
             continue
         if _is_off_road(c):
             off_road_count += 1
-            # Логируем, какие именно значения sdor попали в исключение
-            dor_usl = c.get("dor_usl") or {}
-            sdor_list = dor_usl.get("sdor") or []
+            # Логируем исключённые ДТП
             logger.info(
-                f"ДТП вне дороги исключено: sdor={sdor_list}, "
-                f"дорога={c.get('dor','')}, улица={c.get('street','')}"
+                f"ДТП вне дороги исключено: k_ul={c.get('k_ul','')}, "
+                f"sdor={c.get('dor_usl',{}).get('sdor',[])}, "
+                f"дорога={c.get('dor','')}, улица={c.get('street','')}, "
+                f"дата={c.get('date_dtp','')}"
             )
             continue
         cards_with_coords.append(c)

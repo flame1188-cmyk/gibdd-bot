@@ -62,7 +62,6 @@ from concentration_points import (
     get_concentration_column_names,
     get_detail_column_names,
     _is_off_road,
-    EXCLUDED_SDOR_KEYWORDS,
 )
 from user_request_parser import (
     parse_user_message,
