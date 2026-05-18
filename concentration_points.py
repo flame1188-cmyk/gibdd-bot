@@ -388,9 +388,20 @@ def _relation_to_polygon(
         return None
 
 
+def _invalidate_cache(bbox_str: str) -> None:
+    """Удаляет файл кэша, чтобы при следующем запросе данные обновились."""
+    path = _cache_path(bbox_str)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            logger.info(f"Кэш границ НП инвалидирован (bbox): {path}")
+    except Exception as e:
+        logger.warning(f"Ошибка удаления кэша: {e}")
+
+
 def _parse_overpass_elements(
     elements: list[dict],
-) -> list[Polygon | MultiPolygon]:
+) -> tuple[list[Polygon | MultiPolygon], bool]:
     """
     Преобразует элементы Overpass API в список Shapely-полигонов.
 
@@ -400,6 +411,11 @@ def _parse_overpass_elements(
 
     Приоритет: geom > bb. Если geom-данные есть — используются они,
     если нет — падаем обратно на bounding boxes (совместимость).
+
+    Returns:
+        Кортеж (polygons, is_bbox_fallback):
+        - polygons — список полигонов
+        - is_bbox_fallback — True, если использованы bounding boxes
     """
     polygons: list[Polygon | MultiPolygon] = []
 
@@ -426,7 +442,7 @@ def _parse_overpass_elements(
         logger.info(
             f"Разобрано {len(polygons)} полигонов НП из OSM (out geom)"
         )
-        return polygons
+        return polygons, False
 
     # Fallback: bounding boxes (out bb)
     for element in elements:
@@ -449,7 +465,7 @@ def _parse_overpass_elements(
         f"Разобрано {len(polygons)} bounding boxes из OSM "
         f"(out bb fallback)"
     )
-    return polygons
+    return polygons, True
 
 
 # ========================
@@ -492,9 +508,18 @@ async def fetch_settlement_boundaries(
     # Шаг 1: Проверка кэша
     cached_elements = _load_cache(bbox)
     if cached_elements is not None:
-        polygons = _parse_overpass_elements(cached_elements)
-        if polygons:
+        polygons, is_bbox = _parse_overpass_elements(cached_elements)
+        if polygons and not is_bbox:
+            # Кэш содержит реальные полигоны — используем
             return polygons
+        elif polygons and is_bbox:
+            # Кэш содержит только bounding boxes — инвалидируем
+            # и запросим заново с out geom
+            logger.warning(
+                f"Кэш содержит bounding boxes вместо полигонов — "
+                f"инвалидирую и запрашиваю заново"
+            )
+            _invalidate_cache(bbox)
 
     if progress_callback:
         await progress_callback(
@@ -544,8 +569,8 @@ async def fetch_settlement_boundaries(
             url, geom_query, headers, "geom",
         )
         if elements is not None:
-            polygons = _parse_overpass_elements(elements)
-            if polygons:
+            polygons, is_bbox = _parse_overpass_elements(elements)
+            if polygons and not is_bbox:
                 _save_cache(bbox, elements)
                 logger.info(
                     f"Overpass API ({url}): {len(polygons)} полигонов НП "
@@ -553,17 +578,17 @@ async def fetch_settlement_boundaries(
                 )
                 return polygons
 
-        # Fallback: out bb
+        # Fallback: out bb (только если out geom не дал полигонов)
         elements = await _overpass_request(
             url, bb_query, headers, "bb",
         )
         if elements is not None:
-            polygons = _parse_overpass_elements(elements)
-            if polygons:
-                _save_cache(bbox, elements)
-                logger.info(
+            polygons, is_bbox = _parse_overpass_elements(elements)
+            if polygons and is_bbox:
+                # Bounding boxes кэшируем с коротким TTL — не сохраняем
+                logger.warning(
                     f"Overpass API ({url}): {len(polygons)} bounding boxes НП "
-                    f"(out bb fallback) для bbox {bbox}"
+                    f"(out bb fallback) — используем без кэширования"
                 )
                 return polygons
 
