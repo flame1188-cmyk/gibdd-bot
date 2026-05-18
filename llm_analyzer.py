@@ -315,7 +315,17 @@ async def ask_llm(
     if elapsed_since_last < _MIN_LLM_INTERVAL and _last_llm_call_time > 0:
         cooldown = _MIN_LLM_INTERVAL - elapsed_since_last
         logger.info(f"Rate limiter: ждём {cooldown:.0f} сек между LLM-вызовами...")
-        await asyncio.sleep(cooldown)
+        # Обратный отсчёт с уведомлением пользователя
+        remaining = int(cooldown) + 1
+        while remaining > 0:
+            if progress_callback:
+                await progress_callback(
+                    f"\U0001F916 Подготовка запроса к нейросети...\n"
+                    f"\u23F3 Запрос через {remaining} сек "
+                    f"(лимит бесплатного API GLM)"
+                )
+            await asyncio.sleep(min(10, remaining))
+            remaining -= min(10, remaining)
 
     logger.info(f"LLM запрос: модель={LLM_MODEL}, длина промпта={len(user_message)} символов")
 
