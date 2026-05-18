@@ -399,6 +399,20 @@ def format_change(value: float) -> str:
         return "0% \u2194"
 
 
+def _format_pct_arrow(new: int, old: int) -> str:
+    """Формирует строку '(+12%\u2191)' для изменения текущего vs предыдущего.
+    Возвращает пустую строку, если предыдущее значение 0."""
+    if old <= 0:
+        return ""
+    change = round((new - old) / old * 100, 0)
+    if change > 0:
+        return f" ({change:+.0f}%\u2191)"
+    elif change < 0:
+        return f" ({change:+.0f}%\u2193)"
+    else:
+        return " (=)"
+
+
 def build_analytics_message(
     comparison: dict[str, Any],
     reg_name: str,
@@ -470,20 +484,19 @@ def build_analytics_message(
 
         lines.append(f"Пиковый день: <b>{DAY_NAMES.get(peak_day_num, '')}</b> ({peak_day_count} ДТП, {pct_of_avg}% от среднего)")
 
-        # Таблица по дням (ДТП + погибшие)
+        # Таблица по дням (ДТП + погибшие с %)
         for day_num in range(7):
             day_name = DAY_SHORT[day_num]
             cur = cur_wd.get(day_num, 0)
             prv = prev_wd.get(day_num, 0)
             cur_d = cur_wd_deaths.get(day_num, 0)
             prv_d = prev_wd_deaths.get(day_num, 0)
-            deaths_part = f" / {cur_d} погиб." if cur_d > 0 else ""
-            if prv > 0:
-                change = round((cur - prv) / prv * 100, 1)
-                arrow = "\u2191" if change > 0 else ("\u2193" if change < 0 else "\u2194")
-                lines.append(f"  {day_name}: {cur}{deaths_part} ({change:+.0f}%{arrow})")
-            else:
-                lines.append(f"  {day_name}: {cur}{deaths_part}")
+            dtp_pct = _format_pct_arrow(cur, prv)
+            deaths_pct = _format_pct_arrow(cur_d, prv_d) if cur_d > 0 else ""
+            parts = f"{cur} ДТП{dtp_pct}"
+            if cur_d > 0:
+                parts += f" / {cur_d} погиб.{deaths_pct}"
+            lines.append(f"  {day_name}: {parts}")
     else:
         lines.append("Нет данных для анализа по дням недели")
 
@@ -528,19 +541,36 @@ def build_analytics_message(
         peak_deaths_str = f", {peak_deaths} погиб." if peak_deaths > 0 else ""
         lines.append(f"Пиковый интервал: <b>{peak_interval}</b> ({peak_count} ДТП{peak_deaths_str}, {pct_of_avg}% от среднего)")
 
-        # Топ-3 опасных часа
-        sorted_hours = sorted(cur_hour.items(), key=lambda x: x[1], reverse=True)
-        top_hours = sorted_hours[:3]
-        hours_str = ", ".join(f"{h:02d}:00 ({c})" for h, c in top_hours)
-        lines.append(f"Топ-3 часа: {hours_str}")
+        # Предыдущие интервалы ДТП и погибших для расчёта %
+        prev_intervals = {}
+        for h in range(24):
+            interval_start = (h // 3) * 3
+            interval_end = interval_start + 2
+            interval_key = f"{interval_start:02d}-{interval_end:02d}"
+            prev_intervals.setdefault(interval_key, 0)
+            prev_intervals[interval_key] += prev_hour.get(h, 0)
 
-        # Интервалы с погибшими
-        has_deaths_intervals = any(d > 0 for d in intervals_deaths.values())
-        if has_deaths_intervals:
-            deaths_sorted = sorted(intervals_deaths.items(), key=lambda x: x[1], reverse=True)
-            top_death_intervals = [(k, v) for k, v in deaths_sorted if v > 0][:3]
-            deaths_hours_str = ", ".join(f"{k} ({v} погиб.)" for k, v in top_death_intervals)
-            lines.append(f"Топ интервалов по погибшим: {deaths_hours_str}")
+        prev_intervals_deaths = {}
+        for h in range(24):
+            interval_start = (h // 3) * 3
+            interval_end = interval_start + 2
+            interval_key = f"{interval_start:02d}-{interval_end:02d}"
+            prev_intervals_deaths.setdefault(interval_key, 0)
+            prev_intervals_deaths[interval_key] += prev_hour_deaths.get(h, 0)
+
+        # Таблица по интервалам (ДТП + погибшие с %)
+        for interval_start in range(0, 24, 3):
+            interval_key = f"{interval_start:02d}-{interval_start + 2:02d}"
+            cur = intervals.get(interval_key, 0)
+            prv = prev_intervals.get(interval_key, 0)
+            cur_d = intervals_deaths.get(interval_key, 0)
+            prv_d = prev_intervals_deaths.get(interval_key, 0)
+            dtp_pct = _format_pct_arrow(cur, prv)
+            deaths_pct = _format_pct_arrow(cur_d, prv_d) if cur_d > 0 else ""
+            parts = f"{cur} ДТП{dtp_pct}"
+            if cur_d > 0:
+                parts += f" / {cur_d} погиб.{deaths_pct}"
+            lines.append(f"  {interval_key}: {parts}")
     else:
         lines.append("Нет данных для анализа по часам")
 
@@ -561,13 +591,12 @@ def build_analytics_message(
             prv = prev_type.get(tp_name, 0)
             cur_d = cur_type_deaths.get(tp_name, 0)
             prv_d = prev_type_deaths.get(tp_name, 0)
-            deaths_part = f" / {cur_d} погиб." if cur_d > 0 else ""
-            if prv > 0:
-                change = round((tp_count - prv) / prv * 100, 1)
-                arrow = "\u2191" if change > 0 else ("\u2193" if change < 0 else "\u2194")
-                lines.append(f"  {tp_name}: {tp_count}{deaths_part} ({change:+.0f}%{arrow})")
-            else:
-                lines.append(f"  {tp_name}: {tp_count}{deaths_part}")
+            dtp_pct = _format_pct_arrow(tp_count, prv)
+            deaths_pct = _format_pct_arrow(cur_d, prv_d) if cur_d > 0 else ""
+            parts = f"{tp_count} ДТП{dtp_pct}"
+            if cur_d > 0:
+                parts += f" / {cur_d} погиб.{deaths_pct}"
+            lines.append(f"  {tp_name}: {parts}")
     else:
         lines.append("Нет данных для анализа по видам ДТП")
 
@@ -588,13 +617,12 @@ def build_analytics_message(
             prv = prev_rz.get(rz_name, 0)
             cur_d = cur_rz_deaths.get(rz_name, 0)
             prv_d = prev_rz_deaths.get(rz_name, 0)
-            deaths_part = f" / {cur_d} погиб." if cur_d > 0 else ""
-            if prv > 0:
-                change = round((rz_count - prv) / prv * 100, 1)
-                arrow = "\u2191" if change > 0 else ("\u2193" if change < 0 else "\u2194")
-                lines.append(f"  {rz_name}: {rz_count}{deaths_part} ({change:+.0f}%{arrow})")
-            else:
-                lines.append(f"  {rz_name}: {rz_count}{deaths_part}")
+            dtp_pct = _format_pct_arrow(rz_count, prv)
+            deaths_pct = _format_pct_arrow(cur_d, prv_d) if cur_d > 0 else ""
+            parts = f"{rz_count} ДТП{dtp_pct}"
+            if cur_d > 0:
+                parts += f" / {cur_d} погиб.{deaths_pct}"
+            lines.append(f"  {rz_name}: {parts}")
     else:
         lines.append("Нет данных о значении дороги")
 
@@ -623,10 +651,17 @@ def build_analytics_message(
     prev_known_dtp = prev_cam_dtp + prev_no_cam_dtp
     prev_camera_pct = round(prev_cam_dtp / prev_known_dtp * 100, 1) if prev_known_dtp > 0 else 0
 
-    lines.append(f"С камерами фотовидеофиксации: {cam_dtp} ДТП, {cam_deaths} погиб., {cam_injured} ранен.")
-    lines.append(f"Без камер (фактор указан): {no_cam_dtp} ДТП, {no_cam_deaths} погиб., {no_cam_injured} ранен.")
+    cam_dtp_pct = _format_pct_arrow(cam_dtp, prev_cam_dtp)
+    cam_deaths_pct = _format_pct_arrow(cam_deaths, prev_cam["camera_deaths"]) if cam_deaths > 0 else ""
+    no_cam_dtp_pct = _format_pct_arrow(no_cam_dtp, prev_no_cam_dtp)
+    no_cam_deaths_pct = _format_pct_arrow(no_cam_deaths, prev_cam["no_camera_deaths"]) if no_cam_deaths > 0 else ""
+
+    lines.append(f"С камерами фотовидеофиксации: {cam_dtp} ДТП{cam_dtp_pct}, {cam_deaths} погиб.{cam_deaths_pct}, {cam_injured} ранен.")
+    lines.append(f"Без камер (фактор указан): {no_cam_dtp} ДТП{no_cam_dtp_pct}, {no_cam_deaths} погиб.{no_cam_deaths_pct}, {no_cam_injured} ранен.")
     if unk_dtp > 0:
-        lines.append(f"Фактор не указан: {unk_dtp} ДТП.")
+        prev_unk = prev_cam["unknown_factor_dtp"]
+        unk_pct = _format_pct_arrow(unk_dtp, prev_unk)
+        lines.append(f"Фактор не указан: {unk_dtp} ДТП{unk_pct}.")
     lines.append(f"Доля ДТП с камерами (от участков с указанным фактором): <b>{camera_pct}%</b>")
     if prev_known_dtp > 0:
         diff_pct = round(camera_pct - prev_camera_pct, 1)
