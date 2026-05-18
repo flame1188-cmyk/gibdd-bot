@@ -899,6 +899,13 @@ async def _run_analysis(
         except Exception as e:
             logger.error(f"Ошибка LLM: {e}")
             llm_summary_text = None
+            await status_msg.edit_text(
+                f"\u26A0\uFE0F Не удалось получить ответ от нейросети.\n\n"
+                f"Ошибка: {e}\n\n"
+                f"Отправляю математический анализ без ИИ.\n"
+                f"Попробуйте нажать кнопку ещё раз — обычно работает со 2-й попытки."
+            )
+            # Не удаляем status_msg — пользователь должен увидеть ошибку
 
     # Генерируем Excel
     analytics_data = build_analytics_excel_data(
@@ -910,11 +917,15 @@ async def _run_analysis(
     column_names = get_analytics_column_names(current_label, prev_label)
     analytics_bytes = generate_analytics_file(analytics_data, column_names)
 
-    # Удаляем сообщение о статусе
-    try:
-        await status_msg.delete()
-    except Exception:
+    # Удаляем сообщение о статусе (если не было ошибки LLM)
+    if use_llm and not llm_summary_text:
+        # status_msg уже содержит сообщение об ошибке LLM — не удаляем
         pass
+    else:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
     # Отправляем результаты
     if use_llm and llm_summary_text:
