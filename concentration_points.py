@@ -57,8 +57,10 @@ SETTLEMENT_OTHER_RADIUS_M = 100
 # Окно для дорог с пикетажем в НП (км)
 SETTLEMENT_ROAD_WINDOW_KM = 0.2  # 200 метров
 
-# Окно для вне НП (км)
+# Окно для вне НП с пикетажем (км)
 NON_SETTLEMENT_WINDOW_KM = 1.0
+# Окно для вне НП без пикетажа (км)
+NON_SETTLEMENT_NO_PK_WINDOW_KM = 0.2  # 200 метров
 
 # Пороги
 SAME_TYPE_THRESHOLD = 3   # 3+ ДТП одного вида = очаг
@@ -1223,7 +1225,12 @@ def find_nonsettlement_concentration_points(cards: list[dict]) -> list[dict]:
         # Сортируем по позиции, затем по дате
         cards_pos.sort(key=lambda x: (x[1], _get_date(x[0])))
 
-        # Скользящее окно 1 км
+        # Определяем окно: если на дороге есть хотя бы одно ДТП с пикетажем — 1 км,
+        # если ни одного — 200 м (расчёт по GPS менее точен)
+        has_piketazh = any(_get_km_m(card) is not None for card, _, _ in cards_pos)
+        window_km = NON_SETTLEMENT_WINDOW_KM if has_piketazh else NON_SETTLEMENT_NO_PK_WINDOW_KM
+
+        # Скользящее окно
         assigned: set[int] = set()
 
         for i, (card, pos, coords) in enumerate(cards_pos):
@@ -1231,7 +1238,7 @@ def find_nonsettlement_concentration_points(cards: list[dict]) -> list[dict]:
                 continue
 
             window_start = pos
-            window_end = pos + NON_SETTLEMENT_WINDOW_KM
+            window_end = pos + window_km
 
             group_indices = [i]
             group_cards = [card]
