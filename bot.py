@@ -883,13 +883,17 @@ async def _run_analysis(
             raw_sup = extract_raw_supplement(current_cards, current_label, max_cards=25)
             raw_sup += extract_raw_supplement(prev_cards, prev_label, max_cards=25)
 
-            # Явная пауза перед LLM-запросом: после серии запросов к API ГИБДД
-            # нужно дать LLM API «остыть» чтобы избежать 429
-            await status_msg.edit_text(
-                f"{mode_label}: подготовка запроса к нейросети...\n"
-                f"⏳ Обычно занимает 15-40 секунд."
-            )
-            await asyncio.sleep(10)
+            # Пауза перед LLM-запросом с обратным отсчётом.
+            # Бесплатный тариф GLM ~2-3 запроса в минуту — без паузы
+            # после серии запросов к API ГИБДД гарантированно получим 429.
+            cooldown_seconds = 60
+            for remaining in range(cooldown_seconds, 0, -10):
+                await status_msg.edit_text(
+                    f"{mode_label}: подготовка запроса к нейросети...\n"
+                    f"⏳ Запрос через {remaining} сек "
+                    f"(лимит бесплатного API GLM)"
+                )
+                await asyncio.sleep(min(10, remaining))
 
             llm_summary_text = await get_ai_summary(
                 comparison=comparison,

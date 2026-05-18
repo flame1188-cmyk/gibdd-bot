@@ -27,7 +27,7 @@ ZHIPU_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 # Глобальный rate limiter — минимальный интервал между ЛЮБЫМИ LLM-вызовами
 # ============================================================
 _last_llm_call_time: float = 0.0
-_MIN_LLM_INTERVAL: float = 15.0  # секунды между запросами (free tier GLM ~2-3 req/min)
+_MIN_LLM_INTERVAL: float = 60.0  # секунды между запросами (free tier GLM ~2-3 req/min)
 
 # ============================================================
 # Системный промпт — определяет роль нейросети
