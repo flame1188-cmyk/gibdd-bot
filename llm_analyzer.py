@@ -264,7 +264,8 @@ def build_question_prompt(
 async def ask_llm(
     user_message: str,
     system_prompt: str | None = None,
-    max_retries: int = 5,
+    max_retries: int = 3,
+    progress_callback: Callable[[str], Awaitable[None]] | None = None,
 ) -> str:
     """
     Отправляет запрос к GLM API и возвращает текстовый ответ.
@@ -274,6 +275,7 @@ async def ask_llm(
         user_message: Текст запроса пользователя
         system_prompt: Системный промпт (если None — используется стандартный)
         max_retries: Максимальное число повторных попыток при 429
+        progress_callback: async-функция для обновления статуса в чате
 
     Returns:
         Текст ответа от модели
@@ -298,7 +300,7 @@ async def ask_llm(
             {"role": "user", "content": user_message},
         ],
         "temperature": 0.7,
-        "max_tokens": 4500,
+        "max_tokens": 4096,
     }
 
     headers = {
@@ -318,7 +320,7 @@ async def ask_llm(
     logger.info(f"LLM запрос: модель={LLM_MODEL}, длина промпта={len(user_message)} символов")
 
     # Фоллбэк-задержки при 429 (если нет заголовка Retry-After)
-    retry_delays = [30, 60, 90, 120, 150]
+    retry_delays = [20, 40, 60]
 
     for attempt in range(max_retries + 1):
         try:
@@ -335,14 +337,14 @@ async def ask_llm(
                     retry_after = response.headers.get("Retry-After") or response.headers.get("retry-after")
                     if retry_after:
                         try:
-                            wait = int(retry_after) + 5  # +5 сек запас
+                            wait = int(retry_after) + 3
                         except ValueError:
                             wait = retry_delays[attempt]
                     else:
                         wait = retry_delays[attempt]
 
-                    # Минимум 30 сек, даже если Retry-After маленький
-                    wait = max(wait, 30)
+                    # Минимум 20 сек
+                    wait = max(wait, 20)
 
                     logger.warning(
                         f"LLM 429 Too Many Requests. "
@@ -350,6 +352,11 @@ async def ask_llm(
                         f"ожидание {wait} сек..."
                         + (f" (Retry-After: {retry_after})" if retry_after else "")
                     )
+                    if progress_callback:
+                        await progress_callback(
+                            f"\U0001F916 Сервер перегружен, пробую снова...\n"
+                            f"\u23F3 Попытка {attempt + 1}/{max_retries}"
+                        )
                     await asyncio.sleep(wait)
                     continue
                 else:
@@ -368,8 +375,13 @@ async def ask_llm(
             raise
         except httpx.TimeoutException:
             if attempt < max_retries:
-                wait = 20
+                wait = 10
                 logger.warning(f"LLM таймаут. Попытка {attempt + 1}, ожидание {wait} сек...")
+                if progress_callback:
+                    await progress_callback(
+                        f"\U0001F916 Таймаут ответа, пробую снова...\n"
+                        f"\u23F3 Попытка {attempt + 1}/{max_retries}"
+                    )
                 await asyncio.sleep(wait)
                 continue
             raise
@@ -432,6 +444,7 @@ async def get_ai_summary(
     prev_label: str,
     raw_supplement: str = "",
     news_context: str = "",
+    progress_callback: Callable[[str], Awaitable[None]] | None = None,
 ) -> str:
     """
     Генерирует аналитическое резюме с помощью LLM.
@@ -439,6 +452,7 @@ async def get_ai_summary(
     Args:
         raw_supplement: Дополнительные данные из сырых карточек ДТП
         news_context: Новостной контекст из открытых источников
+        progress_callback: optional async callback for status updates
 
     Returns:
         Текст резюме от нейросети
@@ -448,7 +462,7 @@ async def get_ai_summary(
         raw_supplement=raw_supplement,
         news_context=news_context,
     )
-    return await ask_llm(user_message=prompt)
+    return await ask_llm(user_message=prompt, progress_callback=progress_callback)
 
 
 async def get_ai_answer(
@@ -459,6 +473,7 @@ async def get_ai_answer(
     prev_label: str,
     raw_supplement: str = "",
     news_context: str = "",
+    progress_callback: Callable[[str], Awaitable[None]] | None = None,
 ) -> str:
     """
     Отвечает на вопрос пользователя по данным с помощью LLM.
@@ -466,6 +481,7 @@ async def get_ai_answer(
     Args:
         raw_supplement: Дополнительные данные из сырых карточек ДТП
         news_context: Новостной контекст из открытых источников
+        progress_callback: optional async callback for status updates
 
     Returns:
         Текст ответа от нейросети
@@ -475,4 +491,4 @@ async def get_ai_answer(
         raw_supplement=raw_supplement,
         news_context=news_context,
     )
-    return await ask_llm(user_message=prompt)
+    return await ask_llm(user_message=prompt, progress_callback=progress_callback)

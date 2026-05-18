@@ -872,15 +872,10 @@ async def _run_analysis(
                 f"{mode_label}: собираю данные и ищу новости..."
             )
 
-            # Формируем дополнение из сырых карточек
-            raw_sup = extract_raw_supplement(current_cards, current_label, max_cards=50)
-            raw_sup += extract_raw_supplement(prev_cards, prev_label, max_cards=50)
-
             # Ищем новости из открытых источников (если включено)
             news_ctx = ""
             if ENABLE_NEWS_SEARCH:
                 news_ctx = await fetch_news_context(reg_name, current_label, prev_label)
-            # Сохраняем для вопросов
             context.user_data["analytics_news_context"] = news_ctx
 
             await status_msg.edit_text(
@@ -888,24 +883,21 @@ async def _run_analysis(
                 f"⏳ Обычно занимает 15-30 секунд."
             )
 
+            # Для резюме НЕ отправляем raw_supplement — только метрики + новости.
+            # Промпт с raw_supplement (30K+ символов) вызывает 429 от API.
+            # raw_supplement нужен только для режима вопрос-ответ.
             llm_summary_text = await get_ai_summary(
                 comparison=comparison,
                 reg_name=reg_name,
                 current_label=current_label,
                 prev_label=prev_label,
-                raw_supplement=raw_sup,
+                raw_supplement="",
                 news_context=news_ctx,
+                progress_callback=lambda msg: status_msg.edit_text(msg),
             )
         except Exception as e:
             logger.error(f"Ошибка LLM: {e}")
             llm_summary_text = None
-            await status_msg.edit_text(
-                f"\u26A0\uFE0F Не удалось получить ответ от нейросети.\n\n"
-                f"Ошибка: {e}\n\n"
-                f"Отправляю математический анализ без ИИ.\n"
-                f"Попробуйте нажать кнопку ещё раз — обычно работает со 2-й попытки."
-            )
-            # Не удаляем status_msg — пользователь должен увидеть ошибку
 
     # Генерируем Excel
     analytics_data = build_analytics_excel_data(
@@ -917,15 +909,11 @@ async def _run_analysis(
     column_names = get_analytics_column_names(current_label, prev_label)
     analytics_bytes = generate_analytics_file(analytics_data, column_names)
 
-    # Удаляем сообщение о статусе (если не было ошибки LLM)
-    if use_llm and not llm_summary_text:
-        # status_msg уже содержит сообщение об ошибке LLM — не удаляем
+    # Удаляем сообщение о статусе
+    try:
+        await status_msg.delete()
+    except Exception:
         pass
-    else:
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
 
     # Отправляем результаты
     if use_llm and llm_summary_text:
@@ -1186,13 +1174,13 @@ async def _handle_analytics_question(
 
     try:
         # Формируем дополнение из сырых карточек (если есть)
-        # Для вопросов берём меньше карточек — только статистику + 15 самых тяжёлых
+        # Для вопросов берём меньше карточек — только статистику + 10 самых тяжёлых
         raw_sup = ""
         current_cards = context.user_data.get("analytics_cards", [])
         prev_cards = context.user_data.get("analytics_prev_cards", [])
         if current_cards or prev_cards:
-            raw_sup = extract_raw_supplement(current_cards, current_label, max_cards=15)
-            raw_sup += extract_raw_supplement(prev_cards, prev_label, max_cards=15)
+            raw_sup = extract_raw_supplement(current_cards, current_label, max_cards=10)
+            raw_sup += extract_raw_supplement(prev_cards, prev_label, max_cards=10)
 
         answer = await get_ai_answer(
             question=question,
