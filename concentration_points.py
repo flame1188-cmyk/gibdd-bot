@@ -77,14 +77,17 @@ INTERSECTION_KEYWORDS = [
     "круговым движением",
 ]
 
-# ДТП с k_ul = "Иные места" исключаются из расчёта очагов
-# (произошли не на дороге — дворы, автостоянки, паркинги и т.д.)
-EXCLUDED_K_UL = "иные места"
-
-# Страховка: если k_ul != "Иные места", проверяем sdor на «вне дороги» значения.
-EXCLUDED_SDOR_FALLBACK = [
+# ДТП исключаются из расчёта очагов (произошли не на дороге).
+# 1) Всегда: если sdor содержит эти значения — исключается
+EXCLUDED_SDOR_ALWAYS = [
     "внутридворовая территория",
     "отделенная от проезжей части",
+]
+# 2) Только при k_ul="Иные места": если sdor содержит эти значения — исключается
+EXCLUDED_K_UL = "иные места"
+EXCLUDED_SDOR_FOR_KUL = [
+    "выезд с прилегающей территории",
+    "тротуар, пешеходная дорожка",
     "иное место",
 ]
 
@@ -146,24 +149,30 @@ def _is_off_road(card: dict) -> bool:
 
     Такие ДТП не могут входить в очаги аварийности.
     Двойная проверка:
-    1. card["k_ul"] == "Иные места" — основной критерий (классификация ГИБДД)
-    2. Если k_ul пустой — проверяем sdor на «внутридворовая территория"
-       и «отделенная от проезжей части" (страховка)
+    1. sdor содержит «внутридворовая территория» или «отделенная от проезжей части»
+       → всегда исключается
+    2. k_ul == «Иные места» И sdor содержит «Выезд с прилегающей территории»,
+       «Тротуар, пешеходная дорожка» или «Иное место» → исключается
     """
+    dor_usl = card.get("dor_usl") or {}
+    sdor_list = dor_usl.get("sdor") or []
+    sdor_lower = []
+    if isinstance(sdor_list, list):
+        sdor_lower = [str(item).strip().lower() for item in sdor_list]
+
+    # 1) Всегда исключаем по sdor
+    for item_lower in sdor_lower:
+        for keyword in EXCLUDED_SDOR_ALWAYS:
+            if keyword in item_lower:
+                return True
+
+    # 2) Исключаем по k_ul + sdor
     k_ul = str(card.get("k_ul", "")).strip().lower()
     if k_ul == EXCLUDED_K_UL:
-        return True
-
-    # Страховка: k_ul != "иные места" — проверяем sdor
-    else:
-        dor_usl = card.get("dor_usl") or {}
-        sdor_list = dor_usl.get("sdor") or []
-        if isinstance(sdor_list, list):
-            for item in sdor_list:
-                item_lower = str(item).strip().lower()
-                for keyword in EXCLUDED_SDOR_FALLBACK:
-                    if keyword in item_lower:
-                        return True
+        for item_lower in sdor_lower:
+            for keyword in EXCLUDED_SDOR_FOR_KUL:
+                if keyword in item_lower:
+                    return True
 
     return False
 
@@ -412,20 +421,9 @@ def _relation_to_polygon(
         return None
 
 
-def _invalidate_cache(bbox_str: str) -> None:
-    """Удаляет файл кэша, чтобы при следующем запросе данные обновились."""
-    path = _cache_path(bbox_str)
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-            logger.info(f"Кэш границ НП инвалидирован (bbox): {path}")
-    except Exception as e:
-        logger.warning(f"Ошибка удаления кэша: {e}")
-
-
 def _parse_overpass_elements(
     elements: list[dict],
-) -> tuple[list[Polygon | MultiPolygon], bool]:
+) -> list[Polygon | MultiPolygon]:
     """
     Преобразует элементы Overpass API в список Shapely-полигонов.
 
@@ -435,11 +433,6 @@ def _parse_overpass_elements(
 
     Приоритет: geom > bb. Если geom-данные есть — используются они,
     если нет — падаем обратно на bounding boxes (совместимость).
-
-    Returns:
-        Кортеж (polygons, is_bbox_fallback):
-        - polygons — список полигонов
-        - is_bbox_fallback — True, если использованы bounding boxes
     """
     polygons: list[Polygon | MultiPolygon] = []
 
@@ -466,7 +459,7 @@ def _parse_overpass_elements(
         logger.info(
             f"Разобрано {len(polygons)} полигонов НП из OSM (out geom)"
         )
-        return polygons, False
+        return polygons
 
     # Fallback: bounding boxes (out bb)
     for element in elements:
@@ -489,7 +482,7 @@ def _parse_overpass_elements(
         f"Разобрано {len(polygons)} bounding boxes из OSM "
         f"(out bb fallback)"
     )
-    return polygons, True
+    return polygons
 
 
 # ========================
@@ -532,18 +525,9 @@ async def fetch_settlement_boundaries(
     # Шаг 1: Проверка кэша
     cached_elements = _load_cache(bbox)
     if cached_elements is not None:
-        polygons, is_bbox = _parse_overpass_elements(cached_elements)
-        if polygons and not is_bbox:
-            # Кэш содержит реальные полигоны — используем
+        polygons = _parse_overpass_elements(cached_elements)
+        if polygons:
             return polygons
-        elif polygons and is_bbox:
-            # Кэш содержит только bounding boxes — инвалидируем
-            # и запросим заново с out geom
-            logger.warning(
-                f"Кэш содержит bounding boxes вместо полигонов — "
-                f"инвалидирую и запрашиваю заново"
-            )
-            _invalidate_cache(bbox)
 
     if progress_callback:
         await progress_callback(
@@ -593,8 +577,8 @@ async def fetch_settlement_boundaries(
             url, geom_query, headers, "geom",
         )
         if elements is not None:
-            polygons, is_bbox = _parse_overpass_elements(elements)
-            if polygons and not is_bbox:
+            polygons = _parse_overpass_elements(elements)
+            if polygons:
                 _save_cache(bbox, elements)
                 logger.info(
                     f"Overpass API ({url}): {len(polygons)} полигонов НП "
@@ -602,17 +586,17 @@ async def fetch_settlement_boundaries(
                 )
                 return polygons
 
-        # Fallback: out bb (только если out geom не дал полигонов)
+        # Fallback: out bb
         elements = await _overpass_request(
             url, bb_query, headers, "bb",
         )
         if elements is not None:
-            polygons, is_bbox = _parse_overpass_elements(elements)
-            if polygons and is_bbox:
-                # Bounding boxes кэшируем с коротким TTL — не сохраняем
-                logger.warning(
+            polygons = _parse_overpass_elements(elements)
+            if polygons:
+                _save_cache(bbox, elements)
+                logger.info(
                     f"Overpass API ({url}): {len(polygons)} bounding boxes НП "
-                    f"(out bb fallback) — используем без кэширования"
+                    f"(out bb fallback) для bbox {bbox}"
                 )
                 return polygons
 
@@ -1473,36 +1457,15 @@ async def calculate_concentration_points(
         return []
 
     # Шаг 1: Фильтр — только карточки с координатами
-    #   и исключаем ДТП вне дороги (k_ul = "Иные места")
-    off_road_count = 0
-    no_coords_count = 0
-    cards_with_coords = []
-    for c in cards:
-        if not _parse_coords(c):
-            no_coords_count += 1
-            continue
-        if _is_off_road(c):
-            off_road_count += 1
-            # Логируем исключённые ДТП
-            logger.info(
-                f"ДТП вне дороги исключено: k_ul={c.get('k_ul','')}, "
-                f"sdor={c.get('dor_usl',{}).get('sdor',[])}, "
-                f"дорога={c.get('dor','')}, улица={c.get('street','')}, "
-                f"дата={c.get('date_dtp','')}"
-            )
-            continue
-        cards_with_coords.append(c)
+    #   и исключаем ДТП вне дороги (внутридворовые, автостоянки)
+    cards_with_coords = [
+        c for c in cards
+        if _parse_coords(c) and not _is_off_road(c)
+    ]
+    no_coords = len(cards) - len(cards_with_coords)
 
-    skipped_total = no_coords_count + off_road_count
-    if skipped_total > 0:
-        logger.warning(
-            f"Исключено из очагов: {no_coords_count} без координат, "
-            f"{off_road_count} вне дороги (всего {skipped_total} из {len(cards)})"
-        )
-
-    if progress_callback and skipped_total > 0:
-        skip_info = f"Исключено ДТП: {no_coords_count} без координат, {off_road_count} вне дороги"
-        await progress_callback(skip_info)
+    if no_coords > 0:
+        logger.warning(f"{no_coords} карточек без координат или вне дороги пропущены")
 
     if not cards_with_coords:
         logger.warning("Нет карточек с координатами — расчёт невозможен")
