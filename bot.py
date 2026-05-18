@@ -878,20 +878,25 @@ async def _run_analysis(
                 news_ctx = await fetch_news_context(reg_name, current_label, prev_label)
             context.user_data["analytics_news_context"] = news_ctx
 
-            await status_msg.edit_text(
-                f"{mode_label}: нейросеть анализирует данные...\n"
-                f"⏳ Обычно занимает 15-30 секунд."
-            )
+            # Формируем raw_supplement с ограничением (не 50, а 25 карточек)
+            # чтобы промпт оставался в разумных пределах (~15K вместо ~31K символов)
+            raw_sup = extract_raw_supplement(current_cards, current_label, max_cards=25)
+            raw_sup += extract_raw_supplement(prev_cards, prev_label, max_cards=25)
 
-            # Для резюме НЕ отправляем raw_supplement — только метрики + новости.
-            # Промпт с raw_supplement (30K+ символов) вызывает 429 от API.
-            # raw_supplement нужен только для режима вопрос-ответ.
+            # Явная пауза перед LLM-запросом: после серии запросов к API ГИБДД
+            # нужно дать LLM API «остыть» чтобы избежать 429
+            await status_msg.edit_text(
+                f"{mode_label}: подготовка запроса к нейросети...\n"
+                f"⏳ Обычно занимает 15-40 секунд."
+            )
+            await asyncio.sleep(10)
+
             llm_summary_text = await get_ai_summary(
                 comparison=comparison,
                 reg_name=reg_name,
                 current_label=current_label,
                 prev_label=prev_label,
-                raw_supplement="",
+                raw_supplement=raw_sup,
                 news_context=news_ctx,
                 progress_callback=lambda msg: status_msg.edit_text(msg),
             )
