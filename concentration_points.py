@@ -81,6 +81,13 @@ INTERSECTION_KEYWORDS = [
 # (произошли не на дороге — дворы, автостоянки, паркинги и т.д.)
 EXCLUDED_K_UL = "иные места"
 
+# Страховка: если k_ul != "Иные места", проверяем sdor на «вне дороги» значения.
+EXCLUDED_SDOR_FALLBACK = [
+    "внутридворовая территория",
+    "отделенная от проезжей части",
+    "иное место",
+]
+
 # Кэширование границ НП
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
 CACHE_TTL_SECONDS = 24 * 60 * 60  # 24 часа
@@ -138,10 +145,27 @@ def _is_off_road(card: dict) -> bool:
     """Произошло ли ДТП вне дороги (внутридворовая территория, автостоянка).
 
     Такие ДТП не могут входить в очаги аварийности.
-    Определяется по полю card["k_ul"] — категория улицы/дороги.
-    Значение "Иные места" означает, что ДТП произошло не на дороге.
+    Двойная проверка:
+    1. card["k_ul"] == "Иные места" — основной критерий (классификация ГИБДД)
+    2. Если k_ul пустой — проверяем sdor на «внутридворовая территория"
+       и «отделенная от проезжей части" (страховка)
     """
-    return str(card.get("k_ul", "")).strip().lower() == EXCLUDED_K_UL
+    k_ul = str(card.get("k_ul", "")).strip().lower()
+    if k_ul == EXCLUDED_K_UL:
+        return True
+
+    # Страховка: k_ul != "иные места" — проверяем sdor
+    else:
+        dor_usl = card.get("dor_usl") or {}
+        sdor_list = dor_usl.get("sdor") or []
+        if isinstance(sdor_list, list):
+            for item in sdor_list:
+                item_lower = str(item).strip().lower()
+                for keyword in EXCLUDED_SDOR_FALLBACK:
+                    if keyword in item_lower:
+                        return True
+
+    return False
 
 
 def _get_dtp_type(card: dict) -> str:
