@@ -1435,15 +1435,36 @@ async def calculate_concentration_points(
         return []
 
     # Шаг 1: Фильтр — только карточки с координатами
-    #   и исключаем ДТП вне дороги (внутридворовые, автостоянки)
-    cards_with_coords = [
-        c for c in cards
-        if _parse_coords(c) and not _is_off_road(c)
-    ]
-    no_coords = len(cards) - len(cards_with_coords)
+    #   и исключаем ДТП вне дороги (внутридворовые, автостоянки, иное место)
+    off_road_count = 0
+    no_coords_count = 0
+    cards_with_coords = []
+    for c in cards:
+        if not _parse_coords(c):
+            no_coords_count += 1
+            continue
+        if _is_off_road(c):
+            off_road_count += 1
+            # Логируем, какие именно значения sdor попали в исключение
+            dor_usl = c.get("dor_usl") or {}
+            sdor_list = dor_usl.get("sdor") or []
+            logger.info(
+                f"ДТП вне дороги исключено: sdor={sdor_list}, "
+                f"дорога={c.get('dor','')}, улица={c.get('street','')}"
+            )
+            continue
+        cards_with_coords.append(c)
 
-    if no_coords > 0:
-        logger.warning(f"{no_coords} карточек без координат или вне дороги пропущены")
+    skipped_total = no_coords_count + off_road_count
+    if skipped_total > 0:
+        logger.warning(
+            f"Исключено из очагов: {no_coords_count} без координат, "
+            f"{off_road_count} вне дороги (всего {skipped_total} из {len(cards)})"
+        )
+
+    if progress_callback and skipped_total > 0:
+        skip_info = f"Исключено ДТП: {no_coords_count} без координат, {off_road_count} вне дороги"
+        await progress_callback(skip_info)
 
     if not cards_with_coords:
         logger.warning("Нет карточек с координатами — расчёт невозможен")

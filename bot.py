@@ -61,6 +61,8 @@ from concentration_points import (
     build_concentration_detail_data,
     get_concentration_column_names,
     get_detail_column_names,
+    _is_off_road,
+    EXCLUDED_SDOR_KEYWORDS,
 )
 from user_request_parser import (
     parse_user_message,
@@ -1065,6 +1067,9 @@ async def _run_concentration_points(
             pass
 
     try:
+        # Подсчёт исключённых ДТП для информирования
+        off_road_total = sum(1 for c in current_cards if _is_off_road(c))
+
         clusters = await calculate_concentration_points(
             current_cards, progress_callback,
         )
@@ -1107,6 +1112,15 @@ async def _run_concentration_points(
             f"\U0001F525 <b>Очаги ДТП: {reg_name}</b>",
             f"Период: {current_label}",
             f"Всего ДТП: {len(current_cards)}",
+        ]
+
+        # Информация об исключённых ДТП
+        if off_road_total > 0:
+            summary_lines.append(
+                f"Исключено из расчёта (вне дороги): {off_road_total} ДТП"
+            )
+
+        summary_lines.extend([
             "",
             f"Найдено очагов: <b>{len(clusters)}</b>",
             f"  \u2022 В НП: {np_count}",
@@ -1114,7 +1128,7 @@ async def _run_concentration_points(
             f"  \u2022 ДТП в очагах: {total_in_clusters}",
             f"  \u2022 Погибло в очагах: {total_deaths}",
             f"  \u2022 Ранено в очагах: {total_injured}",
-        ]
+        ])
 
         await context.bot.send_message(
             chat_id=chat_id,
