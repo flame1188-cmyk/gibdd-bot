@@ -298,7 +298,7 @@ async def ask_llm(
             {"role": "user", "content": user_message},
         ],
         "temperature": 0.7,
-        "max_tokens": 70000,
+        "max_tokens": 4500,
     }
 
     headers = {
@@ -322,7 +322,7 @@ async def ask_llm(
 
     for attempt in range(max_retries + 1):
         try:
-            async with httpx.AsyncClient(timeout=90) as client:
+            async with httpx.AsyncClient(timeout=180) as client:
                 response = await client.post(
                     ZHIPU_API_URL,
                     headers=headers,
