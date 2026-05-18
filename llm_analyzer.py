@@ -300,7 +300,7 @@ async def ask_llm(
             {"role": "user", "content": user_message},
         ],
         "temperature": 0.7,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
     }
 
     headers = {
@@ -370,6 +370,7 @@ async def ask_llm(
 
             # Успешный запрос — обновляем время последнего вызова
             _last_llm_call_time = time.monotonic()
+            break
 
         except httpx.HTTPStatusError:
             raise
