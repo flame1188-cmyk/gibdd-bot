@@ -22,7 +22,14 @@
      - Порог: 3+ ДТП одного вида ИЛИ 5+ ДТП любых видов
 
 Определение НП/не НП через OSM Overpass API с реальными полигонами (Shapely).
-Границы кэшируются на диске (TTL 24 ч).
+
+Оптимизации нагрузки на OSM:
+  - In-memory LRU-кэш (5 записей) для распарсенных полигонов
+  - Адаптивный bbox с минимальным запасом (0.02° вместо 0.1°)
+  - Разбиение больших bbox (>1.5°) на тайлы с перехлёстом
+  - Параллельные запросы к зеркалам Overpass API
+  - Дисковый кэш (TTL 24 ч) для элементов Overpass
+  - Bbox-результаты никогда не кэшируются
 """
 
 import math
@@ -31,8 +38,9 @@ import os
 import time
 import hashlib
 import logging
-from collections import Counter
+from collections import Counter, OrderedDict
 from typing import Any, Callable, Awaitable
+import asyncio
 
 import httpx
 from shapely.geometry import Polygon, MultiPolygon, Point, LineString
@@ -96,6 +104,16 @@ EXCLUDED_SDOR_FOR_KUL = [
 # Кэширование границ НП
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
 CACHE_TTL_SECONDS = 24 * 60 * 60  # 24 часа
+
+# In-memory LRU-кэш распарсенных полигонов (избегает повторного парсинга JSON)
+MEMORY_CACHE_MAX = 5  # максимум записей
+_memory_cache: OrderedDict[str, tuple[float, list]] = OrderedDict()  # bbox → (timestamp, polygons)
+
+# Параметры bbox
+BBOX_MARGIN = 0.02  # ~2.2 км — минимальный запас вокруг ДТП
+BBOX_TILE_MAX_DEG = 1.5  # макс. размер стороны тайла (при превышении — разбиение)
+BBOX_TILE_OVERLAP = 0.02  # перехлёст тайлов, чтобы НП на границе не потерялись
+BBOX_MIN_CLAMP = 0.01  # минимальный размер bbox (если ДТП в одной точке)
 
 
 # ========================
@@ -247,6 +265,43 @@ def _check_cluster_criteria(
 
 # ========================
 # Кэширование границ НП
+# ========================
+
+# ========================
+# In-memory кэш полигонов
+# ========================
+
+def _memory_cache_get(bbox_str: str) -> list[Polygon | MultiPolygon] | None:
+    """Получить полигоны из in-memory кэша. Returns None если нет или просрочен."""
+    if bbox_str in _memory_cache:
+        ts, polygons = _memory_cache[bbox_str]
+        age = time.time() - ts
+        if age < CACHE_TTL_SECONDS:
+            # Перемещаем в конец (LRU)
+            _memory_cache.move_to_end(bbox_str)
+            logger.info(
+                f"In-memory кэш границ НП: hit (возраст {age / 3600:.1f} ч, "
+                f"{len(polygons)} полигонов)"
+            )
+            return polygons
+        else:
+            del _memory_cache[bbox_str]
+    return None
+
+
+def _memory_cache_put(bbox_str: str, polygons: list[Polygon | MultiPolygon]) -> None:
+    """Сохранить полигоны в in-memory LRU кэш."""
+    while len(_memory_cache) >= MEMORY_CACHE_MAX:
+        _memory_cache.popitem(last=False)  # удаляем самый старый
+    _memory_cache[bbox_str] = (time.time(), polygons)
+    logger.info(
+        f"In-memory кэш границ НП: сохранено ({len(polygons)} полигонов, "
+        f"LRU размер: {len(_memory_cache)}/{MEMORY_CACHE_MAX})"
+    )
+
+
+# ========================
+# Дисковый кэш элементов Overpass
 # ========================
 
 def _cache_path(bbox_str: str) -> str:
@@ -425,7 +480,7 @@ def _relation_to_polygon(
 
 def _parse_overpass_elements(
     elements: list[dict],
-) -> list[Polygon | MultiPolygon]:
+) -> tuple[list[Polygon | MultiPolygon], bool]:
     """
     Преобразует элементы Overpass API в список Shapely-полигонов.
 
@@ -435,6 +490,10 @@ def _parse_overpass_elements(
 
     Приоритет: geom > bb. Если geom-данные есть — используются они,
     если нет — падаем обратно на bounding boxes (совместимость).
+
+    Returns:
+        (polygons, is_bbox_fallback) — список полигонов и флаг,
+        что использовались bounding boxes (а не реальные полигоны).
     """
     polygons: list[Polygon | MultiPolygon] = []
 
@@ -461,7 +520,7 @@ def _parse_overpass_elements(
         logger.info(
             f"Разобрано {len(polygons)} полигонов НП из OSM (out geom)"
         )
-        return polygons
+        return polygons, False
 
     # Fallback: bounding boxes (out bb)
     for element in elements:
@@ -484,12 +543,102 @@ def _parse_overpass_elements(
         f"Разобрано {len(polygons)} bounding boxes из OSM "
         f"(out bb fallback)"
     )
-    return polygons
+    return polygons, True
 
 
 # ========================
 # OSM: Определение границ НП
 # ========================
+
+# ========================
+# Bbox утилиты
+# ========================
+
+def _compute_bbox_tiles(
+    lat_min: float, lon_min: float,
+    lat_max: float, lon_max: float,
+) -> list[tuple[float, float, float, float]]:
+    """
+    Разбивает большой bbox на тайлы, если любая сторона > BBOX_TILE_MAX_DEG.
+
+    Возвращает список (lat_min, lon_min, lat_max, lon_max) тайлов.
+    Тайлы имеют перехлёст BBOX_TILE_OVERLAP, чтобы НП на границах не терялись.
+    """
+    lat_span = lat_max - lat_min
+    lon_span = lon_max - lon_min
+
+    if lat_span <= BBOX_TILE_MAX_DEG and lon_span <= BBOX_TILE_MAX_DEG:
+        # Достаточно маленький — не разбиваем
+        return [(lat_min, lon_min, lat_max, lon_max)]
+
+    tiles: list[tuple[float, float, float, float]] = []
+    overlap = BBOX_TILE_OVERLAP
+
+    # Разбиваем по широте
+    lat_steps = max(1, math.ceil(lat_span / BBOX_TILE_MAX_DEG))
+    # Разбиваем по долготе
+    lon_steps = max(1, math.ceil(lon_span / BBOX_TILE_MAX_DEG))
+
+    for li in range(lat_steps):
+        for lj in range(lon_steps):
+            t_lat_min = lat_min + li * lat_span / lat_steps - overlap
+            t_lat_max = lat_min + (li + 1) * lat_span / lat_steps + overlap
+            t_lon_min = lon_min + lj * lon_span / lon_steps - overlap
+            t_lon_max = lon_min + (lj + 1) * lon_span / lon_steps + overlap
+
+            # Ограничиваем мировыми границами
+            t_lat_min = max(t_lat_min, 41.0)
+            t_lat_max = min(t_lat_max, 70.0)
+            t_lon_min = max(t_lon_min, 19.0)
+            t_lon_max = min(t_lon_max, 180.0)
+
+            tiles.append((t_lat_min, t_lon_min, t_lat_max, t_lon_max))
+
+    logger.info(
+        f"Bbox разбит на {len(tiles)} тайлов "
+        f"({lat_steps}x{lon_steps}, span: {lat_span:.2f}x{lon_span:.2f}°)"
+    )
+    return tiles
+
+
+def _dedup_elements(elements: list[dict]) -> list[dict]:
+    """
+    Удаляет дубликаты элементов Overpass по (type, id).
+    Нужно при слиянии результатов из нескольких тайлов.
+    """
+    seen: set[tuple[str, int]] = set()
+    unique = []
+    for el in elements:
+        key = (el.get("type", ""), el.get("id", 0))
+        if key not in seen:
+            seen.add(key)
+            unique.append(el)
+    if len(unique) < len(elements):
+        logger.info(
+            f"Дедупликация элементов: {len(elements)} → {len(unique)} "
+            f"(удалено {len(elements) - len(unique)} дублей)"
+        )
+    return unique
+
+
+# ========================
+# OSM: Определение границ НП
+# ========================
+
+OVERPASS_URLS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://lz4.overpass-api.de/api/interpreter",
+    "https://z.overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+]
+
+OVERPASS_HEADERS = {
+    "User-Agent": "GIBDD-DTP-Bot/1.0 (traffic-accident-analysis)",
+    "Accept": "application/json",
+}
+
+PLACE_FILTER = "city|town|village|hamlet"
+
 
 async def fetch_settlement_boundaries(
     cards: list[dict],
@@ -498,11 +647,12 @@ async def fetch_settlement_boundaries(
     """
     Получает полигоны границ населённых пунктов через Overpass API.
 
-    Порядок работы:
-    1. Проверка дискового кэша (TTL 24 ч)
-    2. Запрос к Overpass API с «out geom» (реальные полигоны)
-    3. Fallback: запрос с «out bb» (прямоугольные оболочки)
-    4. Кэширование результата
+    Оптимизации:
+    1. In-memory LRU-кэш (5 записей) — избегает повторного парсинга JSON
+    2. Адаптивный margin — bbox строится с минимальным запасом (0.02°)
+    3. Разбиение на тайлы — bbox > 1.5° делится на части
+    4. Параллельные запросы к зеркалам — asyncio.gather
+    5. Дисковый кэш (TTL 24 ч) — для запросов после перезапуска
 
     Returns:
         Список Shapely-полигонов (Polygon или MultiPolygon).
@@ -516,97 +666,257 @@ async def fetch_settlement_boundaries(
     lats = [c[0] for c in valid_coords]
     lons = [c[1] for c in valid_coords]
 
-    margin = 0.1  # ~11 км
-    lat_min = max(min(lats) - margin, 41.0)
-    lon_min = max(min(lons) - margin, 19.0)
-    lat_max = min(max(lats) + margin, 70.0)
-    lon_max = min(max(lons) + margin, 180.0)
+    # Адаптивный bbox: мин. запас 0.02° (~2.2 км) вокруг крайних ДТП
+    raw_lat_min = min(lats) - BBOX_MARGIN
+    raw_lon_min = min(lons) - BBOX_MARGIN
+    raw_lat_max = max(lats) + BBOX_MARGIN
+    raw_lon_max = max(lons) + BBOX_MARGIN
+
+    # Ограничиваем минимальный размер bbox
+    if raw_lat_max - raw_lat_min < BBOX_MIN_CLAMP:
+        mid_lat = (raw_lat_max + raw_lat_min) / 2
+        raw_lat_min = mid_lat - BBOX_MIN_CLAMP / 2
+        raw_lat_max = mid_lat + BBOX_MIN_CLAMP / 2
+    if raw_lon_max - raw_lon_min < BBOX_MIN_CLAMP:
+        mid_lon = (raw_lon_max + raw_lon_min) / 2
+        raw_lon_min = mid_lon - BBOX_MIN_CLAMP / 2
+        raw_lon_max = mid_lon + BBOX_MIN_CLAMP / 2
+
+    # Clamp к мировым границам
+    lat_min = max(raw_lat_min, 41.0)
+    lon_min = max(raw_lon_min, 19.0)
+    lat_max = min(raw_lat_max, 70.0)
+    lon_max = min(raw_lon_max, 180.0)
 
     bbox = f"{lat_min},{lon_min},{lat_max},{lon_max}"
 
-    # Шаг 1: Проверка кэша
-    cached_elements = _load_cache(bbox)
-    if cached_elements is not None:
-        polygons = _parse_overpass_elements(cached_elements)
-        if polygons:
-            return polygons
+    # --- Шаг 1: In-memory кэш ---
+    mem_polygons = _memory_cache_get(bbox)
+    if mem_polygons is not None:
+        return mem_polygons
+
+    # --- Шаг 2: Разбиваем на тайлы ---
+    tiles = _compute_bbox_tiles(lat_min, lon_min, lat_max, lon_max)
 
     if progress_callback:
+        tile_info = f" ({len(tiles)} тайлов)" if len(tiles) > 1 else ""
         await progress_callback(
-            f"Загрузка границ НП из OpenStreetMap...\n"
+            f"Загрузка границ НП из OpenStreetMap{tile_info}...\n"
             f"BBOX: {bbox}"
         )
 
-    # Список зеркал Overpass API с резервными серверами
-    overpass_urls = [
-        "https://overpass-api.de/api/interpreter",
-        "https://lz4.overpass-api.de/api/interpreter",
-        "https://z.overpass-api.de/api/interpreter",
-        "https://overpass.kumi.systems/api/interpreter",
-    ]
+    # --- Шаг 3: Для каждого тайла — запрос к Overpass ---
+    all_elements: list[dict] = []
 
-    headers = {
-        "User-Agent": "GIBDD-DTP-Bot/1.0 (traffic-accident-analysis)",
-        "Accept": "application/json",
-    }
+    for tile_idx, (t_lat_min, t_lon_min, t_lat_max, t_lon_max) in enumerate(tiles):
+        tile_bbox = f"{t_lat_min},{t_lon_min},{t_lat_max},{t_lon_max}"
 
-    # Типы населённых пунктов: city, town, village + hamlet (деревни/хутора)
-    place_filter = "city|town|village|hamlet"
+        # Проверяем дисковый кэш для тайла
+        cached_elements = _load_cache(tile_bbox)
+        if cached_elements is not None:
+            tile_polys, is_bbox = _parse_overpass_elements(cached_elements)
+            if tile_polys and not is_bbox:
+                all_elements.extend(cached_elements)
+                logger.info(
+                    f"Тайл {tile_idx + 1}/{len(tiles)}: из дискового кэша "
+                    f"({len(cached_elements)} элементов)"
+                )
+                continue
+            elif tile_polys and is_bbox:
+                # bbox из кэша — игнорируем, запросим заново
+                logger.info(
+                    f"Тайл {tile_idx + 1}/{len(tiles)}: кэш содержит bbox, "
+                    f"запрашиваем заново"
+                )
+            else:
+                logger.info(
+                    f"Тайл {tile_idx + 1}/{len(tiles)}: кэш пуст, "
+                    f"запрашиваем OSM"
+                )
 
-    # Шаг 2: Запрос с out geom (реальные полигоны)
+        # Запрос к Overpass с параллельными зеркалами
+        elements = await _fetch_overpass_parallel(tile_bbox, tile_idx, len(tiles))
+        if elements:
+            all_elements.extend(elements)
+
+    # --- Шаг 4: Дедупликация (для тайлов с перехлёстом) ---
+    if len(tiles) > 1 and all_elements:
+        all_elements = _dedup_elements(all_elements)
+
+    # --- Шаг 5: Парсинг ---
+    polygons: list[Polygon | MultiPolygon] = []
+    is_bbox = True  # по умолчанию — fallback, чтобы не кэшировать
+    if all_elements:
+        polygons, is_bbox = _parse_overpass_elements(all_elements)
+
+    if not polygons:
+        logger.error(
+            "Все зеркала Overpass API недоступны. "
+            "Не удалось получить границы НП."
+        )
+        return []
+
+    # --- Шаг 6: Сохраняем в кэши ---
+    # В in-memory — только geom (не bbox)
+    if not is_bbox:
+        _memory_cache_put(bbox, polygons)
+        # На диск — сохраняем элементы по каждому тайлу
+        for tile_idx, (t_lat_min, t_lon_min, t_lat_max, t_lon_max) in enumerate(tiles):
+            tile_bbox = f"{t_lat_min},{t_lon_min},{t_lat_max},{t_lon_max}"
+            tile_elements = _load_cache(tile_bbox)
+            if tile_elements is None:
+                # Фильтруем элементы, принадлежащие этому тайлу
+                tile_elems = _filter_elements_for_bbox(
+                    all_elements, t_lat_min, t_lon_min, t_lat_max, t_lon_max,
+                )
+                if tile_elems:
+                    _save_cache(tile_bbox, tile_elems)
+    else:
+        # bbox fallback — НЕ кэшируем (ни в памяти, ни на диске)
+        logger.warning(
+            "Получены bounding boxes вместо реальных полигонов — "
+            "результат НЕ кэширован"
+        )
+
+    logger.info(
+        f"Итого границ НП: {len(polygons)} полигонов "
+        f"(элементов: {len(all_elements)}, тайлов: {len(tiles)})"
+    )
+    return polygons
+
+
+def _filter_elements_for_bbox(
+    elements: list[dict],
+    lat_min: float, lon_min: float,
+    lat_max: float, lon_max: float,
+) -> list[dict]:
+    """
+    Фильтрует элементы Overpass, оставляя только те, чей центр
+    попадает в указанный bbox. Используется при кэшировании по тайлам.
+    """
+    filtered = []
+    for el in elements:
+        bounds = el.get("bounds")
+        if bounds:
+            center_lat = (bounds.get("minlat", 0) + bounds.get("maxlat", 0)) / 2
+            center_lon = (bounds.get("minlon", 0) + bounds.get("maxlon", 0)) / 2
+            if lat_min <= center_lat <= lat_max and lon_min <= center_lon <= lon_max:
+                filtered.append(el)
+            continue
+        # Для элементов с geometry (out geom) — по первой координате
+        geom = el.get("geometry") or []
+        members = el.get("members") or []
+        if geom:
+            ref = geom[0]
+            ref_lat = ref.get("lat", 0)
+            ref_lon = ref.get("lon", 0)
+            if lat_min <= ref_lat <= lat_max and lon_min <= ref_lon <= lon_max:
+                filtered.append(el)
+        elif members:
+            for m in members:
+                m_geom = m.get("geometry", [])
+                if m_geom:
+                    ref = m_geom[0]
+                    ref_lat = ref.get("lat", 0)
+                    ref_lon = ref.get("lon", 0)
+                    if lat_min <= ref_lat <= lat_max and lon_min <= ref_lon <= lon_max:
+                        filtered.append(el)
+                        break
+    return filtered
+
+
+async def _fetch_overpass_parallel(
+    bbox_str: str,
+    tile_idx: int = 0,
+    total_tiles: int = 1,
+) -> list[dict] | None:
+    """
+    Параллельный запрос к зеркалам Overpass API.
+
+    Стратегия:
+    - Одновременно запускаем запросы к 2 зеркалам (geom)
+    - Первый успешный ответ используется
+    - Если оба geom не удались — параллельно пробуем bb на 2 зеркалах
+    """
     geom_query = (
         "[out:json][timeout:90];\n"
         "(\n"
-        f'  relation["place"~"{place_filter}"]({bbox});\n'
-        f'  way["place"~"{place_filter}"]({bbox});\n'
+        f'  relation["place"~"{PLACE_FILTER}"]({bbox_str});\n'
+        f'  way["place"~"{PLACE_FILTER}"]({bbox_str});\n'
         ");\n"
         "out geom;\n"
     )
 
-    # Шаг 3 (fallback): запрос с out bb (прямоугольники)
     bb_query = (
         "[out:json][timeout:90];\n"
         "(\n"
-        f'  relation["place"~"{place_filter}"]({bbox});\n'
-        f'  way["place"~"{place_filter}"]({bbox});\n'
+        f'  relation["place"~"{PLACE_FILTER}"]({bbox_str});\n'
+        f'  way["place"~"{PLACE_FILTER}"]({bbox_str});\n'
         ");\n"
         "out bb;\n"
     )
 
-    for url in overpass_urls:
-        # Сначала пробуем out geom
+    # --- Пытаемся получить geom параллельно с 2 зеркал ---
+    geom_tasks = []
+    for url in OVERPASS_URLS[:2]:
+        geom_tasks.append(
+            asyncio.create_task(
+                _overpass_request(url, geom_query, OVERPASS_HEADERS, "geom"),
+                name=f"geom-{url}",
+            )
+        )
+
+    geom_results = await asyncio.gather(*geom_tasks, return_exceptions=True)
+
+    for result in geom_results:
+        if isinstance(result, list) and result:
+            polygons, is_bbox = _parse_overpass_elements(result)
+            if polygons and not is_bbox:
+                logger.info(
+                    f"Тайл {tile_idx + 1}/{total_tiles}: "
+                    f"{len(polygons)} полигонов (out geom, parallel)"
+                )
+                _save_cache(bbox_str, result)
+                return result
+
+    # --- Fallback: параллельно out bb на 2 зеркалах ---
+    bb_tasks = []
+    for url in OVERPASS_URLS[:2]:
+        bb_tasks.append(
+            asyncio.create_task(
+                _overpass_request(url, bb_query, OVERPASS_HEADERS, "bb"),
+                name=f"bb-{url}",
+            )
+        )
+
+    bb_results = await asyncio.gather(*bb_tasks, return_exceptions=True)
+
+    for result in bb_results:
+        if isinstance(result, list) and result:
+            polygons, is_bbox = _parse_overpass_elements(result)
+            if polygons:
+                logger.info(
+                    f"Тайл {tile_idx + 1}/{total_tiles}: "
+                    f"{len(polygons)} bounding boxes (out bb, parallel)"
+                )
+                # НЕ сохраняем bb в кэш
+                return result
+
+    # --- Последняя попытка: seq через все зеркала (geom) ---
+    for url in OVERPASS_URLS[2:]:
         elements = await _overpass_request(
-            url, geom_query, headers, "geom",
+            url, geom_query, OVERPASS_HEADERS, "geom",
         )
         if elements is not None:
-            polygons = _parse_overpass_elements(elements)
-            if polygons:
-                _save_cache(bbox, elements)
-                logger.info(
-                    f"Overpass API ({url}): {len(polygons)} полигонов НП "
-                    f"(out geom) для bbox {bbox}"
-                )
-                return polygons
+            polygons, is_bbox = _parse_overpass_elements(elements)
+            if polygons and not is_bbox:
+                _save_cache(bbox_str, elements)
+                return elements
 
-        # Fallback: out bb
-        elements = await _overpass_request(
-            url, bb_query, headers, "bb",
-        )
-        if elements is not None:
-            polygons = _parse_overpass_elements(elements)
-            if polygons:
-                _save_cache(bbox, elements)
-                logger.info(
-                    f"Overpass API ({url}): {len(polygons)} bounding boxes НП "
-                    f"(out bb fallback) для bbox {bbox}"
-                )
-                return polygons
-
-    logger.error(
-        "Все зеркала Overpass API недоступны. "
-        "Не удалось получить границы НП."
+    logger.warning(
+        f"Тайл {tile_idx + 1}/{total_tiles}: все зеркала недоступны"
     )
-    return []
+    return None
 
 
 async def _overpass_request(
