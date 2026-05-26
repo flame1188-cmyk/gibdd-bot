@@ -13,7 +13,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import httpx
 
@@ -27,7 +27,7 @@ ZHIPU_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 # Глобальный rate limiter — минимальный интервал между ЛЮБЫМИ LLM-вызовами
 # ============================================================
 _last_llm_call_time: float = 0.0
-_MIN_LLM_INTERVAL: float = 60.0  # секунды между запросами (free tier GLM ~2-3 req/min)
+_MIN_LLM_INTERVAL: float = 5.0  # секунды между запросами (для glm-4.7-flash достаточно)
 
 # ============================================================
 # Системный промпт — определяет роль нейросети
@@ -44,11 +44,14 @@ SYSTEM_PROMPT = (
     "3. Выделяй ключевые тенденции (рост/снижение) и их масштаб\n"
     "4. Предлагай возможные причины выявленных изменений\n"
     "5. Давай конкретные рекомендации по повышению безопасности\n"
-    "6. Пиши на русском языке, профессиональным но понятным стилем\n"
-    "7. Структурируй ответ: выводы, причины, рекомендации\n"
-    "8. Если данных недостаточно для вывода — так и скажи\n"
-    "9. Не используй эмодзи и markdown-форматирование\n"
-    "10. Объём ответа: 3-5 абзацев для резюме, 2-4 абзаца для ответа на вопрос"
+    "6. Если предоставлены очаги концентрации ДТП — обязательно используй их "
+    "в анализе: выдели наиболее опасные участки, оцени тяжесть последствий, "
+    "рекомендуй приоритетные мероприятия для конкретных очагов\n"
+    "7. Пиши на русском языке, профессиональным но понятным стилем\n"
+    "8. Структурируй ответ: выводы, причины, рекомендации\n"
+    "9. Если данных недостаточно для вывода — так и скажи\n"
+    "10. Не используй эмодзи и markdown-форматирование\n"
+    "11. Объём ответа: 3-5 абзацев для резюме, 2-4 абзаца для ответа на вопрос"
 )
 
 
@@ -72,6 +75,82 @@ def _format_change(change: float) -> str:
     elif change < 0:
         return f"{change:.1f}%"
     return "0%"
+
+
+def format_clusters_for_prompt(
+    clusters: list[dict[str, Any]],
+    max_clusters: int = 10,
+) -> str:
+    """
+    Форматирует данные об очагах концентрации ДТП для промпта LLM.
+
+    Сортирует очаги по тяжести (погибшие × 3 + раненые × 1 + ДТП),
+    выводит топ-N с краткой характеристикой.
+
+    Args:
+        clusters: Список словарей очагов (из calculate_concentration_points)
+        max_clusters: Максимальное количество очагов для включения
+
+    Returns:
+        Текстовый блок для вставки в промпт, или пустую строку если нет очагов
+    """
+    if not clusters:
+        return ""
+
+    # Сортируем по тяжести: погибшие × 3 + раненые × 1 + количество ДТП
+    def severity_score(c: dict) -> float:
+        return c.get("deaths", 0) * 3 + c.get("injured", 0) * 1 + c.get("total_accidents", 0)
+
+    sorted_clusters = sorted(clusters, key=severity_score, reverse=True)[:max_clusters]
+
+    zone_labels = {
+        "settlement_intersection": "Перекрёсток в НП",
+        "settlement_road": "Участок дороги в НП (пикетаж)",
+        "settlement_segment": "Участок дороги в НП",
+        "nonsettlement": "Вне НП",
+    }
+
+    lines = []
+    lines.append(f"ОЧАГИ КОНЦЕНТРАЦИИ ДТП (всего {len(clusters)}, показаны топ-{len(sorted_clusters)} по тяжести):")
+    lines.append("")
+
+    for i, c in enumerate(sorted_clusters, 1):
+        zone = zone_labels.get(c["zone_type"], c["zone_type"])
+        road = c.get("road", "Не указана")
+        total = c["total_accidents"]
+        deaths = c.get("deaths", 0)
+        injured = c.get("injured", 0)
+        dominant = c.get("dominant_type", "")
+
+        # Формируем строку видов ДТП
+        type_counter = c.get("type_counter", {})
+        types_str = ", ".join(
+            f"{t} ({cnt})" for t, cnt in sorted(type_counter.items(), key=lambda x: -x[1])[:3]
+        )
+
+        line = (
+            f"Очаг {i}: {road} ({zone}) | "
+            f"ДТП: {total}, погибло: {deaths}, ранено: {injured}"
+        )
+        if dominant:
+            line += f" | Доминирующий вид: {dominant}"
+        lines.append(line)
+
+        if types_str:
+            lines.append(f"  Виды ДТП: {types_str}")
+
+        # Пикетаж (если есть)
+        start_pos = c.get("start_pos")
+        end_pos = c.get("end_pos")
+        if start_pos is not None and end_pos is not None:
+            lines.append(f"  Пикетаж: {start_pos:.3f} - {end_pos:.3f} км")
+
+        # Даты первого и последнего ДТП
+        dates = c.get("dates", [])
+        if len(dates) >= 2:
+            lines.append(f"  Период: {dates[0]} — {dates[-1]}")
+
+    return "\n".join(lines)
 
 
 def format_metrics_for_prompt(
@@ -206,6 +285,7 @@ def build_summary_prompt(
     prev_label: str,
     raw_supplement: str = "",
     news_context: str = "",
+    clusters_context: str = "",
 ) -> str:
     """Создаёт промпт для генерации аналитического резюме."""
     metrics_text = format_metrics_for_prompt(
@@ -219,6 +299,13 @@ def build_summary_prompt(
         f"3. Возможные причины изменений\n"
         f"4. Рекомендации по повышению безопасности дорожного движения"
     )
+    if clusters_context:
+        prompt += (
+            f"\n\n{clusters_context}\n\n"
+            f"Обрати особое внимание на очаги ДТП: выдели наиболее опасные участки, "
+            f"проанализируй причины концентрации ДТП, предложи конкретные меры "
+            f"для каждого из топ-очагов."
+        )
     if raw_supplement:
         prompt += f"\n\n{raw_supplement}"
     if news_context:
@@ -239,6 +326,7 @@ def build_question_prompt(
     prev_label: str,
     raw_supplement: str = "",
     news_context: str = "",
+    clusters_context: str = "",
 ) -> str:
     """Создаёт промпт для ответа на вопрос пользователя."""
     metrics_text = format_metrics_for_prompt(
@@ -250,6 +338,8 @@ def build_question_prompt(
         f"Ответь на вопрос, опираясь на приведённые данные. "
         f"Если данных недостаточно — так и скажи."
     )
+    if clusters_context:
+        prompt += f"\n\n{clusters_context}"
     if raw_supplement:
         prompt += f"\n\n{raw_supplement}"
     if news_context:
@@ -264,8 +354,7 @@ def build_question_prompt(
 async def ask_llm(
     user_message: str,
     system_prompt: str | None = None,
-    max_retries: int = 3,
-    progress_callback: Callable[[str], Awaitable[None]] | None = None,
+    max_retries: int = 5,
 ) -> str:
     """
     Отправляет запрос к GLM API и возвращает текстовый ответ.
@@ -275,7 +364,6 @@ async def ask_llm(
         user_message: Текст запроса пользователя
         system_prompt: Системный промпт (если None — используется стандартный)
         max_retries: Максимальное число повторных попыток при 429
-        progress_callback: async-функция для обновления статуса в чате
 
     Returns:
         Текст ответа от модели
@@ -300,7 +388,7 @@ async def ask_llm(
             {"role": "user", "content": user_message},
         ],
         "temperature": 0.7,
-        "max_tokens": 8192,
+        "max_tokens": 4096,
     }
 
     headers = {
@@ -315,22 +403,12 @@ async def ask_llm(
     if elapsed_since_last < _MIN_LLM_INTERVAL and _last_llm_call_time > 0:
         cooldown = _MIN_LLM_INTERVAL - elapsed_since_last
         logger.info(f"Rate limiter: ждём {cooldown:.0f} сек между LLM-вызовами...")
-        # Обратный отсчёт с уведомлением пользователя
-        remaining = int(cooldown) + 1
-        while remaining > 0:
-            if progress_callback:
-                await progress_callback(
-                    f"\U0001F916 Подготовка запроса к нейросети...\n"
-                    f"\u23F3 Запрос через {remaining} сек "
-                    f"(лимит бесплатного API GLM)"
-                )
-            await asyncio.sleep(min(10, remaining))
-            remaining -= min(10, remaining)
+        await asyncio.sleep(cooldown)
 
     logger.info(f"LLM запрос: модель={LLM_MODEL}, длина промпта={len(user_message)} символов")
 
     # Фоллбэк-задержки при 429 (если нет заголовка Retry-After)
-    retry_delays = [20, 40, 60]
+    retry_delays = [30, 60, 90, 120, 150]
 
     for attempt in range(max_retries + 1):
         try:
@@ -347,14 +425,14 @@ async def ask_llm(
                     retry_after = response.headers.get("Retry-After") or response.headers.get("retry-after")
                     if retry_after:
                         try:
-                            wait = int(retry_after) + 3
+                            wait = int(retry_after) + 5  # +5 сек запас
                         except ValueError:
                             wait = retry_delays[attempt]
                     else:
                         wait = retry_delays[attempt]
 
-                    # Минимум 20 сек
-                    wait = max(wait, 20)
+                    # Минимум 30 сек, даже если Retry-After маленький
+                    wait = max(wait, 30)
 
                     logger.warning(
                         f"LLM 429 Too Many Requests. "
@@ -362,11 +440,6 @@ async def ask_llm(
                         f"ожидание {wait} сек..."
                         + (f" (Retry-After: {retry_after})" if retry_after else "")
                     )
-                    if progress_callback:
-                        await progress_callback(
-                            f"\U0001F916 Сервер перегружен, пробую снова...\n"
-                            f"\u23F3 Попытка {attempt + 1}/{max_retries}"
-                        )
                     await asyncio.sleep(wait)
                     continue
                 else:
@@ -380,19 +453,13 @@ async def ask_llm(
 
             # Успешный запрос — обновляем время последнего вызова
             _last_llm_call_time = time.monotonic()
-            break
 
         except httpx.HTTPStatusError:
             raise
         except httpx.TimeoutException:
             if attempt < max_retries:
-                wait = 10
+                wait = 20
                 logger.warning(f"LLM таймаут. Попытка {attempt + 1}, ожидание {wait} сек...")
-                if progress_callback:
-                    await progress_callback(
-                        f"\U0001F916 Таймаут ответа, пробую снова...\n"
-                        f"\u23F3 Попытка {attempt + 1}/{max_retries}"
-                    )
                 await asyncio.sleep(wait)
                 continue
             raise
@@ -455,7 +522,7 @@ async def get_ai_summary(
     prev_label: str,
     raw_supplement: str = "",
     news_context: str = "",
-    progress_callback: Callable[[str], Awaitable[None]] | None = None,
+    clusters_context: str = "",
 ) -> str:
     """
     Генерирует аналитическое резюме с помощью LLM.
@@ -463,7 +530,7 @@ async def get_ai_summary(
     Args:
         raw_supplement: Дополнительные данные из сырых карточек ДТП
         news_context: Новостной контекст из открытых источников
-        progress_callback: optional async callback for status updates
+        clusters_context: Данные об очагах концентрации ДТП
 
     Returns:
         Текст резюме от нейросети
@@ -472,8 +539,9 @@ async def get_ai_summary(
         comparison, reg_name, current_label, prev_label,
         raw_supplement=raw_supplement,
         news_context=news_context,
+        clusters_context=clusters_context,
     )
-    return await ask_llm(user_message=prompt, progress_callback=progress_callback)
+    return await ask_llm(user_message=prompt)
 
 
 async def get_ai_answer(
@@ -484,7 +552,7 @@ async def get_ai_answer(
     prev_label: str,
     raw_supplement: str = "",
     news_context: str = "",
-    progress_callback: Callable[[str], Awaitable[None]] | None = None,
+    clusters_context: str = "",
 ) -> str:
     """
     Отвечает на вопрос пользователя по данным с помощью LLM.
@@ -492,7 +560,7 @@ async def get_ai_answer(
     Args:
         raw_supplement: Дополнительные данные из сырых карточек ДТП
         news_context: Новостной контекст из открытых источников
-        progress_callback: optional async callback for status updates
+        clusters_context: Данные об очагах концентрации ДТП
 
     Returns:
         Текст ответа от нейросети
@@ -501,5 +569,6 @@ async def get_ai_answer(
         question, comparison, reg_name, current_label, prev_label,
         raw_supplement=raw_supplement,
         news_context=news_context,
+        clusters_context=clusters_context,
     )
-    return await ask_llm(user_message=prompt, progress_callback=progress_callback)
+    return await ask_llm(user_message=prompt)

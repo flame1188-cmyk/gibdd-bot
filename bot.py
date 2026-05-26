@@ -53,7 +53,7 @@ from analytics import (
     get_analytics_column_names,
     extract_raw_supplement,
 )
-from llm_analyzer import get_ai_summary, get_ai_answer
+from llm_analyzer import get_ai_summary, get_ai_answer, format_clusters_for_prompt
 from news_fetcher import fetch_news_context
 from concentration_points import (
     calculate_concentration_points,
@@ -61,7 +61,6 @@ from concentration_points import (
     build_concentration_detail_data,
     get_concentration_column_names,
     get_detail_column_names,
-    _is_off_road,
 )
 from user_request_parser import (
     parse_user_message,
@@ -873,21 +872,42 @@ async def _run_analysis(
                 f"{mode_label}: собираю данные и ищу новости..."
             )
 
+            # Формируем дополнение из сырых карточек
+            raw_sup = extract_raw_supplement(current_cards, current_label, max_cards=50)
+            raw_sup += extract_raw_supplement(prev_cards, prev_label, max_cards=50)
+
             # Ищем новости из открытых источников (если включено)
             news_ctx = ""
             if ENABLE_NEWS_SEARCH:
                 news_ctx = await fetch_news_context(reg_name, current_label, prev_label)
+            # Сохраняем для вопросов
             context.user_data["analytics_news_context"] = news_ctx
 
-            # Формируем raw_supplement с ограничением (не 50, а 25 карточек)
-            # чтобы промпт оставался в разумных пределах (~15K вместо ~31K символов)
-            raw_sup = extract_raw_supplement(current_cards, current_label, max_cards=25)
-            raw_sup += extract_raw_supplement(prev_cards, prev_label, max_cards=25)
+            # Рассчитываем очаги ДТП для передачи в LLM
+            clusters_ctx = ""
+            try:
+                await status_msg.edit_text(
+                    f"{mode_label}: рассчитываю очаги ДТП..."
+                )
+                clusters = await calculate_concentration_points(
+                    current_cards,
+                )
+                if clusters:
+                    clusters_ctx = format_clusters_for_prompt(clusters, max_clusters=10)
+                    context.user_data["analytics_clusters"] = clusters
+                    logger.info(
+                        f"LLM-анализ: рассчитано {len(clusters)} очагов "
+                        f"для контекста ({len(clusters_ctx)} симв.)"
+                    )
+                else:
+                    context.user_data["analytics_clusters"] = []
+            except Exception as e:
+                logger.warning(f"Не удалось рассчитать очаги для LLM-контекста: {e}")
+                context.user_data["analytics_clusters"] = []
 
-            # Rate limiter в llm_analyzer.py сам рассчитывает нужную паузу
-            # (60 сек после предыдущего LLM-вызова) и показывает обратный отсчёт
             await status_msg.edit_text(
-                f"{mode_label}: подготовка запроса к нейросети..."
+                f"{mode_label}: нейросеть анализирует данные...\n"
+                f"⏳ Обычно занимает 15-30 секунд."
             )
 
             llm_summary_text = await get_ai_summary(
@@ -897,11 +917,18 @@ async def _run_analysis(
                 prev_label=prev_label,
                 raw_supplement=raw_sup,
                 news_context=news_ctx,
-                progress_callback=lambda msg: status_msg.edit_text(msg),
+                clusters_context=clusters_ctx,
             )
         except Exception as e:
             logger.error(f"Ошибка LLM: {e}")
             llm_summary_text = None
+            await status_msg.edit_text(
+                f"\u26A0\uFE0F Не удалось получить ответ от нейросети.\n\n"
+                f"Ошибка: {e}\n\n"
+                f"Отправляю математический анализ без ИИ.\n"
+                f"Попробуйте нажать кнопку ещё раз — обычно работает со 2-й попытки."
+            )
+            # Не удаляем status_msg — пользователь должен увидеть ошибку
 
     # Генерируем Excel
     analytics_data = build_analytics_excel_data(
@@ -913,11 +940,15 @@ async def _run_analysis(
     column_names = get_analytics_column_names(current_label, prev_label)
     analytics_bytes = generate_analytics_file(analytics_data, column_names)
 
-    # Удаляем сообщение о статусе
-    try:
-        await status_msg.delete()
-    except Exception:
+    # Удаляем сообщение о статусе (если не было ошибки LLM)
+    if use_llm and not llm_summary_text:
+        # status_msg уже содержит сообщение об ошибке LLM — не удаляем
         pass
+    else:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
     # Отправляем результаты
     if use_llm and llm_summary_text:
@@ -1066,9 +1097,6 @@ async def _run_concentration_points(
             pass
 
     try:
-        # Подсчёт исключённых ДТП для информирования
-        off_road_total = sum(1 for c in current_cards if _is_off_road(c))
-
         clusters = await calculate_concentration_points(
             current_cards, progress_callback,
         )
@@ -1111,15 +1139,6 @@ async def _run_concentration_points(
             f"\U0001F525 <b>Очаги ДТП: {reg_name}</b>",
             f"Период: {current_label}",
             f"Всего ДТП: {len(current_cards)}",
-        ]
-
-        # Информация об исключённых ДТП
-        if off_road_total > 0:
-            summary_lines.append(
-                f"Исключено из расчёта (вне дороги): {off_road_total} ДТП"
-            )
-
-        summary_lines.extend([
             "",
             f"Найдено очагов: <b>{len(clusters)}</b>",
             f"  \u2022 В НП: {np_count}",
@@ -1127,7 +1146,7 @@ async def _run_concentration_points(
             f"  \u2022 ДТП в очагах: {total_in_clusters}",
             f"  \u2022 Погибло в очагах: {total_deaths}",
             f"  \u2022 Ранено в очагах: {total_injured}",
-        ])
+        ]
 
         await context.bot.send_message(
             chat_id=chat_id,
@@ -1190,13 +1209,13 @@ async def _handle_analytics_question(
 
     try:
         # Формируем дополнение из сырых карточек (если есть)
-        # Для вопросов берём меньше карточек — только статистику + 10 самых тяжёлых
+        # Для вопросов берём меньше карточек — только статистику + 15 самых тяжёлых
         raw_sup = ""
         current_cards = context.user_data.get("analytics_cards", [])
         prev_cards = context.user_data.get("analytics_prev_cards", [])
         if current_cards or prev_cards:
-            raw_sup = extract_raw_supplement(current_cards, current_label, max_cards=10)
-            raw_sup += extract_raw_supplement(prev_cards, prev_label, max_cards=10)
+            raw_sup = extract_raw_supplement(current_cards, current_label, max_cards=15)
+            raw_sup += extract_raw_supplement(prev_cards, prev_label, max_cards=15)
 
         answer = await get_ai_answer(
             question=question,
@@ -1206,6 +1225,9 @@ async def _handle_analytics_question(
             prev_label=prev_label,
             raw_supplement=raw_sup,
             news_context=context.user_data.get("analytics_news_context", ""),
+            clusters_context=format_clusters_for_prompt(
+                context.user_data.get("analytics_clusters", [])
+            ),
         )
 
         # Удаляем индикатор
