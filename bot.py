@@ -44,7 +44,7 @@ from telegram.ext import (
 from config import validate_config, ALLOWED_USER_IDS, LLM_API_KEY, ENABLE_NEWS_SEARCH
 from api_client import fetch_dtp_data, fetch_regions, extract_accident_cards
 from gibdd_parser import build_file1_data, build_file2_data
-from excel_generator import generate_both_files, generate_analytics_file, generate_concentration_file
+from excel_generator import generate_both_files, generate_analytics_file, generate_concentration_file, generate_concentration_dynamics_file
 from analytics import (
     calculate_metrics,
     compare_metrics,
@@ -1169,16 +1169,30 @@ async def _run_concentration_points(
         # --- Сводная статистика ---
         dyn_stats = build_dynamics_summary(clusters)
 
-        # --- Генерируем Excel с динамикой ---
+        # --- Разделяем очаги: текущие vs исчезнувшие ---
+        current_only_clusters = [
+            c for c in clusters if not c.get("_is_lost", False)
+        ]
+
+        # --- Генерируем Excel с 3 листами ---
+        # Лист 1: очаги запрашиваемого года (стандартный формат)
+        current_data = build_concentration_excel_data(current_only_clusters)
+        current_columns = get_concentration_column_names()
+
+        # Лист 2: динамика очагов (текущие + исчезнувшие)
         dyn_data = build_dynamics_excel_data(clusters)
         dyn_columns = get_dynamics_column_names()
+
+        # Лист 3: детализация ДТП
         detail_data = build_dynamics_detail_data(
             clusters, current_label, prev_label,
         )
         detail_columns = get_dynamics_detail_column_names()
-        from excel_generator import generate_concentration_dynamics_file
+
         conc_bytes = generate_concentration_dynamics_file(
-            dyn_data, dyn_columns, detail_data, detail_columns,
+            current_data, current_columns,
+            dyn_data, dyn_columns,
+            detail_data, detail_columns,
         )
 
         # Удаляем статус
@@ -1187,64 +1201,64 @@ async def _run_concentration_points(
         except Exception:
             pass
 
-        # --- Текстовое резюме с динамикой ---
-        np_count = sum(
-            1 for c in clusters
+        # --- Статистика по очагам текущего года ---
+        current_np_count = sum(
+            1 for c in current_only_clusters
             if c["zone_type"].startswith("settlement")
-            and not c.get("_is_lost", False)
         )
-        nonp_count = sum(
-            1 for c in clusters
+        current_nonp_count = sum(
+            1 for c in current_only_clusters
             if c["zone_type"] == "nonsettlement"
-            and not c.get("_is_lost", False)
         )
-        total_in_clusters = sum(
-            c["total_accidents"]
-            for c in clusters
-            if not c.get("_is_lost", False)
+        current_total_clusters = len(current_only_clusters)
+        current_total_dtp = sum(
+            c["total_accidents"] for c in current_only_clusters
         )
-        total_deaths = sum(
-            c["deaths"]
-            for c in clusters
-            if not c.get("_is_lost", False)
+        current_deaths = sum(
+            c["deaths"] for c in current_only_clusters
         )
-        total_injured = sum(
-            c["injured"]
-            for c in clusters
-            if not c.get("_is_lost", False)
+        current_injured = sum(
+            c["injured"] for c in current_only_clusters
         )
 
+        # --- Текстовое резюме ---
+        # Блок 1: очаги запрашиваемого года
         summary_lines = [
             f"\U0001F525 <b>Очаги ДТП: {reg_name}</b>",
-            f"Период: {current_label} vs {prev_label}",
+            f"Период: {current_label}",
             f"Всего ДТП: {len(current_cards)}",
             "",
-            f"Очагов найдено: <b>{dyn_stats['total']}</b>",
-            f"  \u2022 В НП: {np_count}",
-            f"  \u2022 Вне НП: {nonp_count}",
+            f"\U0001F4CA <b>Очагов за {current_label}:</b> <b>{current_total_clusters}</b>",
+            f"  \u2022 В НП: {current_np_count}",
+            f"  \u2022 Вне НП: {current_nonp_count}",
             "",
-            "<b>\U0001F4C8 Динамика:</b>",
-            f"  \U0001F7E2 Новый: {dyn_stats['new']}",
-            f"  \u2B06 Рост: {dyn_stats['growing']}",
-            f"  \u2B07 Снижение: {dyn_stats['shrinking']}",
-            f"  \u27A1 Стабильный: {dyn_stats['stable']}",
-            f"  \u274C Исчезнувший: {dyn_stats['lost']}",
-            "",
-            f"ДТП в очагах: {total_in_clusters}",
-            f"  \u2022 Погибло: {total_deaths}",
-            f"  \u2022 Ранено: {total_injured}",
+            f"ДТП в очагах: {current_total_dtp}",
+            f"  \u2022 Погибло: {current_deaths}",
+            f"  \u2022 Ранено: {current_injured}",
         ]
 
-        if dyn_stats["prev_total_dtp"] > 0:
-            delta_dtp = (
-                dyn_stats["current_total_dtp"]
-                - dyn_stats["prev_total_dtp"]
-            )
-            summary_lines.append("")
-            summary_lines.append(
-                f"ДТП в очагах (пр. год): {dyn_stats['prev_total_dtp']} "
-                f"({delta_dtp:+d})"
-            )
+        # Блок 2: динамика (только если есть данные за прошлый год)
+        if prev_cards:
+            summary_lines.extend([
+                "",
+                f"<b>\U0001F4C8 Динамика ({prev_label}):</b>",
+                f"  \U0001F7E2 Новый: {dyn_stats['new']}",
+                f"  \u2B06 Рост: {dyn_stats['growing']}",
+                f"  \u2B07 Снижение: {dyn_stats['shrinking']}",
+                f"  \u27A1 Стабильный: {dyn_stats['stable']}",
+                f"  \u274C Исчезнувший: {dyn_stats['lost']}",
+            ])
+
+            if dyn_stats["prev_total_dtp"] > 0:
+                delta_dtp = (
+                    dyn_stats["current_total_dtp"]
+                    - dyn_stats["prev_total_dtp"]
+                )
+                summary_lines.append("")
+                summary_lines.append(
+                    f"ДТП в очагах ({prev_label}): {dyn_stats['prev_total_dtp']} "
+                    f"({delta_dtp:+d})"
+                )
 
         await context.bot.send_message(
             chat_id=chat_id,
@@ -1265,10 +1279,12 @@ async def _run_concentration_points(
             document=conc_bytes,
             filename=filename,
             caption=(
-                f"\U0001F525 Очаги ДТП (динамика): {reg_name}\n"
-                f"{current_label} vs {prev_label}\n"
-                f"Очагов: {dyn_stats['total']} | "
-                f"ДТП в очагах: {total_in_clusters}"
+                f"\U0001F525 Очаги ДТП: {reg_name}\n"
+                f"{current_label}"
+                + (f" | Динамика: {prev_label}" if prev_cards else "")
+                + f"\n"
+                f"Очагов: {current_total_clusters} | "
+                f"ДТП в очагах: {current_total_dtp}"
             ),
         )
 
@@ -1276,9 +1292,10 @@ async def _run_concentration_points(
         context.user_data["analytics_clusters"] = clusters
 
         logger.info(
-            f"Очаги (динамика) отправлены: {reg_name}, "
-            f"{current_label} vs {prev_label}, "
-            f"{dyn_stats['total']} очагов из {len(current_cards)} ДТП"
+            f"Очаги отправлены: {reg_name}, "
+            f"{current_label}, "
+            f"{current_total_clusters} очагов из {len(current_cards)} ДТП"
+            + (f", динамика: {prev_label}" if prev_cards else "")
         )
 
     except Exception as e:

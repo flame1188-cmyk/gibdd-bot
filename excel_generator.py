@@ -414,42 +414,119 @@ DYN_STATUS_FILLS = {
 
 
 def generate_concentration_dynamics_file(
+    current_year_data: list[dict[str, str]],
+    current_year_columns: list[str],
     dynamics_data: list[dict[str, str]],
-    column_names: list[str],
+    dynamics_columns: list[str],
     detail_data: list[dict[str, str]] | None = None,
     detail_columns: list[str] | None = None,
 ) -> bytes:
     """
     Генерирует Excel-файл с очагами ДТП и исторической динамикой.
 
-    Лист 1 «Очаги ДТП (динамика)» — сводка с цветовой кодировкой:
+    Лист 1 «Очаги ДТП» — очаги запрашиваемого года (без динамики):
+      стандартные колонки с цветовой кодировкой по типу зоны
+      (НП — жёлтый, вне НП — голубой).
+
+    Лист 2 «Динамика очагов» — сводка с цветовой кодировкой по статусу:
       - Зелёный = Новый
       - Красный = Рост (ухудшение)
       - Голубой = Снижение (улучшение)
       - Серый = Стабильный
       - Светло-зелёный = Исчезнувший
 
-    Лист 2 «Детализация ДТП» — все ДТП с пометкой периода.
+    Лист 3 «Детализация ДТП» — все ДТП с пометкой периода.
+
+    Args:
+        current_year_data: Данные очагов только за запрашиваемый год
+        current_year_columns: Названия колонок для очагов текущего года
+        dynamics_data: Данные очагов с динамикой (текущие + исчезнувшие)
+        dynamics_columns: Названия колонок для динамики
+        detail_data: Данные от concentration_points.build_dynamics_detail_data()
+        detail_columns: Названия колонок для детализации
     """
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Очаги ДТП (динамика)"
 
-    col_count = len(column_names)
+    # ==============================
+    # Лист 1: Очаги ДТП (текущий год)
+    # ==============================
+    ws1 = wb.active
+    ws1.title = "Очаги ДТП"
 
-    # Заголовки
-    for col_idx, col_name in enumerate(column_names, start=1):
-        cell = ws.cell(row=1, column=col_idx, value=col_name)
+    col_count1 = len(current_year_columns)
+
+    for col_idx, col_name in enumerate(current_year_columns, start=1):
+        cell = ws1.cell(row=1, column=col_idx, value=col_name)
         cell.font = HEADER_FONT
         cell.fill = HEADER_FILL
         cell.alignment = HEADER_ALIGNMENT
         cell.border = THIN_BORDER
 
-    # Данные
-    for row_idx, row_data in enumerate(dynamics_data, start=2):
-        for col_idx, col_name in enumerate(column_names, start=1):
+    for row_idx, row_data in enumerate(current_year_data, start=2):
+        for col_idx, col_name in enumerate(current_year_columns, start=1):
             value = row_data.get(col_name, "")
-            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell = ws1.cell(row=row_idx, column=col_idx, value=value)
+            cell.alignment = CELL_ALIGNMENT
+            cell.border = THIN_BORDER
+
+        # Цветовое кодирование по типу зоны
+        zone = row_data.get("Тип зоны", "")
+        fill = None
+        if zone.startswith("НП"):
+            fill = ZONE_NP_FILL
+        elif zone.startswith("Вне"):
+            fill = ZONE_NONP_FILL
+
+        if fill:
+            for col_idx in range(1, col_count1 + 1):
+                ws1.cell(row=row_idx, column=col_idx).fill = fill
+
+    # Ширина колонок
+    col_widths = {
+        "№ очага": 8,
+        "Тип зоны": 28,
+        "Дорога/Улица": 30,
+        "Пикетаж начало": 14,
+        "Пикетаж конец": 14,
+        "Широта первого ДТП": 16,
+        "Долгота первого ДТП": 16,
+        "Широта последнего ДТП": 16,
+        "Долгота последнего ДТП": 16,
+        "Кол-во ДТП": 10,
+        "Виды ДТП (детализация)": 45,
+        "Доминирующий вид": 25,
+        "Погибло": 8,
+        "Ранено": 8,
+        "Дата первого ДТП": 14,
+        "Дата последнего ДТП": 14,
+    }
+    for col_idx, col_name in enumerate(current_year_columns, start=1):
+        col_letter = ws1.cell(row=1, column=col_idx).column_letter
+        ws1.column_dimensions[col_letter].width = col_widths.get(col_name, 20)
+
+    ws1.freeze_panes = "A2"
+
+    if current_year_data:
+        ws1.auto_filter.ref = ws1.dimensions
+
+    # ==============================
+    # Лист 2: Динамика очагов
+    # ==============================
+    ws2 = wb.create_sheet("Динамика очагов")
+
+    col_count2 = len(dynamics_columns)
+
+    for col_idx, col_name in enumerate(dynamics_columns, start=1):
+        cell = ws2.cell(row=1, column=col_idx, value=col_name)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = HEADER_ALIGNMENT
+        cell.border = THIN_BORDER
+
+    for row_idx, row_data in enumerate(dynamics_data, start=2):
+        for col_idx, col_name in enumerate(dynamics_columns, start=1):
+            value = row_data.get(col_name, "")
+            cell = ws2.cell(row=row_idx, column=col_idx, value=value)
             cell.alignment = CELL_ALIGNMENT
             cell.border = THIN_BORDER
 
@@ -458,8 +535,8 @@ def generate_concentration_dynamics_file(
         fill = DYN_STATUS_FILLS.get(status)
 
         if fill:
-            for col_idx in range(1, col_count + 1):
-                ws.cell(row=row_idx, column=col_idx).fill = fill
+            for col_idx in range(1, col_count2 + 1):
+                ws2.cell(row=row_idx, column=col_idx).fill = fill
 
         # Дополнительно: тип зоны в колонках «Тип зоны» и «Дорога»
         zone = row_data.get("Тип зоны", "")
@@ -470,9 +547,9 @@ def generate_concentration_dynamics_file(
             zone_fill = ZONE_NONP_FILL
 
         if zone_fill:
-            for col_idx, col_name in enumerate(column_names, start=1):
+            for col_idx, col_name in enumerate(dynamics_columns, start=1):
                 if col_name in ("Тип зоны", "Дорога/Улица"):
-                    ws.cell(row=row_idx, column=col_idx).fill = zone_fill
+                    ws2.cell(row=row_idx, column=col_idx).fill = zone_fill
 
     # Ширина колонок
     dyn_widths = {
@@ -496,21 +573,23 @@ def generate_concentration_dynamics_file(
         "Дата первого ДТП": 14,
         "Дата последнего ДТП": 14,
     }
-    for col_idx, col_name in enumerate(column_names, start=1):
-        col_letter = ws.cell(row=1, column=col_idx).column_letter
-        ws.column_dimensions[col_letter].width = dyn_widths.get(col_name, 20)
+    for col_idx, col_name in enumerate(dynamics_columns, start=1):
+        col_letter = ws2.cell(row=1, column=col_idx).column_letter
+        ws2.column_dimensions[col_letter].width = dyn_widths.get(col_name, 20)
 
-    ws.freeze_panes = "A2"
+    ws2.freeze_panes = "A2"
 
     if dynamics_data:
-        ws.auto_filter.ref = ws.dimensions
+        ws2.auto_filter.ref = ws2.dimensions
 
-    # --- Лист 2: Детализация ДТП с указанием периода ---
+    # ==============================
+    # Лист 3: Детализация ДТП
+    # ==============================
     if detail_data and detail_columns:
-        ws2 = wb.create_sheet("Детализация ДТП")
+        ws3 = wb.create_sheet("Детализация ДТП")
 
         for col_idx, col_name in enumerate(detail_columns, start=1):
-            cell = ws2.cell(row=1, column=col_idx, value=col_name)
+            cell = ws3.cell(row=1, column=col_idx, value=col_name)
             cell.font = HEADER_FONT
             cell.fill = HEADER_FILL
             cell.alignment = HEADER_ALIGNMENT
@@ -519,7 +598,7 @@ def generate_concentration_dynamics_file(
         for row_idx, row_data in enumerate(detail_data, start=2):
             for col_idx, col_name in enumerate(detail_columns, start=1):
                 value = row_data.get(col_name, "")
-                cell = ws2.cell(row=row_idx, column=col_idx, value=value)
+                cell = ws3.cell(row=row_idx, column=col_idx, value=value)
                 cell.alignment = CELL_ALIGNMENT
                 cell.border = THIN_BORDER
 
@@ -529,7 +608,7 @@ def generate_concentration_dynamics_file(
             if fill:
                 for ci, cn in enumerate(detail_columns, start=1):
                     if cn == "Статус":
-                        ws2.cell(row=row_idx, column=ci).fill = fill
+                        ws3.cell(row=row_idx, column=ci).fill = fill
                         break
 
         det_widths = {
@@ -546,12 +625,12 @@ def generate_concentration_dynamics_file(
             "Ранено": 8,
         }
         for col_idx, col_name in enumerate(detail_columns, start=1):
-            col_letter = ws2.cell(row=1, column=col_idx).column_letter
-            ws2.column_dimensions[col_letter].width = det_widths.get(col_name, 20)
+            col_letter = ws3.cell(row=1, column=col_idx).column_letter
+            ws3.column_dimensions[col_letter].width = det_widths.get(col_name, 20)
 
-        ws2.freeze_panes = "A2"
+        ws3.freeze_panes = "A2"
 
         if detail_data:
-            ws2.auto_filter.ref = ws2.dimensions
+            ws3.auto_filter.ref = ws3.dimensions
 
     return workbook_to_bytes(wb)
