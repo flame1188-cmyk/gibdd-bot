@@ -391,3 +391,167 @@ def generate_concentration_file(
             ws2.auto_filter.ref = ws2.dimensions
 
     return workbook_to_bytes(wb)
+
+
+# ========================
+# Очаги ДТП: динамика (сравнение периодов)
+# ========================
+
+# Стили для статусов динамики
+DYN_NEW_FILL = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+DYN_GROWING_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+DYN_SHRINKING_FILL = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
+DYN_STABLE_FILL = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+DYN_LOST_FILL = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+
+DYN_STATUS_FILLS = {
+    "Новый": DYN_NEW_FILL,
+    "Рост": DYN_GROWING_FILL,
+    "Снижение": DYN_SHRINKING_FILL,
+    "Стабильный": DYN_STABLE_FILL,
+    "Исчезнувший": DYN_LOST_FILL,
+}
+
+
+def generate_concentration_dynamics_file(
+    dynamics_data: list[dict[str, str]],
+    column_names: list[str],
+    detail_data: list[dict[str, str]] | None = None,
+    detail_columns: list[str] | None = None,
+) -> bytes:
+    """
+    Генерирует Excel-файл с очагами ДТП и исторической динамикой.
+
+    Лист 1 «Очаги ДТП (динамика)» — сводка с цветовой кодировкой:
+      - Зелёный = Новый
+      - Красный = Рост (ухудшение)
+      - Голубой = Снижение (улучшение)
+      - Серый = Стабильный
+      - Светло-зелёный = Исчезнувший
+
+    Лист 2 «Детализация ДТП» — все ДТП с пометкой периода.
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Очаги ДТП (динамика)"
+
+    col_count = len(column_names)
+
+    # Заголовки
+    for col_idx, col_name in enumerate(column_names, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = HEADER_ALIGNMENT
+        cell.border = THIN_BORDER
+
+    # Данные
+    for row_idx, row_data in enumerate(dynamics_data, start=2):
+        for col_idx, col_name in enumerate(column_names, start=1):
+            value = row_data.get(col_name, "")
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.alignment = CELL_ALIGNMENT
+            cell.border = THIN_BORDER
+
+        # Цветовое кодирование по статусу динамики
+        status = row_data.get("Статус", "")
+        fill = DYN_STATUS_FILLS.get(status)
+
+        if fill:
+            for col_idx in range(1, col_count + 1):
+                ws.cell(row=row_idx, column=col_idx).fill = fill
+
+        # Дополнительно: тип зоны в колонках «Тип зоны» и «Дорога»
+        zone = row_data.get("Тип зоны", "")
+        zone_fill = None
+        if zone.startswith("НП"):
+            zone_fill = ZONE_NP_FILL
+        elif zone.startswith("Вне"):
+            zone_fill = ZONE_NONP_FILL
+
+        if zone_fill:
+            for col_idx, col_name in enumerate(column_names, start=1):
+                if col_name in ("Тип зоны", "Дорога/Улица"):
+                    ws.cell(row=row_idx, column=col_idx).fill = zone_fill
+
+    # Ширина колонок
+    dyn_widths = {
+        "№ очага": 8,
+        "Статус": 16,
+        "Тип зоны": 28,
+        "Дорога/Улица": 30,
+        "Пикетаж начало": 14,
+        "Пикетаж конец": 14,
+        "Широта": 14,
+        "Долгота": 14,
+        "Кол-во ДТП": 10,
+        "ДТП (пр. период)": 14,
+        "Изменение ДТП": 12,
+        "Виды ДТП (детализация)": 45,
+        "Доминирующий вид": 25,
+        "Погибло": 8,
+        "Ранено": 8,
+        "Погибло (пр. период)": 14,
+        "Ранено (пр. период)": 14,
+        "Дата первого ДТП": 14,
+        "Дата последнего ДТП": 14,
+    }
+    for col_idx, col_name in enumerate(column_names, start=1):
+        col_letter = ws.cell(row=1, column=col_idx).column_letter
+        ws.column_dimensions[col_letter].width = dyn_widths.get(col_name, 20)
+
+    ws.freeze_panes = "A2"
+
+    if dynamics_data:
+        ws.auto_filter.ref = ws.dimensions
+
+    # --- Лист 2: Детализация ДТП с указанием периода ---
+    if detail_data and detail_columns:
+        ws2 = wb.create_sheet("Детализация ДТП")
+
+        for col_idx, col_name in enumerate(detail_columns, start=1):
+            cell = ws2.cell(row=1, column=col_idx, value=col_name)
+            cell.font = HEADER_FONT
+            cell.fill = HEADER_FILL
+            cell.alignment = HEADER_ALIGNMENT
+            cell.border = THIN_BORDER
+
+        for row_idx, row_data in enumerate(detail_data, start=2):
+            for col_idx, col_name in enumerate(detail_columns, start=1):
+                value = row_data.get(col_name, "")
+                cell = ws2.cell(row=row_idx, column=col_idx, value=value)
+                cell.alignment = CELL_ALIGNMENT
+                cell.border = THIN_BORDER
+
+            # Цвет по статусу
+            status = row_data.get("Статус", "")
+            fill = DYN_STATUS_FILLS.get(status)
+            if fill:
+                for ci, cn in enumerate(detail_columns, start=1):
+                    if cn == "Статус":
+                        ws2.cell(row=row_idx, column=ci).fill = fill
+                        break
+
+        det_widths = {
+            "№ очага": 8,
+            "Статус": 16,
+            "Период": 18,
+            "Дата ДТП": 14,
+            "Вид ДТП": 25,
+            "Дорога/Улица": 30,
+            "Пикетаж": 14,
+            "Широта": 16,
+            "Долгота": 16,
+            "Погибло": 8,
+            "Ранено": 8,
+        }
+        for col_idx, col_name in enumerate(detail_columns, start=1):
+            col_letter = ws2.cell(row=1, column=col_idx).column_letter
+            ws2.column_dimensions[col_letter].width = det_widths.get(col_name, 20)
+
+        ws2.freeze_panes = "A2"
+
+        if detail_data:
+            ws2.auto_filter.ref = ws2.dimensions
+
+    return workbook_to_bytes(wb)
