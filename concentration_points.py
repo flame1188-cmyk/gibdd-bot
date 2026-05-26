@@ -1792,6 +1792,7 @@ def build_concentration_detail_data(
 async def calculate_concentration_points(
     cards: list[dict],
     progress_callback: Callable[[str], Awaitable[None]] | None = None,
+    settlement_polygons: list[Polygon | MultiPolygon] | None = None,
 ) -> list[dict]:
     """
     Главная функция: расчёт всех очагов концентрации ДТП.
@@ -1799,6 +1800,9 @@ async def calculate_concentration_points(
     Args:
         cards: Список сырых карточек ДТП
         progress_callback: async-функция для обновления статуса
+        settlement_polygons: Если переданы — используются вместо запроса к OSM.
+            Это позволяет переиспользовать полигоны между вызовами
+            (например, при сравнении с прошлым годом).
 
     Returns:
         Список словарей очагов
@@ -1821,10 +1825,17 @@ async def calculate_concentration_points(
         logger.warning("Нет карточек с координатами — расчёт невозможен")
         return []
 
-    # Шаг 2: Границы НП из Overpass API (полигоны, с кэшем)
-    settlement_polygons = await fetch_settlement_boundaries(
-        cards_with_coords, progress_callback,
-    )
+    # Шаг 2: Границы НП
+    # Если полигоны переданы снаружи — используем их (OSM не запрашиваем)
+    if settlement_polygons is None:
+        settlement_polygons = await fetch_settlement_boundaries(
+            cards_with_coords, progress_callback,
+        )
+    else:
+        logger.info(
+            f"Границы НП переданы извне: {len(settlement_polygons)} полигонов "
+            f"(OSM-запрос пропущен)"
+        )
 
     if not settlement_polygons:
         logger.warning(
@@ -1957,6 +1968,9 @@ async def calculate_concentration_dynamics(
     """
     Рассчитывает очаги для двух периодов и определяет динамику каждого.
 
+    Границы НП загружаются из OSM **один раз** по объединённому bbox
+    обоих периодов — это сокращает нагрузку на Overpass API в 2 раза.
+
     Каждому очагу добавляется ключ ``dynamics``:
     {
         "status": "new" | "lost" | "growing" | "shrinking" | "stable",
@@ -1977,11 +1991,52 @@ async def calculate_concentration_dynamics(
     Returns:
         Список очагов с полем ``dynamics``
     """
+    # --- Готовим карточки с координатами из обоих периодов ---
+    current_filtered = [
+        c for c in current_cards
+        if _parse_coords(c) and not _is_off_road(c)
+    ]
+    prev_filtered = [
+        c for c in prev_cards
+        if _parse_coords(c) and not _is_off_road(c)
+    ]
+
+    if not current_filtered:
+        logger.warning("Нет карточек текущего периода с координатами")
+        return []
+
+    # --- Загружаем границы НП ОДИН РАЗ по объединённому bbox ---
+    combined_cards = current_filtered + prev_filtered
+    if prev_filtered:
+        if progress_callback:
+            await progress_callback(
+                f"Загрузка границ НП из OpenStreetMap...\n"
+                f"(Один запрос для обоих периодов)\n"
+                f"ДТП текущего: {len(current_filtered)}, "
+                f"прошлого: {len(prev_filtered)}"
+            )
+        settlement_polygons = await fetch_settlement_boundaries(
+            combined_cards, progress_callback,
+        )
+    else:
+        settlement_polygons = await fetch_settlement_boundaries(
+            current_filtered, progress_callback,
+        )
+
+    if settlement_polygons:
+        logger.info(
+            f"Динамика: границы НП загружены один раз: "
+            f"{len(settlement_polygons)} полигонов "
+            f"(OSM-запрос пропущен для прошлого периода)"
+        )
+
     # --- Очаги текущего периода ---
     if progress_callback:
         await progress_callback("Расчёт очагов текущего периода...")
     current_clusters = await calculate_concentration_points(
-        current_cards, progress_callback,
+        current_cards,
+        progress_callback,
+        settlement_polygons=settlement_polygons,
     )
 
     if not prev_cards:
@@ -2000,13 +2055,15 @@ async def calculate_concentration_dynamics(
         )
         return current_clusters
 
-    # --- Очаги прошлого периода ---
+    # --- Очаги прошлого периода (те же полигоны!) ---
     if progress_callback:
         await progress_callback(
             f"Расчёт очагов за прошлый год ({len(prev_cards)} ДТП)..."
         )
     prev_clusters = await calculate_concentration_points(
-        prev_cards, progress_callback,
+        prev_cards,
+        progress_callback,
+        settlement_polygons=settlement_polygons,
     )
 
     if not prev_clusters:
