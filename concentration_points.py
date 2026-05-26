@@ -723,6 +723,7 @@ async def fetch_settlement_boundaries(
 
     # --- Шаг 3: Для каждого тайла — запрос к Overpass ---
     all_elements: list[dict] = []
+    bbox_tile_indices: set[int] = set()  # тайлы, вернувшие bbox (не кэшируем)
 
     for tile_idx, (t_lat_min, t_lon_min, t_lat_max, t_lon_max) in enumerate(tiles):
         tile_bbox = f"{t_lat_min},{t_lon_min},{t_lat_max},{t_lon_max}"
@@ -753,6 +754,14 @@ async def fetch_settlement_boundaries(
         # Запрос к Overpass с параллельными зеркалами
         elements = await _fetch_overpass_parallel(tile_bbox, tile_idx, len(tiles))
         if elements:
+            # Проверяем: geom или bbox?
+            _, tile_is_bbox = _parse_overpass_elements(elements)
+            if tile_is_bbox:
+                bbox_tile_indices.add(tile_idx)
+                logger.info(
+                    f"Тайл {tile_idx + 1}/{len(tiles)}: получен bbox "
+                    f"(не кэшируем, {len(elements)} элементов)"
+                )
             all_elements.extend(elements)
 
     # --- Шаг 4: Дедупликация (для тайлов с перехлёстом) ---
@@ -777,7 +786,15 @@ async def fetch_settlement_boundaries(
     if not is_bbox:
         _memory_cache_put(bbox, polygons)
         # На диск — сохраняем элементы по каждому тайлу
+        # (кроме тайлов, вернувших bbox — их не кэшируем)
         for tile_idx, (t_lat_min, t_lon_min, t_lat_max, t_lon_max) in enumerate(tiles):
+            if tile_idx in bbox_tile_indices:
+                # Этот тайл вернул bbox — пропускаем, не кэшируем
+                logger.info(
+                    f"Тайл {tile_idx + 1}/{len(tiles)}: пропущен "
+                    f"(был bbox fallback)"
+                )
+                continue
             tile_bbox = f"{t_lat_min},{t_lon_min},{t_lat_max},{t_lon_max}"
             tile_elements = _load_cache(tile_bbox)
             if tile_elements is None:
