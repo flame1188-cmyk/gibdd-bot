@@ -123,6 +123,96 @@ def _create_workbook(
     return wb
 
 
+def generate_point_stats_file(
+    current_rows: list[dict[str, str]],
+    prev_rows: list[dict[str, str]] | None,
+    column_names: list[str],
+    current_label: str,
+    prev_label: str | None = None,
+) -> bytes:
+    """
+    Генерирует Excel-файл с ДТП в радиусе точки.
+
+    Лист 1 — текущий период (название = current_label).
+    Лист 2 — прошлый период (если есть данные, название = prev_label).
+
+    Args:
+        current_rows: Строки ДТП текущего периода
+        prev_rows: Строки ДТП прошлого периода (опционально)
+        column_names: Названия колонок
+        current_label: Подпись текущего периода (используется как название листа)
+        prev_label: Подпись прошлого периода (опционально)
+    """
+    wb = Workbook()
+
+    col_widths_ps = {
+        "Дата ДТП": 14,
+        "Время": 8,
+        "Вид ДТП": 25,
+        "Дорога/Улица": 35,
+        "Расстояние, м": 12,
+        "Погибло": 8,
+        "Ранено": 8,
+        "Широта": 14,
+        "Долгота": 14,
+    }
+
+    # --- Лист 1: Текущий период ---
+    ws1 = wb.active
+    sheet_name = current_label[:31]  # openpyxl: max 31 символов
+    ws1.title = sheet_name
+
+    for col_idx, col_name in enumerate(column_names, start=1):
+        cell = ws1.cell(row=1, column=col_idx, value=col_name)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = HEADER_ALIGNMENT
+        cell.border = THIN_BORDER
+
+    for row_idx, row_data in enumerate(current_rows, start=2):
+        for col_idx, col_name in enumerate(column_names, start=1):
+            value = row_data.get(col_name, "")
+            cell = ws1.cell(row=row_idx, column=col_idx, value=value)
+            cell.alignment = CELL_ALIGNMENT
+            cell.border = THIN_BORDER
+
+    for col_idx, col_name in enumerate(column_names, start=1):
+        col_letter = ws1.cell(row=1, column=col_idx).column_letter
+        ws1.column_dimensions[col_letter].width = col_widths_ps.get(col_name, 18)
+
+    ws1.freeze_panes = "A2"
+    if current_rows:
+        ws1.auto_filter.ref = ws1.dimensions
+
+    # --- Лист 2: Прошлый период (если есть) ---
+    if prev_rows and prev_label:
+        ws2 = wb.create_sheet(title=prev_label[:31])
+
+        for col_idx, col_name in enumerate(column_names, start=1):
+            cell = ws2.cell(row=1, column=col_idx, value=col_name)
+            cell.font = HEADER_FONT
+            cell.fill = HEADER_FILL
+            cell.alignment = HEADER_ALIGNMENT
+            cell.border = THIN_BORDER
+
+        for row_idx, row_data in enumerate(prev_rows, start=2):
+            for col_idx, col_name in enumerate(column_names, start=1):
+                value = row_data.get(col_name, "")
+                cell = ws2.cell(row=row_idx, column=col_idx, value=value)
+                cell.alignment = CELL_ALIGNMENT
+                cell.border = THIN_BORDER
+
+        for col_idx, col_name in enumerate(column_names, start=1):
+            col_letter = ws2.cell(row=1, column=col_idx).column_letter
+            ws2.column_dimensions[col_letter].width = col_widths_ps.get(col_name, 18)
+
+        ws2.freeze_panes = "A2"
+        if prev_rows:
+            ws2.auto_filter.ref = ws2.dimensions
+
+    return workbook_to_bytes(wb)
+
+
 def workbook_to_bytes(wb: Workbook) -> bytes:
     """Сериализует Workbook в байты xlsx-файла."""
     buffer = io.BytesIO()

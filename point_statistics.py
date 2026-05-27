@@ -399,66 +399,48 @@ def get_point_stats_column_names() -> list[str]:
     return list(POINT_STATS_COLUMNS)
 
 
+def _card_to_excel_row(card: dict) -> dict[str, str]:
+    """Преобразует одну карточку ДТП в строку Excel."""
+    dist_m = card.get("_dist_m", 0)
+    try:
+        lat = float(str(card.get("coord_w", "")).strip())
+        lon = float(str(card.get("coord_l", "")).strip())
+    except (ValueError, TypeError):
+        lat, lon = 0, 0
+
+    return {
+        "Дата ДТП": str(card.get("date_dtp", "")).strip(),
+        "Время": str(card.get("time", "")).strip(),
+        "Вид ДТП": str(card.get("dtpv", "")).strip(),
+        "Дорога/Улица": (
+            str(card.get("dor", "")).strip()
+            or str(card.get("street", "")).strip()
+        ),
+        "Расстояние, м": f"{dist_m:.0f}" if dist_m > 0 else "",
+        "Погибло": str(_safe_int(card.get("pog"))),
+        "Ранено": str(_safe_int(card.get("ran"))),
+        "Широта": f"{lat:.6f}" if lat else "",
+        "Долгота": f"{lon:.6f}" if lon else "",
+    }
+
+
 def build_point_stats_excel_data(
     current_cards: list[dict],
     prev_cards: list[dict] | None,
     current_label: str,
     prev_label: str,
-) -> list[dict[str, str]]:
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """
     Строит данные для Excel-файла с ДТП в радиусе точки.
 
-    Разделяет текущий и прошлый период с пометкой.
+    Возвращает кортеж из двух списков:
+      (текущий_период, прошлый_период)
+    Каждый список — список словарей для строк Excel.
     """
-    rows = []
+    current_rows = [_card_to_excel_row(card) for card in current_cards]
 
-    # Текущий период
-    for card in current_cards:
-        dist_m = card.get("_dist_m", 0)
-        try:
-            lat = float(str(card.get("coord_w", "")).strip())
-            lon = float(str(card.get("coord_l", "")).strip())
-        except (ValueError, TypeError):
-            lat, lon = 0, 0
-
-        rows.append({
-            "Дата ДТП": str(card.get("date_dtp", "")).strip(),
-            "Время": str(card.get("time", "")).strip(),
-            "Вид ДТП": str(card.get("dtpv", "")).strip(),
-            "Дорога/Улица": (
-                str(card.get("dor", "")).strip()
-                or str(card.get("street", "")).strip()
-            ),
-            "Расстояние, м": f"{dist_m:.0f}" if dist_m > 0 else "",
-            "Погибло": str(_safe_int(card.get("pog"))),
-            "Ранено": str(_safe_int(card.get("ran"))),
-            "Широта": f"{lat:.6f}" if lat else "",
-            "Долгота": f"{lon:.6f}" if lon else "",
-        })
-
-    # Прошлый период
+    prev_rows = []
     if prev_cards:
-        for card in prev_cards:
-            dist_m = card.get("_dist_m", 0)
-            try:
-                lat = float(str(card.get("coord_w", "")).strip())
-                lon = float(str(card.get("coord_l", "")).strip())
-            except (ValueError, TypeError):
-                lat, lon = 0, 0
+        prev_rows = [_card_to_excel_row(card) for card in prev_cards]
 
-            rows.append({
-                "Дата ДТП": str(card.get("date_dtp", "")).strip(),
-                "Время": str(card.get("time", "")).strip(),
-                "Вид ДТП": str(card.get("dtpv", "")).strip(),
-                "Дорога/Улица": (
-                    str(card.get("dor", "")).strip()
-                    or str(card.get("street", "")).strip()
-                ),
-                "Расстояние, м": f"{dist_m:.0f}" if dist_m > 0 else "",
-                "Погибло": str(_safe_int(card.get("pog"))),
-                "Ранено": str(_safe_int(card.get("ran"))),
-                "Широта": f"{lat:.6f}" if lat else "",
-                "Долгота": f"{lon:.6f}" if lon else "",
-            })
-
-    return rows
+    return current_rows, prev_rows

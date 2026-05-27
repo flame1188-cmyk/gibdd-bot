@@ -44,7 +44,7 @@ from telegram.ext import (
 from config import validate_config, ALLOWED_USER_IDS, LLM_API_KEY, ENABLE_NEWS_SEARCH
 from api_client import fetch_dtp_data, fetch_regions, extract_accident_cards
 from gibdd_parser import build_file1_data, build_file2_data
-from excel_generator import generate_both_files, generate_analytics_file, generate_concentration_file, generate_concentration_dynamics_file
+from excel_generator import generate_both_files, generate_analytics_file, generate_concentration_file, generate_concentration_dynamics_file, generate_point_stats_file
 from analytics import (
     calculate_metrics,
     compare_metrics,
@@ -551,6 +551,11 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if data.startswith("ps_radius:"):
             radius_m = int(data.split(":")[1])
             await _handle_point_stats_radius(update, context, radius_m)
+            return
+
+        # --- Выгрузка ДТП по точке в Excel ---
+        if data == "ps_excel":
+            await _send_point_stats_excel(update, context)
             return
 
         # --- Завершить режим вопросов ---
@@ -1450,6 +1455,105 @@ async def _handle_point_stats_radius(
     )
 
 
+async def _send_point_stats_excel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Генерирует и отправляет Excel-файл с ДТП в радиусе точки.
+    Использует сохранённые координаты и радиус из user_data.
+    """
+    chat_id = update.effective_chat.id
+
+    lat = context.user_data.get("point_stats_lat")
+    lon = context.user_data.get("point_stats_lon")
+    radius_m = context.user_data.get("point_stats_radius", 500)
+
+    if lat is None or lon is None:
+        await update.callback_query.answer(
+            "Координаты не найдены. Отправьте координаты заново.",
+            show_alert=True,
+        )
+        return
+
+    # Подтверждение
+    await update.callback_query.answer("Генерирую Excel-файл...")
+
+    current_cards = context.user_data.get("analytics_cards", [])
+    prev_cards = context.user_data.get("analytics_prev_cards", [])
+    period = context.user_data.get("analytics_period")
+    current_label = period.label if period else "Текущий период"
+    prev_label = context.user_data.get("analytics_prev_label", "")
+
+    # Фильтруем карточки по радиусу
+    from point_statistics import (
+        filter_cards_by_radius,
+        build_point_stats_excel_data,
+        get_point_stats_column_names,
+    )
+
+    current_filtered = filter_cards_by_radius(current_cards, lat, lon, radius_m)
+    prev_filtered = filter_cards_by_radius(prev_cards, lat, lon, radius_m) if prev_cards else []
+
+    total = len(current_filtered) + len(prev_filtered)
+    if total == 0:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="\u26A0\uFE0F В указанном радиусе нет ДТП для выгрузки.",
+        )
+        return
+
+    # Строим данные для Excel
+    current_rows, prev_rows = build_point_stats_excel_data(
+        current_filtered,
+        prev_filtered if prev_filtered else None,
+        current_label,
+        prev_label,
+    )
+
+    column_names = get_point_stats_column_names()
+
+    # Генерируем файл
+    excel_bytes = generate_point_stats_file(
+        current_rows=current_rows,
+        prev_rows=prev_rows if prev_rows else None,
+        column_names=column_names,
+        current_label=current_label,
+        prev_label=prev_label if prev_filtered else None,
+    )
+
+    # Имя файла
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if radius_m >= 1000:
+        radius_str = f"{radius_m / 1000:.0f}km"
+    else:
+        radius_str = f"{radius_m}m"
+
+    filename = f"dtp_point_{radius_str}_{timestamp}.xlsx"
+
+    # Формируем подпись
+    if radius_m >= 1000:
+        radius_display = f"{radius_m / 1000:.0f} км"
+    else:
+        radius_display = f"{radius_m} м"
+
+    caption_parts = [
+        f"\U0001F4CD ДТП в радиусе {radius_display}",
+        f"Координаты: {lat:.5f}, {lon:.5f}",
+        f"Период: {current_label}",
+    ]
+    if prev_filtered:
+        caption_parts.append(f"Сравнение: {prev_label}")
+    caption_parts.append(f"ДТП: {total} ({len(current_filtered)} + {len(prev_filtered)})")
+
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=excel_bytes,
+        filename=filename,
+        caption="\n".join(caption_parts),
+    )
+
+
 async def _process_point_stats(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -1497,7 +1601,19 @@ async def _process_point_stats(
             callback_data=f"ps_radius:{r_m}",
         ))
 
-    keyboard = InlineKeyboardMarkup([radius_buttons])
+    # Кнопка выгрузки в Excel (если есть ДТП)
+    total_dtp = stats["current"]["total"]
+    prev_total = stats["prev"]["total"] if stats.get("prev") else 0
+    buttons = [radius_buttons]
+
+    if total_dtp > 0 or prev_total > 0:
+        excel_label = f"\U0001F4E5 Выгрузить в Excel ({total_dtp + prev_total} ДТП)"
+        buttons.append([InlineKeyboardButton(
+            excel_label,
+            callback_data="ps_excel",
+        )])
+
+    keyboard = InlineKeyboardMarkup(buttons)
 
     # Отправляем или редактируем
     if edit_query:
