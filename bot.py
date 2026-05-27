@@ -68,6 +68,14 @@ from concentration_points import (
     get_dynamics_column_names,
     get_dynamics_detail_column_names,
 )
+from point_statistics import (
+    parse_coordinates,
+    calculate_point_statistics,
+    format_point_stats_message,
+    build_point_stats_excel_data,
+    get_point_stats_column_names,
+    RADIUS_OPTIONS,
+)
 from user_request_parser import (
     parse_user_message,
     parse_period,
@@ -534,6 +542,17 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await _run_concentration_points(update, context)
             return
 
+        # --- Статистика по точке ---
+        if data == "do_point_stats":
+            await _start_point_stats(update, context)
+            return
+
+        # --- Смена радиуса статистики по точке ---
+        if data.startswith("ps_radius:"):
+            radius_m = int(data.split(":")[1])
+            await _handle_point_stats_radius(update, context, radius_m)
+            return
+
         # --- Завершить режим вопросов ---
         if data == "end_qa":
             _clear_analytics_data(context.user_data)
@@ -748,6 +767,10 @@ async def _offer_analysis(
         "\U0001F525 Очаги ДТП",
         callback_data="do_concentration",
     )])
+    buttons.append([InlineKeyboardButton(
+        "\U0001F4CD Статистика по точке",
+        callback_data="do_point_stats",
+    )])
 
     keyboard = InlineKeyboardMarkup(buttons)
 
@@ -757,13 +780,15 @@ async def _offer_analysis(
             f"Хотите провести сравнительный анализ с аналогичным периодом {prev_year} года?\n\n"
             f"\U0001F4CA <b>Без ИИ</b> — математический анализ (таблицы, проценты)\n"
             f"\U0001F916 <b>С ИИ</b> — анализ + резюме от нейросети\n"
-            f"\U0001F525 <b>Очаги ДТП</b> — места концентрации аварийности"
+            f"\U0001F525 <b>Очаги ДТП</b> — места концентрации аварийности\n"
+            f"\U0001F4CD <b>По точке</b> — статистика ДТП по координатам"
         )
     else:
         text = (
             f"\u2705 Выгрузка завершена: {len(current_cards)} ДТП.\n\n"
             f"Хотите провести сравнительный анализ с аналогичным периодом {prev_year} года?\n\n"
-            f"\U0001F525 <b>Очаги ДТП</b> — места концентрации аварийности"
+            f"\U0001F525 <b>Очаги ДТП</b> — места концентрации аварийности\n"
+            f"\U0001F4CD <b>По точке</b> — статистика ДТП по координатам"
         )
 
     await context.bot.send_message(
@@ -1309,6 +1334,245 @@ async def _run_concentration_points(
             pass
 
 
+# ========================
+# Статистика по точке
+# ========================
+
+async def _start_point_stats(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Начинает режим «Статистика по точке».
+    Загружает данные за прошлый год (если ещё нет) и просит координаты.
+    """
+    chat_id = update.effective_chat.id
+
+    reg_code = context.user_data.get("analytics_reg_code", "")
+    reg_name = context.user_data.get("analytics_reg_name", "")
+    period = context.user_data.get("analytics_period")
+    current_cards = context.user_data.get("analytics_cards", [])
+
+    if not period or not current_cards:
+        await update.callback_query.edit_message_text(
+            "Данные не найдены. Пожалуйста, выполните выгрузку заново."
+        )
+        return
+
+    current_label = period.label
+    prev_year = period.year - 1
+    prev_label = period.label.replace(str(period.year), str(prev_year))
+
+    # Проверяем, есть ли данные за прошлый год
+    prev_cards = context.user_data.get("analytics_prev_cards", [])
+
+    if not prev_cards and reg_code:
+        # Загружаем данные за прошлый год
+        status_msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "\U0001F4CD Статистика по точке: подготовка...\n\n"
+                f"Загрузка данных за {prev_label}..."
+            ),
+        )
+
+        dat_list_prev = [f"{m}.{prev_year}" for m in period.months]
+        errors = []
+
+        month_names = {
+            1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
+            5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
+            9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
+        }
+
+        for i, dat in enumerate(dat_list_prev, start=1):
+            month_num = int(dat.split(".")[0])
+            month_name = month_names.get(month_num, dat)
+
+            await status_msg.edit_text(
+                f"\U0001F4CD Загрузка данных за прошлый год...\n\n"
+                f"{i}/{len(dat_list_prev)} — {month_name} {prev_year}"
+            )
+
+            try:
+                api_response = await fetch_dtp_data(
+                    dat=dat, reg=reg_code, pok="1",
+                )
+                cards = extract_accident_cards(api_response)
+                prev_cards.extend(cards)
+            except Exception as e:
+                errors.append(f"{month_name} {prev_year}: {e}")
+                logger.error(f"  Точечная статистика: {dat} -> ОШИБКА {e}")
+
+        # Сохраняем для повторного использования
+        if prev_cards:
+            context.user_data["analytics_prev_cards"] = prev_cards
+            context.user_data["analytics_prev_label"] = prev_label
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+    # Входим в режим ожидания координат
+    context.user_data["point_stats_mode"] = True
+
+    await update.callback_query.edit_message_text(
+        "\U0001F4CD <b>Статистика по точке</b>\n\n"
+        "Отправьте координаты одним из способов:\n\n"
+        "\U0001F4CD <b>Прикрепить локацию</b> (скрепка \U0001F4CE → Местоположение)\n\n"
+        "Или текстом:\n"
+        "<code>55.1234, 38.5678</code>\n\n"
+        f"Период: {current_label}"
+        + (f" | {prev_label}" if prev_cards else ""),
+        parse_mode="HTML",
+    )
+
+
+async def _handle_point_stats_radius(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    radius_m: int,
+) -> None:
+    """Пересчитывает статистику с новым радиусом (координаты те же)."""
+    lat = context.user_data.get("point_stats_lat")
+    lon = context.user_data.get("point_stats_lon")
+
+    if lat is None or lon is None:
+        await update.callback_query.edit_message_text(
+            "Координаты потеряны. Попробуйте снова."
+        )
+        return
+
+    await _process_point_stats(
+        context, update.effective_chat.id, lat, lon, radius_m,
+        edit_query=update.callback_query,
+    )
+
+
+async def _process_point_stats(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    lat: float,
+    lon: float,
+    radius_m: int,
+    edit_query=None,
+) -> None:
+    """
+    Вычисляет и отправляет статистику по точке.
+
+    Args:
+        edit_query: Если передан — редактирует сообщение с кнопками.
+            Иначе отправляет новое сообщение.
+    """
+    current_cards = context.user_data.get("analytics_cards", [])
+    prev_cards = context.user_data.get("analytics_prev_cards", [])
+    period = context.user_data.get("analytics_period")
+    current_label = period.label if period else ""
+    prev_label = context.user_data.get("analytics_prev_label", "")
+
+    # Сохраняем координаты и радиус для переключения
+    context.user_data["point_stats_lat"] = lat
+    context.user_data["point_stats_lon"] = lon
+    context.user_data["point_stats_radius"] = radius_m
+
+    # Вычисляем статистику
+    stats = calculate_point_statistics(
+        lat, lon, radius_m, current_cards,
+        prev_cards if prev_cards else None,
+    )
+
+    # Форматируем сообщение
+    message_text = format_point_stats_message(
+        stats, current_label,
+        prev_label if prev_cards else None,
+    )
+
+    # Кнопки радиуса
+    radius_buttons = []
+    for r_m, r_label in RADIUS_OPTIONS:
+        active = "\u2022 " if r_m == radius_m else ""
+        radius_buttons.append(InlineKeyboardButton(
+            f"{active}{r_label}",
+            callback_data=f"ps_radius:{r_m}",
+        ))
+
+    keyboard = InlineKeyboardMarkup([radius_buttons])
+
+    # Отправляем или редактируем
+    if edit_query:
+        try:
+            await edit_query.edit_message_text(
+                message_text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        except Exception:
+            # Если сообщение слишком длинное для редактирования — отправляем новое
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=message_text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=message_text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+
+
+async def _handle_location_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Обрабатывает сообщение с локацией (пinned location)."""
+    if not context.user_data.get("point_stats_mode"):
+        return
+
+    location = update.message.location
+    if not location:
+        return
+
+    lat = location.latitude
+    lon = location.longitude
+    radius_m = context.user_data.get("point_stats_radius", 500)
+
+    await _process_point_stats(
+        context, update.effective_chat.id, lat, lon, radius_m,
+    )
+
+
+async def _handle_coordinate_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+) -> None:
+    """Обрабатывает текстовое сообщение с координатами."""
+    if not context.user_data.get("point_stats_mode"):
+        return
+
+    coords = parse_coordinates(text)
+    if coords is None:
+        # Возможно, это вопрос для LLM — не обрабатываем здесь
+        return
+
+    lat, lon = coords
+    radius_m = context.user_data.get("point_stats_radius", 500)
+
+    # Удаляем сообщение с координатами (чистота чата)
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    await _process_point_stats(
+        context, update.effective_chat.id, lat, lon, radius_m,
+    )
+
+
 async def _handle_analytics_question(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1404,6 +1668,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if not user_text:
         return
+
+    # --- Режим статистики по точке: проверяем координаты ---
+    if context.user_data.get("point_stats_mode"):
+        coords = parse_coordinates(user_text)
+        if coords is not None:
+            lat, lon = coords
+            radius_m = context.user_data.get("point_stats_radius", 500)
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
+            await _process_point_stats(
+                context, update.effective_chat.id, lat, lon, radius_m,
+            )
+            return
+        # Если координаты не распознаны — выходим из режима и падаем ниже
+        context.user_data.pop("point_stats_mode", None)
 
     if not is_user_allowed(user.id):
         await update.message.reply_text("У вас нет доступа к этому боту.")
@@ -1579,6 +1860,9 @@ def main() -> None:
 
     # Текстовые сообщения
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Сообщения с локацией (для статистики по точке)
+    app.add_handler(MessageHandler(filters.LOCATION, _handle_location_message))
 
     # Глобальный обработчик ошибок
     app.add_error_handler(error_handler)
