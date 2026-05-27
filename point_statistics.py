@@ -382,15 +382,33 @@ def format_point_stats_message(
 # ========================
 
 POINT_STATS_COLUMNS = [
+    # --- Место и время ---
     "Дата ДТП",
     "Время",
-    "Вид ДТП",
+    "Населённый пункт",
+    "Район",
     "Дорога/Улица",
+    "Пикетаж",
     "Расстояние, м",
-    "Погибло",
-    "Ранено",
     "Широта",
     "Долгота",
+    # --- Характер ДТП ---
+    "Вид ДТП",
+    "Кол-во ТС",
+    "Кол-во участников",
+    "Погибло",
+    "Ранено",
+    "Категории участников",
+    # --- Дорожные условия ---
+    "Категория дороги",
+    "Состояние покрытия",
+    "Погода",
+    "Освещение",
+    # --- Причины ---
+    "Нарушения ПДД",
+    # --- Транспортные средства ---
+    "Типы ТС",
+    "Марки/Модели ТС",
 ]
 
 
@@ -399,8 +417,17 @@ def get_point_stats_column_names() -> list[str]:
     return list(POINT_STATS_COLUMNS)
 
 
+def _join_list(arr: Any, sep: str = "; ") -> str:
+    """Склеивает список в строку через разделитель."""
+    if not arr:
+        return ""
+    if isinstance(arr, list):
+        return sep.join(str(item) for item in arr if item is not None and str(item).strip() != "")
+    return str(arr).strip()
+
+
 def _card_to_excel_row(card: dict) -> dict[str, str]:
-    """Преобразует одну карточку ДТП в строку Excel."""
+    """Преобразует одну карточку ДТП в строку Excel (расширенная версия)."""
     dist_m = card.get("_dist_m", 0)
     try:
         lat = float(str(card.get("coord_w", "")).strip())
@@ -408,19 +435,97 @@ def _card_to_excel_row(card: dict) -> dict[str, str]:
     except (ValueError, TypeError):
         lat, lon = 0, 0
 
+    # --- Пикетаж: км + м ---
+    km = str(card.get("km", "")).strip()
+    m = str(card.get("m", "")).strip()
+    if km and m:
+        piketazh = f"{km} км {m} м"
+    elif km:
+        piketazh = f"{km} км"
+    elif m:
+        piketazh = f"{m} м"
+    else:
+        piketazh = ""
+
+    # --- Дорожные условия ---
+    dor_usl = card.get("dor_usl", {}) or {}
+    weather = _join_list(dor_usl.get("spog", []))
+    osveshchenie = str(dor_usl.get("osv", "")).strip()
+    s_pch = str(dor_usl.get("s_pch", "")).strip()
+
+    # --- Участники: категории ---
+    all_kt = []
+    ts_list = card.get("ts_info", []) or []
+    for ts in ts_list:
+        for uch in (ts.get("ts_uch", []) or []):
+            kt = str(uch.get("kt_uch", "")).strip()
+            if kt:
+                all_kt.append(kt)
+    for uch in (card.get("uch_info", []) or []):
+        kt = str(uch.get("kt_uch", "")).strip()
+        if kt:
+            all_kt.append(kt)
+    # Убираем дубли
+    categories = "; ".join(dict.fromkeys(all_kt))
+
+    # --- Нарушения ПДД (непосредственные) ---
+    all_npdd = []
+    for ts in ts_list:
+        for uch in (ts.get("ts_uch", []) or []):
+            npdd = _join_list(uch.get("npdd", []))
+            if npdd:
+                all_npdd.append(npdd)
+    for uch in (card.get("uch_info", []) or []):
+        npdd = _join_list(uch.get("npdd", []))
+        if npdd:
+            all_npdd.append(npdd)
+    npdd_str = "; ".join(all_npdd) if all_npdd else ""
+
+    # --- Транспортные средства ---
+    ts_types = []
+    ts_marks = []
+    for ts in ts_list:
+        t = str(ts.get("t_ts", "")).strip()
+        if t:
+            ts_types.append(t)
+        marka = str(ts.get("marka_ts", "")).strip()
+        model = str(ts.get("m_ts", "")).strip()
+        if marka:
+            ts_marks.append(f"{marka} {model}".strip())
+        elif model:
+            ts_marks.append(model)
+
     return {
+        # --- Место и время ---
         "Дата ДТП": str(card.get("date_dtp", "")).strip(),
         "Время": str(card.get("time", "")).strip(),
-        "Вид ДТП": str(card.get("dtpv", "")).strip(),
+        "Населённый пункт": str(card.get("np", "")).strip(),
+        "Район": str(card.get("district", "")).strip(),
         "Дорога/Улица": (
             str(card.get("dor", "")).strip()
             or str(card.get("street", "")).strip()
         ),
+        "Пикетаж": piketazh,
         "Расстояние, м": f"{dist_m:.0f}" if dist_m > 0 else "",
-        "Погибло": str(_safe_int(card.get("pog"))),
-        "Ранено": str(_safe_int(card.get("ran"))),
         "Широта": f"{lat:.6f}" if lat else "",
         "Долгота": f"{lon:.6f}" if lon else "",
+        # --- Характер ДТП ---
+        "Вид ДТП": str(card.get("dtpv", "")).strip(),
+        "Кол-во ТС": str(_safe_int(card.get("k_ts"))),
+        "Кол-во участников": str(_safe_int(card.get("k_uch"))),
+        "Погибло": str(_safe_int(card.get("pog"))),
+        "Ранено": str(_safe_int(card.get("ran"))),
+        "Категории участников": categories,
+        # --- Дорожные условия ---
+        "Категория дороги": str(card.get("dor_k", "")).strip(),
+        "Состояние покрытия": s_pch,
+        "Погода": weather,
+        "Освещение": osveshchenie,
+        # --- Причины ---
+        "Нарушения ПДД": npdd_str,
+        # --- Транспортные средства ---
+        "Типы ТС": "; ".join(ts_types),
+        "Марки/Модели ТС": "; ".join(ts_marks),
     }
 
 
