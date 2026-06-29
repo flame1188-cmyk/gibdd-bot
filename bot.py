@@ -1943,6 +1943,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if isinstance(error, Conflict):
         import time as _time
+        global _conflict_last_log
         now = _time.monotonic()
         if now - _conflict_last_log >= _CONFLICT_LOG_INTERVAL:
             _conflict_last_log = now
