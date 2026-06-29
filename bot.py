@@ -94,6 +94,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Rate-limit для Conflict-предупреждений (логируем не чаще 1 раза в 60с)
+_conflict_last_log: float = 0.0
+_CONFLICT_LOG_INTERVAL = 60.0
+
 
 # ========================
 # Константы
@@ -1938,11 +1942,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     error = context.error
 
     if isinstance(error, Conflict):
-        logger.warning(
-            "Conflict: обнаружен другой экземпляр бота. "
-            "Если это произошло при деплое — старый инстанс ещё остановлен. "
-            "Подождите, конфликт разрешится автоматически."
-        )
+        import time as _time
+        now = _time.monotonic()
+        if now - _conflict_last_log >= _CONFLICT_LOG_INTERVAL:
+            _conflict_last_log = now
+            logger.warning(
+                "Conflict: другой экземпляр бота (deploу). "
+                "Автоматически разрешится. Следующее сообщение через 60с."
+            )
         return
 
     if isinstance(error, NetworkError):
