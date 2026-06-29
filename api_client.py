@@ -112,7 +112,7 @@ async def _request_with_retries(
 
     # Формируем таймауты: короткий connect, длинный read
     timeout = httpx.Timeout(
-        connect=connect_timeout or 30,
+        connect=connect_timeout or 60,
         read=read_timeout or TARGET_API_TIMEOUT,
         write=30,
         pool=30,
