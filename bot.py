@@ -42,7 +42,7 @@ from telegram.ext import (
 )
 
 from config import validate_config, ALLOWED_USER_IDS, LLM_API_KEY, ENABLE_NEWS_SEARCH
-from api_client import fetch_dtp_data, fetch_regions, extract_accident_cards
+from api_client import fetch_dtp_data, fetch_regions, extract_accident_cards, error_brief
 from gibdd_parser import build_file1_data, build_file2_data
 from excel_generator import generate_both_files, generate_analytics_file, generate_concentration_file, generate_concentration_dynamics_file, generate_point_stats_file
 from analytics import (
@@ -644,9 +644,11 @@ async def _start_fetching(
             all_cards.extend(cards)
             logger.info(f"  {dat}: {len(cards)} ДТП")
         except Exception as e:
-            error_msg = f"{month_name} {period.year}: {e}"
+            error_msg = f"{month_name} {period.year}: {error_brief(e)}"
             errors.append(error_msg)
-            logger.error(f"  {dat}: ОШИБКА — {e}")
+            logger.error(
+                f"  {dat}: ОШИБКА [{type(e).__name__}] {error_brief(e)}"
+            )
 
     # Проверяем результат
     if not all_cards and errors:
@@ -872,8 +874,10 @@ async def _run_analysis(
             prev_cards.extend(cards)
             logger.info(f"  Аналитика: {dat} -> {len(cards)} ДТП")
         except Exception as e:
-            errors.append(f"{month_name} {prev_year}: {e}")
-            logger.error(f"  Аналитика: {dat} -> ОШИБКА {e}")
+            errors.append(f"{month_name} {prev_year}: {error_brief(e)}")
+            logger.error(
+                f"  Аналитика: {dat} -> ОШИБКА [{type(e).__name__}] {error_brief(e)}"
+            )
 
     if not prev_cards:
         error_text = "\n".join(f"- {e}" for e in errors) if errors else "Нет данных"
@@ -1168,9 +1172,9 @@ async def _run_concentration_points(
                         f"  Очаги-динамика: {dat} -> {len(cards)} ДТП"
                     )
                 except Exception as e:
-                    errors.append(f"{month_name} {prev_year}: {e}")
+                    errors.append(f"{month_name} {prev_year}: {error_brief(e)}")
                     logger.error(
-                        f"  Очаги-динамика: {dat} -> ОШИБКА {e}"
+                        f"  Очаги-динамика: {dat} -> ОШИБКА [{type(e).__name__}] {error_brief(e)}"
                     )
 
             if errors:
@@ -1406,8 +1410,10 @@ async def _start_point_stats(
                 cards = extract_accident_cards(api_response)
                 prev_cards.extend(cards)
             except Exception as e:
-                errors.append(f"{month_name} {prev_year}: {e}")
-                logger.error(f"  Точечная статистика: {dat} -> ОШИБКА {e}")
+                errors.append(f"{month_name} {prev_year}: {error_brief(e)}")
+                logger.error(
+                    f"  Точечная статистика: {dat} -> ОШИБКА [{type(e).__name__}] {error_brief(e)}"
+                )
 
         # Сохраняем для повторного использования
         if prev_cards:
