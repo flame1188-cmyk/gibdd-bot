@@ -193,9 +193,10 @@ async def _request_with_retries(
             error_desc = _classify_error(e)
             last_error = e
             logger.warning(f"{description} | попытка {attempt}/{retries} | {error_desc}")
-            # При ошибке соединения — сбрасываем клиент, чтобы следующий
-            # ретрай гарантированно создал новое TCP-подключение
-            await close_client()
+            # НЕ закрываем клиент! httpx сам помечает нерабочие соединения
+            # в пуле и создаст новое при следующем запросе.
+            # close_client() здесь убивал connection pooling — каждый ретрай
+            # открывал новый TCP-сокет, что на Amvera вызывало rate-limit.
 
         except httpx.HTTPStatusError as e:
             error_desc = _classify_error(e)
@@ -211,7 +212,6 @@ async def _request_with_retries(
                 f"{description} | попытка {attempt}/{retries} | "
                 f"неожиданная ошибка: {type(e).__name__}: {e}"
             )
-            await close_client()
 
         # Задержка перед следующим ретраем (экспоненциальная)
         if attempt < retries:
