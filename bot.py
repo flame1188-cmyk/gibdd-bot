@@ -675,7 +675,7 @@ async def _start_fetching(
 
         file1_data = build_file1_data(all_cards)
         file2_data = build_file2_data(all_cards)
-        file1_bytes, file2_bytes = generate_both_files(file1_data, file2_data)
+        file1_bytes, file2_bytes = await asyncio.to_thread(generate_both_files, file1_data, file2_data)
 
         # Отправляем файлы
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -982,7 +982,7 @@ async def _run_analysis(
         previous_label=prev_label,
     )
     column_names = get_analytics_column_names(current_label, prev_label)
-    analytics_bytes = generate_analytics_file(analytics_data, column_names)
+    analytics_bytes = await asyncio.to_thread(generate_analytics_file, analytics_data, column_names)
 
     # Удаляем сообщение о статусе (если не было ошибки LLM)
     if use_llm and not llm_summary_text:
@@ -1227,7 +1227,8 @@ async def _run_concentration_points(
         )
         detail_columns = get_dynamics_detail_column_names()
 
-        conc_bytes = generate_concentration_dynamics_file(
+        conc_bytes = await asyncio.to_thread(
+            generate_concentration_dynamics_file,
             current_data, current_columns,
             dyn_data, dyn_columns,
             detail_data, detail_columns,
@@ -1524,7 +1525,8 @@ async def _send_point_stats_excel(
     column_names = get_point_stats_column_names()
 
     # Генерируем файл
-    excel_bytes = generate_point_stats_file(
+    excel_bytes = await asyncio.to_thread(
+        generate_point_stats_file,
         current_rows=current_rows,
         prev_rows=prev_rows if prev_rows else None,
         column_names=column_names,
@@ -1977,7 +1979,7 @@ def main() -> None:
 
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).concurrent_updates(True).build()
 
     # Команды
     app.add_handler(CommandHandler("start", cmd_start))
