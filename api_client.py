@@ -169,13 +169,13 @@ async def _request_with_retries(
         ConnectionError: после исчерпания всех ретраев
         httpx.HTTPStatusError: при HTTP-ошибке (без ретраев)
     """
-    client = await get_client()
     retries = max_retries if max_retries is not None else MAX_RETRIES
     bo_base = backoff_base if backoff_base is not None else RETRY_BACKOFF_BASE
 
     last_error: Exception | None = None
 
     for attempt in range(1, retries + 1):
+        client = await get_client()  # Получаем (или пересоздаём) клиент на каждой попытке
         await _throttle()
 
         try:
