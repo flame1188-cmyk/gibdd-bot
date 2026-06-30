@@ -42,7 +42,7 @@ from telegram.ext import (
 )
 
 from config import validate_config, ALLOWED_USER_IDS, LLM_API_KEY, ENABLE_NEWS_SEARCH
-from api_client import fetch_dtp_data, fetch_regions, extract_accident_cards, error_brief
+from api_client import fetch_dtp_data, fetch_regions, extract_accident_cards, error_brief, close_client
 from gibdd_parser import build_file1_data, build_file2_data
 from excel_generator import generate_both_files, generate_analytics_file, generate_concentration_file, generate_concentration_dynamics_file, generate_point_stats_file
 from analytics import (
@@ -2005,6 +2005,9 @@ def main() -> None:
     print("  Нажмите Ctrl+C для остановки.\n")
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Закрываем HTTP-клиент (connection pool)
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(close_client())
 
 
 if __name__ == "__main__":
