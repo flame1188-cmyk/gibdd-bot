@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 from datetime import datetime
+from typing import Any
 
 # ============================================================
 # SSL: otkluchaem proverku sertifikatov (dlya korporativnogo fayervola)
@@ -120,6 +121,34 @@ QUARTER_LABELS = {
 # ========================
 # Вспомогательные функции
 # ========================
+
+async def _telegram_api_call(
+    fn,
+    description: str = "Telegram API",
+    max_retries: int = 3,
+) -> Any:
+    """Выполняет вызов Telegram API с ретраями при сетевых ошибках.
+    Принимает callable (функцию/лямбду), возвращает корутину внутри.
+
+    Пример: await _telegram_api_call(lambda: bot.send_document(...))
+
+    Защищает от TimedOut / NetworkError — временная недоступность api.telegram.org."""
+    from telegram.error import TimedOut
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            return await fn()
+        except (TimedOut, NetworkError) as e:
+            if attempt < max_retries:
+                wait = 3 * attempt  # 3, 6, 9...
+                logger.warning(
+                    f"{description}: {type(e).__name__}, "
+                    f"попытка {attempt}/{max_retries}, повтор через {wait}с"
+                )
+                await asyncio.sleep(wait)
+            else:
+                raise
+
 
 def is_user_allowed(user_id: int) -> bool:
     if not ALLOWED_USER_IDS:
@@ -678,12 +707,15 @@ async def _start_fetching(
 
     # Обработка и генерация Excel
     try:
-        await query.edit_message_text(
-            f"Выгрузка данных:\n\n"
-            f"Регион: {reg_name}\n"
-            f"Период: {period.label}\n\n"
-            f"Найдено ДТП: {len(all_cards)}\n"
-            f"Генерация Excel-файлов..."
+        await _telegram_api_call(
+            lambda: query.edit_message_text(
+                f"Выгрузка данных:\n\n"
+                f"Регион: {reg_name}\n"
+                f"Период: {period.label}\n\n"
+                f"Найдено ДТП: {len(all_cards)}\n"
+                f"Генерация Excel-файлов..."
+            ),
+            description="Статус: генерация Excel",
         )
 
         file1_data = build_file1_data(all_cards)
@@ -696,33 +728,42 @@ async def _start_fetching(
         filename1 = f"dtp_cards_{safe_reg}_{period.year}_{timestamp}.xlsx"
         filename2 = f"dtp_uch_{safe_reg}_{period.year}_{timestamp}.xlsx"
 
-        await query.edit_message_text("Готово! Отправляю файлы...")
+        await _telegram_api_call(
+            lambda: query.edit_message_text("Готово! Отправляю файлы..."),
+            description="Статус: отправка файлов",
+        )
 
         chat_id = query.message.chat_id
 
         from telegram import Bot
         bot: Bot = context.bot
 
-        await bot.send_document(
-            chat_id=chat_id,
-            document=file1_bytes,
-            filename=filename1,
-            caption=(
-                f"Карточки ДТП\n"
-                f"{reg_name} | {period.label}\n"
-                f"ДТП: {len(all_cards)}"
+        await _telegram_api_call(
+            lambda: bot.send_document(
+                chat_id=chat_id,
+                document=file1_bytes,
+                filename=filename1,
+                caption=(
+                    f"Карточки ДТП\n"
+                    f"{reg_name} | {period.label}\n"
+                    f"ДТП: {len(all_cards)}"
+                ),
             ),
+            description="Отправка файла карточек ДТП",
         )
 
-        await bot.send_document(
-            chat_id=chat_id,
-            document=file2_bytes,
-            filename=filename2,
-            caption=(
-                f"Участники ДТП\n"
-                f"{reg_name} | {period.label}\n"
-                f"Участников: {len(file2_data)}"
+        await _telegram_api_call(
+            lambda: bot.send_document(
+                chat_id=chat_id,
+                document=file2_bytes,
+                filename=filename2,
+                caption=(
+                    f"Участники ДТП\n"
+                    f"{reg_name} | {period.label}\n"
+                    f"Участников: {len(file2_data)}"
+                ),
             ),
+            description="Отправка файла участников ДТП",
         )
 
         # Удаляем сообщение о статусе
@@ -734,7 +775,10 @@ async def _start_fetching(
         logger.info(f"Файлы отправлены: {len(all_cards)} ДТП, {len(file2_data)} участников")
 
         # Предлагаем провести анализ
-        await _offer_analysis(context, chat_id, reg_name, reg_code, period, all_cards)
+        await _telegram_api_call(
+            lambda: _offer_analysis(context, chat_id, reg_name, reg_code, period, all_cards),
+            description="Предложение анализа",
+        )
 
     except Exception as e:
         logger.exception(f"Ошибка генерации/отправки файлов: {e}")
@@ -1052,15 +1096,18 @@ async def _run_analysis(
     ai_suffix = "_ai" if use_llm else ""
     filename = f"dtp_analytics{ai_suffix}_{safe_reg}_{period.year}_vs_{prev_year}_{timestamp}.xlsx"
 
-    await context.bot.send_document(
-        chat_id=chat_id,
-        document=analytics_bytes,
-        filename=filename,
-        caption=(
-            f"\U0001F4CA Аналитика: {reg_name}\n"
-            f"{current_label} vs {prev_label}\n"
-            f"Текущий: {len(current_cards)} ДТП | Прошлый: {len(prev_cards)} ДТП"
+    await _telegram_api_call(
+        lambda: context.bot.send_document(
+            chat_id=chat_id,
+            document=analytics_bytes,
+            filename=filename,
+            caption=(
+                f"\U0001F4CA Аналитика: {reg_name}\n"
+                f"{current_label} vs {prev_label}\n"
+                f"Текущий: {len(current_cards)} ДТП | Прошлый: {len(prev_cards)} ДТП"
+            ),
         ),
+        description="Отправка файла аналитики",
     )
 
     # Предлагаем задать вопросы (если есть LLM-ключ)
@@ -1326,18 +1373,21 @@ async def _run_concentration_points(
             f"{period.year}_{timestamp}.xlsx"
         )
 
-        await context.bot.send_document(
-            chat_id=chat_id,
-            document=conc_bytes,
-            filename=filename,
-            caption=(
-                f"\U0001F525 Очаги ДТП: {reg_name}\n"
-                f"{current_label}"
-                + (f" | Динамика: {prev_label}" if prev_cards else "")
-                + f"\n"
-                f"Очагов: {current_total_clusters} | "
-                f"ДТП в очагах: {current_total_dtp}"
+        await _telegram_api_call(
+            lambda: context.bot.send_document(
+                chat_id=chat_id,
+                document=conc_bytes,
+                filename=filename,
+                caption=(
+                    f"\U0001F525 Очаги ДТП: {reg_name}\n"
+                    f"{current_label}"
+                    + (f" | Динамика: {prev_label}" if prev_cards else "")
+                    + f"\n"
+                    f"Очагов: {current_total_clusters} | "
+                    f"ДТП в очагах: {current_total_dtp}"
+                ),
             ),
+            description="Отправка файла очагов ДТП",
         )
 
         # Сохраняем очаги в сессию (для LLM и дальнейших вопросов)
@@ -1571,11 +1621,14 @@ async def _send_point_stats_excel(
         caption_parts.append(f"Сравнение: {prev_label}")
     caption_parts.append(f"ДТП: {total} ({len(current_filtered)} + {len(prev_filtered)})")
 
-    await context.bot.send_document(
-        chat_id=chat_id,
-        document=excel_bytes,
-        filename=filename,
-        caption="\n".join(caption_parts),
+    await _telegram_api_call(
+        lambda: context.bot.send_document(
+            chat_id=chat_id,
+            document=excel_bytes,
+            filename=filename,
+            caption="\n".join(caption_parts),
+        ),
+        description="Отправка файла ДТП по точке",
     )
 
 
