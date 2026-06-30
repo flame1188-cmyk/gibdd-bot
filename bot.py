@@ -207,10 +207,21 @@ def build_period_keyboard(year: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(f"IV кв", callback_data=f"pq:4:{year}"),
     ])
 
-    # Строка 3: 9 месяцев
-    buttons.append([
-        InlineKeyboardButton(f"9 месяцев ({MONTH_SHORT[1]}-{MONTH_SHORT[9]})", callback_data=f"p9:{year}"),
-    ])
+    # Строки 3-4: произвольные периоды по месяцам
+    # (3, 6, 12 месяцев уже покрыты кнопками «квартал», «полугодие», «год»)
+    custom_periods = [2, 4, 5, 7, 8, 9, 10, 11]
+    row: list[InlineKeyboardButton] = []
+    for n in custom_periods:
+        row.append(InlineKeyboardButton(
+            f"{n} мес ({MONTH_SHORT[1]}-{MONTH_SHORT[n]})",
+            callback_data=f"pn:{n}:{year}",
+        ))
+        # По 3 кнопки в строке, чтобы текст помещался
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
 
     # Строки 4-5: месяцы (по 6 в строке)
     for row_start in (1, 7):
@@ -476,13 +487,15 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await _start_fetching(query, context, period)
             return
 
-        # --- Выбор периода: 9 месяцев ---
-        if data.startswith("p9:"):
-            year = int(data[3:])
+        # --- Выбор периода: Произвольный N месяцев (янв-N) ---
+        if data.startswith("pn:"):
+            parts = data.split(":")
+            n = int(parts[1])
+            year = int(parts[2])
             period = ParsedPeriod(
-                months=list(range(1, 10)),
+                months=list(range(1, n + 1)),
                 year=year,
-                label=f"9 месяцев {year} (Янв-Сен)",
+                label=f"{n} мес {year} (Янв-{MONTH_SHORT[n]})",
             )
             await _start_fetching(query, context, period)
             return
