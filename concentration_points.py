@@ -867,9 +867,10 @@ async def _fetch_overpass_parallel(
     Параллельный запрос к зеркалам Overpass API.
 
     Стратегия:
-    - Одновременно запускаем запросы к 2 зеркалам (geom)
-    - Первый успешный ответ используется
-    - Если оба geom не удались — параллельно пробуем bb на 2 зеркалах
+    1. Параллельно запускаем запросы к 2 зеркалам (out geom)
+    2. Если оба не удались — пауза 5 сек, повторная попытка geom
+    3. Если и повторная попытка не удалась — fallback на out bb
+    4. Последняя надежда: out geom последовательно на оставшихся зеркалах
     """
     geom_query = (
         "[out:json][timeout:90];\n"
@@ -890,27 +891,39 @@ async def _fetch_overpass_parallel(
     )
 
     # --- Пытаемся получить geom параллельно с 2 зеркал ---
-    geom_tasks = []
-    for url in OVERPASS_URLS[:2]:
-        geom_tasks.append(
-            asyncio.create_task(
-                _overpass_request(url, geom_query, OVERPASS_HEADERS, "geom"),
-                name=f"geom-{url}",
-            )
-        )
+    geom_urls = OVERPASS_URLS[:2]
 
-    geom_results = await asyncio.gather(*geom_tasks, return_exceptions=True)
-
-    for result in geom_results:
-        if isinstance(result, list) and result:
-            polygons, is_bbox = _parse_overpass_elements(result)
-            if polygons and not is_bbox:
-                logger.info(
-                    f"Тайл {tile_idx + 1}/{total_tiles}: "
-                    f"{len(polygons)} полигонов (out geom, parallel)"
+    for attempt in range(1, 3):  # максимум 2 попытки geom
+        geom_tasks = []
+        for url in geom_urls:
+            geom_tasks.append(
+                asyncio.create_task(
+                    _overpass_request(url, geom_query, OVERPASS_HEADERS, "geom"),
+                    name=f"geom-{url}",
                 )
-                _save_cache(bbox_str, result)
-                return result
+            )
+
+        geom_results = await asyncio.gather(*geom_tasks, return_exceptions=True)
+
+        for result in geom_results:
+            if isinstance(result, list) and result:
+                polygons, is_bbox = _parse_overpass_elements(result)
+                if polygons and not is_bbox:
+                    logger.info(
+                        f"Тайл {tile_idx + 1}/{total_tiles}: "
+                        f"{len(polygons)} полигонов (out geom, parallel"
+                        f"{f', попытка {attempt}' if attempt > 1 else ''})"
+                    )
+                    _save_cache(bbox_str, result)
+                    return result
+
+        # Перед второй попыткой — пауза, чтобы сервер Overpass успел
+        if attempt == 1:
+            logger.info(
+                f"Тайл {tile_idx + 1}/{total_tiles}: "
+                f"geom не удался, повторная попытка через 5 сек..."
+            )
+            await asyncio.sleep(5)
 
     # --- Fallback: параллельно out bb на 2 зеркалах ---
     bb_tasks = []
