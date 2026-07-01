@@ -23,6 +23,26 @@ logger = logging.getLogger(__name__)
 
 ZHIPU_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 
+# Персистентный HTTP-клиент для ZhipuAI (connection pooling)
+_llm_client: httpx.AsyncClient | None = None
+
+
+def _get_llm_client() -> httpx.AsyncClient:
+    """Возвращает переиспользуемый httpx-клиент для ZhipuAI API."""
+    global _llm_client
+    if _llm_client is None or _llm_client.is_closed:
+        _llm_client = httpx.AsyncClient(timeout=180)
+        logger.info("Создан новый HTTP-клиент для LLM (ZhipuAI)")
+    return _llm_client
+
+
+async def close_llm_client() -> None:
+    """Закрывает HTTP-клиент ZhipuAI."""
+    global _llm_client
+    if _llm_client is not None and not _llm_client.is_closed:
+        await _llm_client.aclose()
+        _llm_client = None
+
 # ============================================================
 # Глобальный rate limiter — минимальный интервал между ЛЮБЫМИ LLM-вызовами
 # ============================================================
@@ -412,12 +432,12 @@ async def ask_llm(
 
     for attempt in range(max_retries + 1):
         try:
-            async with httpx.AsyncClient(timeout=180) as client:
-                response = await client.post(
-                    ZHIPU_API_URL,
-                    headers=headers,
-                    json=payload,
-                )
+            client = _get_llm_client()
+            response = await client.post(
+                ZHIPU_API_URL,
+                headers=headers,
+                json=payload,
+            )
 
             if response.status_code == 429:
                 if attempt < max_retries:
@@ -453,6 +473,7 @@ async def ask_llm(
 
             # Успешный запрос — обновляем время последнего вызова
             _last_llm_call_time = time.monotonic()
+            break  # Выходим из цикла ретраев
 
         except httpx.HTTPStatusError:
             raise
@@ -464,18 +485,23 @@ async def ask_llm(
                 continue
             raise
 
-    data = response.json()
+    try:
+        data = response.json()
+    except json.JSONDecodeError as e:
+        logger.error(f"LLM вернул невалидный JSON: {e}")
+        raise ValueError(f"LLM вернул невалидный ответ") from e
 
     # Диагностика: логируем структуру ответа (без полного content для экономии)
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(f"LLM полный ответ: {json.dumps(data, ensure_ascii=False)[:500]}")
     else:
         # Даже на INFO логируем ключи и структуру choices
-        choice = data.get("choices", [{}])[0].get("message", {})
+        choices = data.get("choices") or [{}]
+        choice = choices[0].get("message", {})
         content_preview = str(choice.get("content", ""))[:100]
         logger.info(
             f"LLM ответ структура: keys={list(data.keys())}, "
-            f"finish_reason={data.get('choices', [{}])[0].get('finish_reason')}, "
+            f"finish_reason={choices[0].get('finish_reason')}, "
             f"content_type={type(choice.get('content')).__name__}, "
             f"content_preview={repr(content_preview)}"
         )

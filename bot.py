@@ -16,20 +16,6 @@ import logging
 import os
 import sys
 from datetime import datetime
-from typing import Any
-
-# ============================================================
-# SSL: otkluchaem proverku sertifikatov (dlya korporativnogo fayervola)
-# Patentiruem httpx DO importa telegram
-# ============================================================
-import httpx
-_orig_async_client_init = httpx.AsyncClient.__init__
-
-def _patched_async_client_init(self, *args, **kwargs):
-    kwargs.setdefault('verify', False)
-    _orig_async_client_init(self, *args, **kwargs)
-
-httpx.AsyncClient.__init__ = _patched_async_client_init
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import Conflict, NetworkError
@@ -44,6 +30,7 @@ from telegram.ext import (
 
 from config import validate_config, ALLOWED_USER_IDS, LLM_API_KEY, ENABLE_NEWS_SEARCH
 from api_client import fetch_dtp_data, fetch_regions, extract_accident_cards, error_brief, close_client
+from llm_analyzer import close_llm_client
 from gibdd_parser import build_file1_data, build_file2_data
 from excel_generator import generate_both_files, generate_analytics_file, generate_concentration_file, generate_concentration_dynamics_file, generate_point_stats_file
 from analytics import (
@@ -112,6 +99,12 @@ MONTH_SHORT = {
     9: "Сен", 10: "Окт", 11: "Ноя", 12: "Дек",
 }
 
+MONTH_FULL = {
+    1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
+    5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
+    9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
+}
+
 QUARTER_LABELS = {
     1: "I кв (Янв-Мар)", 2: "II кв (Апр-Июн)",
     3: "III кв (Июл-Сен)", 4: "IV кв (Окт-Дек)",
@@ -121,34 +114,6 @@ QUARTER_LABELS = {
 # ========================
 # Вспомогательные функции
 # ========================
-
-async def _telegram_api_call(
-    fn,
-    description: str = "Telegram API",
-    max_retries: int = 3,
-) -> Any:
-    """Выполняет вызов Telegram API с ретраями при сетевых ошибках.
-    Принимает callable (функцию/лямбду), возвращает корутину внутри.
-
-    Пример: await _telegram_api_call(lambda: bot.send_document(...))
-
-    Защищает от TimedOut / NetworkError — временная недоступность api.telegram.org."""
-    from telegram.error import TimedOut
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            return await fn()
-        except (TimedOut, NetworkError) as e:
-            if attempt < max_retries:
-                wait = 3 * attempt  # 3, 6, 9...
-                logger.warning(
-                    f"{description}: {type(e).__name__}, "
-                    f"попытка {attempt}/{max_retries}, повтор через {wait}с"
-                )
-                await asyncio.sleep(wait)
-            else:
-                raise
-
 
 def is_user_allowed(user_id: int) -> bool:
     if not ALLOWED_USER_IDS:
@@ -168,6 +133,53 @@ async def _load_regions_if_needed(context: ContextTypes.DEFAULT_TYPE) -> list[di
         regions = await ensure_regions_loaded()
         context.bot_data["regions"] = regions
     return regions
+
+
+async def _fetch_cards_for_period(
+    dat_list: list[str],
+    reg_code: str,
+    log_prefix: str,
+    progress_callback=None,
+) -> tuple[list[dict], list[str]]:
+    """Загружает карточки ДТП за список месяцев с GIBDD API.
+
+    Общая функция для аналитики, очагов и точечной статистики —
+    устраняет дублирование одного и того же цикла в 3 местах.
+
+    Args:
+        dat_list: Список строк в формате "m.YYYY"
+        reg_code: Код региона
+        log_prefix: Префикс для логов (например "Аналитика", "Очаги")
+        progress_callback: Опциональная async-функция(i, total, month_name, year)
+                           для обновления статуса
+
+    Returns:
+        (cards, errors) — список карточек ДТП и список строк-ошибок
+    """
+    cards: list[dict] = []
+    errors: list[str] = []
+
+    for i, dat in enumerate(dat_list, start=1):
+        month_num = int(dat.split(".")[0])
+        month_name = MONTH_FULL.get(month_num, dat)
+        year = dat.split(".")[1]
+
+        if progress_callback:
+            await progress_callback(i, len(dat_list), month_name, year)
+
+        try:
+            api_response = await fetch_dtp_data(dat=dat, reg=reg_code, pok="1")
+            extracted = extract_accident_cards(api_response)
+            cards.extend(extracted)
+            logger.info(f"  {log_prefix}: {dat} -> {len(extracted)} ДТП")
+        except Exception as e:
+            err_msg = f"{month_name} {year}: {error_brief(e)}"
+            errors.append(err_msg)
+            logger.error(
+                f"  {log_prefix}: {dat} -> ОШИБКА [{type(e).__name__}] {error_brief(e)}"
+            )
+
+    return cards, errors
 
 
 # ========================
@@ -236,21 +248,10 @@ def build_period_keyboard(year: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(f"IV кв", callback_data=f"pq:4:{year}"),
     ])
 
-    # Строки 3-4: произвольные периоды по месяцам
-    # (3, 6, 12 месяцев уже покрыты кнопками «квартал», «полугодие», «год»)
-    custom_periods = [2, 4, 5, 7, 8, 9, 10, 11]
-    row: list[InlineKeyboardButton] = []
-    for n in custom_periods:
-        row.append(InlineKeyboardButton(
-            f"{n} мес ({MONTH_SHORT[1]}-{MONTH_SHORT[n]})",
-            callback_data=f"pn:{n}:{year}",
-        ))
-        # По 3 кнопки в строке, чтобы текст помещался
-        if len(row) == 3:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
+    # Строка 3: 9 месяцев
+    buttons.append([
+        InlineKeyboardButton(f"9 месяцев ({MONTH_SHORT[1]}-{MONTH_SHORT[9]})", callback_data=f"p9:{year}"),
+    ])
 
     # Строки 4-5: месяцы (по 6 в строке)
     for row_start in (1, 7):
@@ -516,15 +517,13 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await _start_fetching(query, context, period)
             return
 
-        # --- Выбор периода: Произвольный N месяцев (янв-N) ---
-        if data.startswith("pn:"):
-            parts = data.split(":")
-            n = int(parts[1])
-            year = int(parts[2])
+        # --- Выбор периода: 9 месяцев ---
+        if data.startswith("p9:"):
+            year = int(data[3:])
             period = ParsedPeriod(
-                months=list(range(1, n + 1)),
+                months=list(range(1, 10)),
                 year=year,
-                label=f"{n} мес {year} (Янв-{MONTH_SHORT[n]})",
+                label=f"9 месяцев {year} (Янв-Сен)",
             )
             await _start_fetching(query, context, period)
             return
@@ -534,15 +533,10 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             parts = data.split(":")
             month = int(parts[1])
             year = int(parts[2])
-            month_name = {
-                1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
-                5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
-                9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
-            }
             period = ParsedPeriod(
                 months=[month],
                 year=year,
-                label=f"{month_name.get(month, '')} {year}",
+                label=f"{MONTH_FULL.get(month, '')} {year}",
             )
             await _start_fetching(query, context, period)
             return
@@ -624,7 +618,7 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         logger.exception(f"Ошибка в callback handler: {e}")
         try:
             await query.edit_message_text(
-                f"Произошла ошибка: {e}\n\nОтправьте /dtp чтобы начать заново."
+                "Произошла ошибка при обработке запроса.\n\n"
             )
         except Exception:
             pass
@@ -663,11 +657,7 @@ async def _start_fetching(
     for i, dat in enumerate(dat_list, start=1):
         # Обновляем прогресс
         month_num = int(dat.split(".")[0])
-        month_name = {
-            1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
-            5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
-            9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
-        }.get(month_num, dat)
+        month_name = MONTH_FULL.get(month_num, dat)
 
         progress_bar = _make_progress_bar(i, total_months)
         status_text = (
@@ -707,20 +697,17 @@ async def _start_fetching(
 
     # Обработка и генерация Excel
     try:
-        await _telegram_api_call(
-            lambda: query.edit_message_text(
-                f"Выгрузка данных:\n\n"
-                f"Регион: {reg_name}\n"
-                f"Период: {period.label}\n\n"
-                f"Найдено ДТП: {len(all_cards)}\n"
-                f"Генерация Excel-файлов..."
-            ),
-            description="Статус: генерация Excel",
+        await query.edit_message_text(
+            f"Выгрузка данных:\n\n"
+            f"Регион: {reg_name}\n"
+            f"Период: {period.label}\n\n"
+            f"Найдено ДТП: {len(all_cards)}\n"
+            f"Генерация Excel-файлов..."
         )
 
         file1_data = build_file1_data(all_cards)
         file2_data = build_file2_data(all_cards)
-        file1_bytes, file2_bytes = await asyncio.to_thread(generate_both_files, file1_data, file2_data)
+        file1_bytes, file2_bytes = generate_both_files(file1_data, file2_data)
 
         # Отправляем файлы
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -728,42 +715,33 @@ async def _start_fetching(
         filename1 = f"dtp_cards_{safe_reg}_{period.year}_{timestamp}.xlsx"
         filename2 = f"dtp_uch_{safe_reg}_{period.year}_{timestamp}.xlsx"
 
-        await _telegram_api_call(
-            lambda: query.edit_message_text("Готово! Отправляю файлы..."),
-            description="Статус: отправка файлов",
-        )
+        await query.edit_message_text("Готово! Отправляю файлы...")
 
         chat_id = query.message.chat_id
 
         from telegram import Bot
         bot: Bot = context.bot
 
-        await _telegram_api_call(
-            lambda: bot.send_document(
-                chat_id=chat_id,
-                document=file1_bytes,
-                filename=filename1,
-                caption=(
-                    f"Карточки ДТП\n"
-                    f"{reg_name} | {period.label}\n"
-                    f"ДТП: {len(all_cards)}"
-                ),
+        await bot.send_document(
+            chat_id=chat_id,
+            document=file1_bytes,
+            filename=filename1,
+            caption=(
+                f"Карточки ДТП\n"
+                f"{reg_name} | {period.label}\n"
+                f"ДТП: {len(all_cards)}"
             ),
-            description="Отправка файла карточек ДТП",
         )
 
-        await _telegram_api_call(
-            lambda: bot.send_document(
-                chat_id=chat_id,
-                document=file2_bytes,
-                filename=filename2,
-                caption=(
-                    f"Участники ДТП\n"
-                    f"{reg_name} | {period.label}\n"
-                    f"Участников: {len(file2_data)}"
-                ),
+        await bot.send_document(
+            chat_id=chat_id,
+            document=file2_bytes,
+            filename=filename2,
+            caption=(
+                f"Участники ДТП\n"
+                f"{reg_name} | {period.label}\n"
+                f"Участников: {len(file2_data)}"
             ),
-            description="Отправка файла участников ДТП",
         )
 
         # Удаляем сообщение о статусе
@@ -775,10 +753,7 @@ async def _start_fetching(
         logger.info(f"Файлы отправлены: {len(all_cards)} ДТП, {len(file2_data)} участников")
 
         # Предлагаем провести анализ
-        await _telegram_api_call(
-            lambda: _offer_analysis(context, chat_id, reg_name, reg_code, period, all_cards),
-            description="Предложение анализа",
-        )
+        await _offer_analysis(context, chat_id, reg_name, reg_code, period, all_cards)
 
     except Exception as e:
         logger.exception(f"Ошибка генерации/отправки файлов: {e}")
@@ -911,34 +886,20 @@ async def _run_analysis(
     )
 
     # Запрашиваем данные за прошлый год
-    prev_cards = []
-    errors = []
-
-    for i, dat in enumerate(dat_list_prev, start=1):
-        month_num = int(dat.split(".")[0])
-        month_name = {
-            1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
-            5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
-            9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
-        }.get(month_num, dat)
-
-        progress = _make_progress_bar(i, len(dat_list_prev))
-        await status_msg.edit_text(
-            f"{mode_label}: загрузка...\n\n"
-            f"{progress} {i}/{len(dat_list_prev)}\n"
-            f"Запрос: {month_name} {prev_year}..."
-        )
-
+    async def progress(i, total, month_name, year):
+        bar = _make_progress_bar(i, total)
         try:
-            api_response = await fetch_dtp_data(dat=dat, reg=reg_code, pok="1")
-            cards = extract_accident_cards(api_response)
-            prev_cards.extend(cards)
-            logger.info(f"  Аналитика: {dat} -> {len(cards)} ДТП")
-        except Exception as e:
-            errors.append(f"{month_name} {prev_year}: {error_brief(e)}")
-            logger.error(
-                f"  Аналитика: {dat} -> ОШИБКА [{type(e).__name__}] {error_brief(e)}"
+            await status_msg.edit_text(
+                f"{mode_label}: загрузка...\n\n"
+                f"{bar} {i}/{total}\n"
+                f"Запрос: {month_name} {year}..."
             )
+        except Exception:
+            pass
+
+    prev_cards, errors = await _fetch_cards_for_period(
+        dat_list_prev, reg_code, "Аналитика", progress_callback=progress,
+    )
 
     if not prev_cards:
         error_text = "\n".join(f"- {e}" for e in errors) if errors else "Нет данных"
@@ -1039,7 +1000,7 @@ async def _run_analysis(
         previous_label=prev_label,
     )
     column_names = get_analytics_column_names(current_label, prev_label)
-    analytics_bytes = await asyncio.to_thread(generate_analytics_file, analytics_data, column_names)
+    analytics_bytes = generate_analytics_file(analytics_data, column_names)
 
     # Удаляем сообщение о статусе (если не было ошибки LLM)
     if use_llm and not llm_summary_text:
@@ -1096,18 +1057,15 @@ async def _run_analysis(
     ai_suffix = "_ai" if use_llm else ""
     filename = f"dtp_analytics{ai_suffix}_{safe_reg}_{period.year}_vs_{prev_year}_{timestamp}.xlsx"
 
-    await _telegram_api_call(
-        lambda: context.bot.send_document(
-            chat_id=chat_id,
-            document=analytics_bytes,
-            filename=filename,
-            caption=(
-                f"\U0001F4CA Аналитика: {reg_name}\n"
-                f"{current_label} vs {prev_label}\n"
-                f"Текущий: {len(current_cards)} ДТП | Прошлый: {len(prev_cards)} ДТП"
-            ),
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=analytics_bytes,
+        filename=filename,
+        caption=(
+            f"\U0001F4CA Аналитика: {reg_name}\n"
+            f"{current_label} vs {prev_label}\n"
+            f"Текущий: {len(current_cards)} ДТП | Прошлый: {len(prev_cards)} ДТП"
         ),
-        description="Отправка файла аналитики",
     )
 
     # Предлагаем задать вопросы (если есть LLM-ключ)
@@ -1115,7 +1073,7 @@ async def _run_analysis(
         context.user_data["qa_mode"] = True
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(
-                "\u274C Завершить问答",
+                "\u274C Завершить",
                 callback_data="end_qa",
             )],
         ])
@@ -1145,11 +1103,14 @@ async def _run_analysis(
 
 
 def _clear_analytics_data(user_data: dict) -> None:
-    """Очищает все данные аналитики из user_data."""
+    """Очищает все данные аналитики из user_data (включая тяжёлые списки ДТП)."""
     for key in [
         "analytics_ready", "analytics_reg_code", "analytics_reg_name",
         "analytics_period", "analytics_cards", "analytics_comparison",
-        "analytics_current_label", "analytics_prev_label", "qa_mode",
+        "analytics_current_label", "analytics_prev_label",
+        "analytics_prev_cards", "analytics_clusters",
+        "analytics_news_context", "qa_mode",
+        "point_stats_mode", "point_stats_lat", "point_stats_lon", "point_stats_radius",
     ]:
         user_data.pop(key, None)
 
@@ -1211,35 +1172,16 @@ async def _run_concentration_points(
         errors = []
 
         if reg_code:
-            month_names = {
-                1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
-                5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
-                9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
-            }
-
-            for i, dat in enumerate(dat_list_prev, start=1):
-                month_num = int(dat.split(".")[0])
-                month_name = month_names.get(month_num, dat)
-
+            async def fetch_progress(i, total, month_name, year):
                 await progress_callback(
                     f"Загрузка данных за прошлый год...\n"
-                    f"{i}/{len(dat_list_prev)} — {month_name} {prev_year}"
+                    f"{i}/{total} — {month_name} {year}"
                 )
 
-                try:
-                    api_response = await fetch_dtp_data(
-                        dat=dat, reg=reg_code, pok="1",
-                    )
-                    cards = extract_accident_cards(api_response)
-                    prev_cards.extend(cards)
-                    logger.info(
-                        f"  Очаги-динамика: {dat} -> {len(cards)} ДТП"
-                    )
-                except Exception as e:
-                    errors.append(f"{month_name} {prev_year}: {error_brief(e)}")
-                    logger.error(
-                        f"  Очаги-динамика: {dat} -> ОШИБКА [{type(e).__name__}] {error_brief(e)}"
-                    )
+            prev_cards, errors = await _fetch_cards_for_period(
+                dat_list_prev, reg_code, "Очаги-динамика",
+                progress_callback=fetch_progress,
+            )
 
             if errors:
                 logger.warning(
@@ -1287,8 +1229,7 @@ async def _run_concentration_points(
         )
         detail_columns = get_dynamics_detail_column_names()
 
-        conc_bytes = await asyncio.to_thread(
-            generate_concentration_dynamics_file,
+        conc_bytes = generate_concentration_dynamics_file(
             current_data, current_columns,
             dyn_data, dyn_columns,
             detail_data, detail_columns,
@@ -1373,25 +1314,25 @@ async def _run_concentration_points(
             f"{period.year}_{timestamp}.xlsx"
         )
 
-        await _telegram_api_call(
-            lambda: context.bot.send_document(
-                chat_id=chat_id,
-                document=conc_bytes,
-                filename=filename,
-                caption=(
-                    f"\U0001F525 Очаги ДТП: {reg_name}\n"
-                    f"{current_label}"
-                    + (f" | Динамика: {prev_label}" if prev_cards else "")
-                    + f"\n"
-                    f"Очагов: {current_total_clusters} | "
-                    f"ДТП в очагах: {current_total_dtp}"
-                ),
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=conc_bytes,
+            filename=filename,
+            caption=(
+                f"\U0001F525 Очаги ДТП: {reg_name}\n"
+                f"{current_label}"
+                + (f" | Динамика: {prev_label}" if prev_cards else "")
+                + f"\n"
+                f"Очагов: {current_total_clusters} | "
+                f"ДТП в очагах: {current_total_dtp}"
             ),
-            description="Отправка файла очагов ДТП",
         )
 
         # Сохраняем очаги в сессию (для LLM и дальнейших вопросов)
         context.user_data["analytics_clusters"] = clusters
+
+        # Освобождаем память: прошлый год больше не нужен
+        context.user_data.pop("analytics_prev_cards", None)
 
         logger.info(
             f"Очаги отправлены: {reg_name}, "
@@ -1454,34 +1395,17 @@ async def _start_point_stats(
         )
 
         dat_list_prev = [f"{m}.{prev_year}" for m in period.months]
-        errors = []
 
-        month_names = {
-            1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
-            5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
-            9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
-        }
-
-        for i, dat in enumerate(dat_list_prev, start=1):
-            month_num = int(dat.split(".")[0])
-            month_name = month_names.get(month_num, dat)
-
+        async def pt_progress(i, total, month_name, year):
             await status_msg.edit_text(
                 f"\U0001F4CD Загрузка данных за прошлый год...\n\n"
-                f"{i}/{len(dat_list_prev)} — {month_name} {prev_year}"
+                f"{i}/{total} — {month_name} {year}"
             )
 
-            try:
-                api_response = await fetch_dtp_data(
-                    dat=dat, reg=reg_code, pok="1",
-                )
-                cards = extract_accident_cards(api_response)
-                prev_cards.extend(cards)
-            except Exception as e:
-                errors.append(f"{month_name} {prev_year}: {error_brief(e)}")
-                logger.error(
-                    f"  Точечная статистика: {dat} -> ОШИБКА [{type(e).__name__}] {error_brief(e)}"
-                )
+        prev_cards, _ = await _fetch_cards_for_period(
+            dat_list_prev, reg_code, "Точечная статистика",
+            progress_callback=pt_progress,
+        )
 
         # Сохраняем для повторного использования
         if prev_cards:
@@ -1588,8 +1512,7 @@ async def _send_point_stats_excel(
     column_names = get_point_stats_column_names()
 
     # Генерируем файл
-    excel_bytes = await asyncio.to_thread(
-        generate_point_stats_file,
+    excel_bytes = generate_point_stats_file(
         current_rows=current_rows,
         prev_rows=prev_rows if prev_rows else None,
         column_names=column_names,
@@ -1621,14 +1544,11 @@ async def _send_point_stats_excel(
         caption_parts.append(f"Сравнение: {prev_label}")
     caption_parts.append(f"ДТП: {total} ({len(current_filtered)} + {len(prev_filtered)})")
 
-    await _telegram_api_call(
-        lambda: context.bot.send_document(
-            chat_id=chat_id,
-            document=excel_bytes,
-            filename=filename,
-            caption="\n".join(caption_parts),
-        ),
-        description="Отправка файла ДТП по точке",
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=excel_bytes,
+        filename=filename,
+        caption="\n".join(caption_parts),
     )
 
 
@@ -2032,6 +1952,13 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # Точка входа
 # ========================
 
+async def _post_shutdown(app) -> None:
+    """Корректно закрывает все HTTP-клиенты при остановке бота."""
+    await close_client()
+    await close_llm_client()
+    logger.info("Все HTTP-клиенты закрыты (post_shutdown)")
+
+
 def main() -> None:
     logger.info("=== GIBDD Telegram Bot запускается ===")
 
@@ -2045,7 +1972,7 @@ def main() -> None:
 
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
-    app = Application.builder().token(token).concurrent_updates(True).build()
+    app = Application.builder().token(token).concurrent_updates(True).post_shutdown(_post_shutdown).build()
 
     # Команды
     app.add_handler(CommandHandler("start", cmd_start))
@@ -2073,9 +2000,6 @@ def main() -> None:
     print("  Нажмите Ctrl+C для остановки.\n")
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-    # Закрываем HTTP-клиент (connection pool)
-    import asyncio
-    asyncio.get_event_loop().run_until_complete(close_client())
 
 
 if __name__ == "__main__":

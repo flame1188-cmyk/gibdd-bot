@@ -10,6 +10,7 @@
 """
 
 import logging
+import math
 from collections import Counter
 from typing import Any
 
@@ -90,16 +91,16 @@ def filter_cards_by_radius(
             continue
 
         # Гаверсинус
-        lat1_r, lon1_r = __import__('math').radians(lat), __import__('math').radians(lon)
-        lat2_r, lon2_r = __import__('math').radians(card_lat), __import__('math').radians(card_lon)
+        lat1_r, lon1_r = math.radians(lat), math.radians(lon)
+        lat2_r, lon2_r = math.radians(card_lat), math.radians(card_lon)
         dlat = lat2_r - lat1_r
         dlon = lon2_r - lon1_r
         a = (
-            __import__('math').sin(dlat / 2) ** 2
-            + __import__('math').cos(lat1_r) * __import__('math').cos(lat2_r)
-            * __import__('math').sin(dlon / 2) ** 2
+            math.sin(dlat / 2) ** 2
+            + math.cos(lat1_r) * math.cos(lat2_r)
+            * math.sin(dlon / 2) ** 2
         )
-        c = 2 * __import__('math').asin(__import__('math').sqrt(min(a, 1.0)))
+        c = 2 * math.asin(math.sqrt(min(a, 1.0)))
         dist_m = EARTH_RADIUS_KM * c * 1000.0
 
         if dist_m <= radius_m:
