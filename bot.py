@@ -86,6 +86,51 @@ logger = logging.getLogger(__name__)
 _conflict_last_log: float = 0.0
 _CONFLICT_LOG_INTERVAL = 60.0
 
+# Лимит символов в одном сообщении Telegram
+TG_MSG_LIMIT = 4096
+
+
+async def _send_long_message(
+    bot,
+    chat_id: int,
+    text: str,
+    parse_mode: str | None = None,
+    reply_markup=None,
+) -> None:
+    """Отправляет текст, разбивая на части если он превышает TG_MSG_LIMIT.
+
+    Разбивка происходит по границам абзацев (\\n\\n) для читаемости.
+    reply_markup прикрепляется только к последнему сообщению.
+    """
+    if len(text) <= TG_MSG_LIMIT:
+        await bot.send_message(
+            chat_id=chat_id, text=text,
+            parse_mode=parse_mode, reply_markup=reply_markup,
+        )
+        return
+
+    # Разбиваем по двойным переносам строк
+    paragraphs = text.split("\n\n")
+    chunks: list[str] = []
+    current = ""
+    for p in paragraphs:
+        candidate = current + ("\n\n" if current else "") + p
+        if len(candidate) > TG_MSG_LIMIT and current:
+            chunks.append(current)
+            current = p
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+
+    for i, chunk in enumerate(chunks):
+        is_last = (i == len(chunks) - 1)
+        await bot.send_message(
+            chat_id=chat_id, text=chunk,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup if is_last else None,
+        )
+
 
 # ========================
 # Константы
@@ -248,12 +293,21 @@ def build_period_keyboard(year: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(f"IV кв", callback_data=f"pq:4:{year}"),
     ])
 
-    # Строка 3: 9 месяцев
+    # Строка 3: произвольное количество месяцев
     buttons.append([
-        InlineKeyboardButton(f"9 месяцев ({MONTH_SHORT[1]}-{MONTH_SHORT[9]})", callback_data=f"p9:{year}"),
+        InlineKeyboardButton(f"За 2 мес", callback_data=f"pn:2:{year}"),
+        InlineKeyboardButton(f"За 4 мес", callback_data=f"pn:4:{year}"),
+        InlineKeyboardButton(f"За 5 мес", callback_data=f"pn:5:{year}"),
+        InlineKeyboardButton(f"За 7 мес", callback_data=f"pn:7:{year}"),
+    ])
+    buttons.append([
+        InlineKeyboardButton(f"За 8 мес", callback_data=f"pn:8:{year}"),
+        InlineKeyboardButton(f"За 9 мес", callback_data=f"pn:9:{year}"),
+        InlineKeyboardButton(f"За 10 мес", callback_data=f"pn:10:{year}"),
+        InlineKeyboardButton(f"За 11 мес", callback_data=f"pn:11:{year}"),
     ])
 
-    # Строки 4-5: месяцы (по 6 в строке)
+    # Строки 5-6: месяцы (по 6 в строке)
     for row_start in (1, 7):
         row = []
         for m in range(row_start, row_start + 6):
@@ -525,6 +579,17 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 year=year,
                 label=f"9 месяцев {year} (Янв-Сен)",
             )
+            await _start_fetching(query, context, period)
+            return
+
+        # --- Выбор периода: Произвольное количество месяцев ---
+        if data.startswith("pn:"):
+            parts = data.split(":")
+            n = int(parts[1])
+            year = int(parts[2])
+            months = list(range(1, n + 1))
+            label = f"За {n} мес. {year} ({MONTH_SHORT[1]}-{MONTH_SHORT[n]})"
+            period = ParsedPeriod(months=months, year=year, label=label)
             await _start_fetching(query, context, period)
             return
 
@@ -1015,8 +1080,8 @@ async def _run_analysis(
     # Отправляем результаты
     if use_llm and llm_summary_text:
         # Режим с ИИ: сначала LLM-резюме, потом таблица + Excel
-        await context.bot.send_message(
-            chat_id=chat_id,
+        await _send_long_message(
+            context.bot, chat_id,
             text=(
                 f"\U0001F916 <b>Аналитика ИИ: {reg_name}</b>\n"
                 f"{current_label} vs {prev_label}\n\n"
@@ -1032,8 +1097,8 @@ async def _run_analysis(
             previous_label=prev_label,
         )
         # Отправляем как отдельное сообщение (математика)
-        await context.bot.send_message(
-            chat_id=chat_id,
+        await _send_long_message(
+            context.bot, chat_id,
             text=f"\U0001F4CA <b>Детальные данные:</b>\n\n{analytics_text}",
             parse_mode="HTML",
         )
@@ -1045,8 +1110,8 @@ async def _run_analysis(
             current_label=current_label,
             previous_label=prev_label,
         )
-        await context.bot.send_message(
-            chat_id=chat_id,
+        await _send_long_message(
+            context.bot, chat_id,
             text=analytics_text,
             parse_mode="HTML",
         )
@@ -1300,8 +1365,8 @@ async def _run_concentration_points(
                     f"({delta_dtp:+d})"
                 )
 
-        await context.bot.send_message(
-            chat_id=chat_id,
+        await _send_long_message(
+            context.bot, chat_id,
             text="\n".join(summary_lines),
             parse_mode="HTML",
         )
@@ -1623,15 +1688,15 @@ async def _process_point_stats(
             )
         except Exception:
             # Если сообщение слишком длинное для редактирования — отправляем новое
-            await context.bot.send_message(
-                chat_id=chat_id,
+            await _send_long_message(
+                context.bot, chat_id,
                 text=message_text,
                 parse_mode="HTML",
                 reply_markup=keyboard,
             )
     else:
-        await context.bot.send_message(
-            chat_id=chat_id,
+        await _send_long_message(
+            context.bot, chat_id,
             text=message_text,
             parse_mode="HTML",
             reply_markup=keyboard,
@@ -1738,8 +1803,8 @@ async def _handle_analytics_question(
             pass
 
         # Отправляем ответ
-        await context.bot.send_message(
-            chat_id=chat_id,
+        await _send_long_message(
+            context.bot, chat_id,
             text=f"\U0001F916 <b>Вопрос:</b> {question}\n\n{answer}",
             parse_mode="HTML",
         )
