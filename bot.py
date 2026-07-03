@@ -12,6 +12,7 @@
 """
 
 import asyncio
+import html as html_mod
 import logging
 import os
 import sys
@@ -1079,13 +1080,16 @@ async def _run_analysis(
 
     # Отправляем результаты
     if use_llm and llm_summary_text:
+        # Экранируем спецсимволы HTML в LLM-ответе, чтобы теги от модели
+        # (например <i>, <b>) не ломали Telegram HTML-парсер
+        safe_llm = html_mod.escape(llm_summary_text)
         # Режим с ИИ: сначала LLM-резюме, потом таблица + Excel
         await _send_long_message(
             context.bot, chat_id,
             text=(
                 f"\U0001F916 <b>Аналитика ИИ: {reg_name}</b>\n"
                 f"{current_label} vs {prev_label}\n\n"
-                f"<i>{llm_summary_text}</i>"
+                f"<i>{safe_llm}</i>"
             ),
             parse_mode="HTML",
         )
@@ -1802,10 +1806,13 @@ async def _handle_analytics_question(
         except Exception:
             pass
 
-        # Отправляем ответ
+        # Отправляем ответ (экранируем и вопрос, и ответ LLM)
         await _send_long_message(
             context.bot, chat_id,
-            text=f"\U0001F916 <b>Вопрос:</b> {question}\n\n{answer}",
+            text=(
+                f"\U0001F916 <b>Вопрос:</b> {html_mod.escape(question)}\n\n"
+                f"{html_mod.escape(answer)}"
+            ),
             parse_mode="HTML",
         )
 
