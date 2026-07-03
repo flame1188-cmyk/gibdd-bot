@@ -378,12 +378,13 @@ async def ask_llm(
 ) -> str:
     """
     Отправляет запрос к GLM API и возвращает текстовый ответ.
-    При 429 (Too Many Requests) автоматически повторяет с задержкой.
+    При 429 (Too Many Requests) и 5xx (Server Error) автоматически
+    повторяет с задержкой.
 
     Args:
         user_message: Текст запроса пользователя
         system_prompt: Системный промпт (если None — используется стандартный)
-        max_retries: Максимальное число повторных попыток при 429
+        max_retries: Максимальное число повторных попыток при 429/5xx
 
     Returns:
         Текст ответа от модели
@@ -469,6 +470,21 @@ async def ask_llm(
                         response=response,
                     )
 
+            # Проверяем статус ответа
+            if response.status_code >= 500:
+                if attempt < max_retries:
+                    wait = retry_delays[attempt]
+                    logger.warning(
+                        f"LLM {response.status_code} ({response.reason_phrase}). "
+                        f"Попытка {attempt + 1}/{max_retries}, "
+                        f"ожидание {wait} сек..."
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                # Все попытки исчерпаны — пробрасываем ошибку
+                response.raise_for_status()
+
+            # Для 4xx и 2xx — стандартная проверка
             response.raise_for_status()
 
             # Успешный запрос — обновляем время последнего вызова
