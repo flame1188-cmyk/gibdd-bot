@@ -228,47 +228,49 @@ def _parse_xml(file_bytes: bytes) -> list[dict]:
 
     cameras = []
     debug_logged = False
-    for row_el in rows:
-        cells = row_el.findall(".//{urn:schemas-microsoft-com:office:spreadsheet}Cell")
-        if not cells:
-            cells = row_el.findall(".//Cell")
+    for row_idx, row_el in enumerate(rows):
+        try:
+            cells = row_el.findall(".//{urn:schemas-microsoft-com:office:spreadsheet}Cell")
+            if not cells:
+                cells = row_el.findall(".//Cell")
 
-        # Ячейки могут идти с пропуском (ss:Index). Восстанавливаем порядок.
-        row_values = []
-        for cell in cells:
-            idx_attr = cell.get(
-                "{urn:schemas-microsoft-com:office:spreadsheet}Index"
-            ) or cell.get("Index")
-            if idx_attr:
-                idx = int(idx_attr) - 1  # 1-based → 0-based
-                # Дополняем пустыми ячейками до нужного индекса
-                while len(row_values) < idx:
-                    row_values.append(None)
-            data_el = cell.find(
-                "{urn:schemas-microsoft-com:office:spreadsheet}Data"
-            )
-            if data_el is None:
-                data_el = cell.find("Data")
-            value = data_el.text if data_el is not None and data_el.text else None
-            row_values.append(value)
+            # Ячейки могут идти с пропуском (ss:Index). Восстанавливаем порядок.
+            row_values = []
+            for cell in cells:
+                idx_attr = cell.get(
+                    "{urn:schemas-microsoft-com:office:spreadsheet}Index"
+                ) or cell.get("Index")
+                if idx_attr:
+                    idx = int(idx_attr) - 1  # 1-based → 0-based
+                    while len(row_values) < idx:
+                        row_values.append(None)
+                data_el = cell.find(
+                    "{urn:schemas-microsoft-com:office:spreadsheet}Data"
+                )
+                if data_el is None:
+                    data_el = cell.find("Data")
+                value = data_el.text if data_el is not None and data_el.text else None
+                row_values.append(value)
 
-        # Debug: логируем первую непустую строку с данными
-        if not debug_logged and row_values and row_values[0]:
-            debug_logged = True
-            addr_preview = str(row_values[6])[:80] if row_values[6] else None
-            logger.info(
-                f"XML первая строка данных: len={len(row_values)}, "
-                f"[0]={row_values[0]!r}, [2]={row_values[2]!r}, "
-                f"[4]={row_values[4]!r}, [5]={row_values[5]!r}, "
-                f"[6]={addr_preview!r}"
-            )
+            # Debug: логируем первые 3 непустые строки
+            if not debug_logged and row_values and row_values[0]:
+                debug_logged = True
+                safe_get = lambda lst, i: lst[i] if len(lst) > i else "<MISSING>"
+                logger.info(
+                    f"XML row[{row_idx}]: len={len(row_values)}, "
+                    f"cells={len(cells)}, "
+                    f"[0]={safe_get(row_values, 0)!r}, "
+                    f"[2]={safe_get(row_values, 2)!r}, "
+                    f"[4]={safe_get(row_values, 4)!r}, "
+                    f"[5]={safe_get(row_values, 5)!r}, "
+                    f"[6]={str(safe_get(row_values, 6))[:80]!r}"
+                )
 
-        cam = _row_to_camera(row_values)
-        if cam:
-            cameras.append(cam)
-        elif len(row_values) >= 7 and row_values[0]:
-            # Строка с № но не прошла парсинг — возможно нечисловые координаты
-            logger.debug(f"XML row skipped: {row_values[0]!r}, row[4]={row_values[4]!r}")
+            cam = _row_to_camera(row_values)
+            if cam:
+                cameras.append(cam)
+        except Exception as e:
+            logger.warning(f"XML row[{row_idx}] error: {e}, row_values len={len(row_values) if 'row_values' in dir() else '?'}")
 
     _log_result(cameras)
     return cameras
