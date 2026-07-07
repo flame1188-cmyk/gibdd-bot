@@ -93,34 +93,54 @@ def parse_camera_file(file_bytes: bytes) -> list[dict]:
         raise ValueError(f"Неизвестный формат файла (сигнатура: {sig})")
 
 
-def _row_to_camera(row) -> dict | None:
-    """Общая логика извлечения камеры из строки (tuple или list)."""
-    # Столбцы: 0=№, 1=ID, 2=Комплекс, 3=Модель,
-    #           4=Широта, 5=Долгота, 6=Адрес, 7=Нарушения
-    if not row or len(row) < 7:
-        return None
-    if not row[0] or row[2] is None:
+def _row_to_camera(row, xml_mode: bool = False) -> dict | None:
+    """Общая логика извлечения камеры из строки.
+
+    Стандартный формат (xlsx/xls через openpyxl/xlrd, данные с row 5):
+        0=№, 1=ID, 2=Комплекс, 3=Модель, 4=Широта, 5=Долгота, 6=Адрес
+
+    XML Spreadsheet формат (данные с row 4, 21 столбец):
+        0=№, 1=ID, 4=Комплекс, 7=Модель, 9=Широта, 10=Долгота, 11=Адрес
+    """
+    if not row:
         return None
 
+    if xml_mode:
+        # XML: нужно минимум 12 столбцов
+        if len(row) < 12:
+            return None
+        if not row[0]:
+            return None
+        col_num, col_id, col_complex, col_model = 0, 1, 4, 7
+        col_lat, col_lon, col_addr = 9, 10, 11
+    else:
+        # Стандартный xlsx/xls
+        if len(row) < 7:
+            return None
+        if not row[0] or row[2] is None:
+            return None
+        col_num, col_id, col_complex, col_model = 0, 1, 2, 3
+        col_lat, col_lon, col_addr = 4, 5, 6
+
     try:
-        lat = float(row[4]) if row[4] else None
-        lon = float(row[5]) if row[5] else None
+        lat = float(row[col_lat]) if row[col_lat] else None
+        lon = float(row[col_lon]) if row[col_lon] else None
     except (ValueError, TypeError):
         lat = lon = None
 
     if lat is None or lon is None:
         return None
 
-    address = str(row[6]).strip() if row[6] else ""
+    address = str(row[col_addr]).strip() if row[col_addr] else ""
 
     road_num, road_name, road_simple, piket, has_piket = (
         _parse_camera_address(address)
     )
 
     return {
-        "id": str(row[1]) if row[1] else "",
-        "number": str(row[2]).strip(),
-        "model": str(row[3]).strip() if row[3] else "",
+        "id": str(row[col_id]) if len(row) > col_id and row[col_id] else "",
+        "number": str(row[col_complex]).strip() if len(row) > col_complex and row[col_complex] else "",
+        "model": str(row[col_model]).strip() if len(row) > col_model and row[col_model] else "",
         "lat": lat,
         "lon": lon,
         "address": address,
@@ -227,7 +247,6 @@ def _parse_xml(file_bytes: bytes) -> list[dict]:
         rows = ws.findall(".//Row")
 
     cameras = []
-    debug_logged = 0
     for row_idx, row_el in enumerate(rows):
         try:
             cells = row_el.findall(".//{urn:schemas-microsoft-com:office:spreadsheet}Cell")
@@ -252,21 +271,7 @@ def _parse_xml(file_bytes: bytes) -> list[dict]:
                 value = data_el.text if data_el is not None and data_el.text else None
                 row_values.append(value)
 
-            # Debug: логируем первые 3 строки с len >= 5 и пропущенные
-            if len(row_values) >= 5 and row_values[0]:
-                if debug_logged < 3:
-                    debug_logged += 1
-                    safe_get = lambda lst, i: lst[i] if len(lst) > i else "<MISSING>"
-                    logger.info(
-                        f"XML row[{row_idx}]: len={len(row_values)}, "
-                        f"[0]={safe_get(row_values, 0)!r}, "
-                        f"[2]={safe_get(row_values, 2)!r}, "
-                        f"[4]={safe_get(row_values, 4)!r}, "
-                        f"[5]={safe_get(row_values, 5)!r}, "
-                        f"[6]={str(safe_get(row_values, 6))[:100]!r}"
-                    )
-
-            cam = _row_to_camera(row_values)
+            cam = _row_to_camera(row_values, xml_mode=True)
             if cam:
                 cameras.append(cam)
         except Exception as e:
