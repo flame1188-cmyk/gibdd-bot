@@ -448,9 +448,10 @@ def find_cameras_for_cluster(
 
     Логика:
     1. Очаг с пикетажем + дорогой:
-       а) Камера на той же дороге, пикетаж в диапазоне очага → «закрытый»
-       б) Камера на той же дороге, пикетаж в пределах 1 км (вне НП)
-          или 500 м (в НП) от границ очага → «ближайшая»
+       а) Камера на той же дороге, пикетаж в диапазоне реальных границ ДТП
+          (dtp_pk_min .. dtp_pk_max) → «закрытый»
+       б) Камера на той же дороге, пикетаж в пределах 500 м (в НП)
+          или 1 км (вне НП) от границ ДТП → «ближайшая»
     2. Очаг без пикетажа (обычно НП):
        а) GPS-радиус 200 м → «закрытый»
        б) GPS-радиус 500 м → «ближайшая»
@@ -479,8 +480,10 @@ def find_cameras_for_cluster(
 
     road_name = cluster.get("road", "")
     zone_type = cluster.get("zone_type", "")
-    start_piket = cluster.get("start_km")   # float км или None
-    end_piket = cluster.get("end_km")       # float км или None
+    start_piket = cluster.get("start_km")   # float км — окно группировки
+    end_piket = cluster.get("end_km")       # float км — окно группировки
+    dtp_pk_min = cluster.get("dtp_pk_min")  # реальный мин. пикетаж ДТП
+    dtp_pk_max = cluster.get("dtp_pk_max")  # реальный макс. пикетаж ДТП
     first_coords = cluster.get("first_coords")  # (lat, lon) или None
     last_coords = cluster.get("last_coords")    # (lat, lon) или None
 
@@ -493,6 +496,7 @@ def find_cameras_for_cluster(
         # === Сценарий 1: Очаг с пикетажем ===
         result = _search_by_piketage(
             road_name, start_piket, end_piket,
+            dtp_pk_min, dtp_pk_max,
             is_settlement, cameras,
         )
     else:
@@ -508,10 +512,16 @@ def _search_by_piketage(
     road_name: str,
     start_piket: float,
     end_piket: float,
+    dtp_pk_min: float | None,
+    dtp_pk_max: float | None,
     is_settlement: bool,
     cameras: list[dict],
 ) -> dict:
-    """Поиск камер по пикетажу и названию дороги."""
+    """Поиск камер по пикетажу и названию дороги.
+
+    Для определения «закрыт» используем реальные границы ДТП (dtp_pk_min/dtp_pk_max).
+    Для поиска «ближайших» используем окно группировки (start_piket/end_piket).
+    """
     result = {
         "in_cluster": None,
         "nearest": None,
@@ -519,10 +529,20 @@ def _search_by_piketage(
         "status": "открыт",
     }
 
-    piket_min = min(start_piket, end_piket)
-    piket_max = max(start_piket, end_piket)
+    # Границы окна (для поиска ближайших)
+    window_min = min(start_piket, end_piket)
+    window_max = max(start_piket, end_piket)
 
-    # Радиус поиска ближайших (по пикетажу, в км)
+    # Реальные границы очага по ДТП (для статуса «закрыт»)
+    if dtp_pk_min is not None and dtp_pk_max is not None:
+        cluster_min = min(dtp_pk_min, dtp_pk_max)
+        cluster_max = max(dtp_pk_min, dtp_pk_max)
+    else:
+        # Фоллбэк: если у ДТП нет пикетажа — используем окно
+        cluster_min = window_min
+        cluster_max = window_max
+
+    # Радиус поиска ближайших (по пикетажу, в км) — от границ ДТП
     near_radius = NEAR_ROAD_PK_NP_KM if is_settlement else NEAR_ROAD_PK_OUT_KM
 
     # Фильтруем камеры на той же дороге
@@ -536,17 +556,17 @@ def _search_by_piketage(
         if cam_pk is None:
             continue
 
-        if piket_min <= cam_pk <= piket_max:
-            # Камера в пределах очага
+        if cluster_min <= cam_pk <= cluster_max:
+            # Камера ВНУТРИ реальных границ очага (между крайними ДТП)
             in_cluster_cams.append(cam)
-        elif cam_pk < piket_min:
-            # Камера до начала очага
-            dist_km = piket_min - cam_pk
+        elif cam_pk < cluster_min:
+            # Камера до начала очага — считаем расстояние от границы ДТП
+            dist_km = cluster_min - cam_pk
             if dist_km <= near_radius:
                 near_cams.append((cam, dist_km))
-        elif cam_pk > piket_max:
-            # Камера после конца очага
-            dist_km = cam_pk - piket_max
+        elif cam_pk > cluster_max:
+            # Камера после конца очага — считаем расстояние от границы ДТП
+            dist_km = cam_pk - cluster_max
             if dist_km <= near_radius:
                 near_cams.append((cam, dist_km))
 
@@ -554,6 +574,11 @@ def _search_by_piketage(
     if in_cluster_cams:
         result["in_cluster"] = in_cluster_cams[0]
         result["status"] = "закрыт"
+        logger.debug(
+            f"Закрыт очаг {road_name} [{cluster_min:.3f}..{cluster_max:.3f}] "
+            f"камера {in_cluster_cams[0].get('number', '?')} "
+            f"пикетаж {in_cluster_cams[0].get('piket', '?'):.3f}"
+        )
 
     # Ближайшая камера (если нет в очаге)
     if not result["in_cluster"] and near_cams:
