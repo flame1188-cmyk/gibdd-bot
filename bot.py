@@ -1973,12 +1973,12 @@ async def _handle_document(
     if not document:
         return
 
-    # Проверяем имя файла
+    # Проверяем имя файла (.xls или .xlsx)
     filename = document.file_name or ""
     if not filename.startswith("gibddrf_cameras_change"):
         await update.message.reply_text(
             "\u26A0\uFE0F Неверный файл.\n\n"
-            "Ожидается файл: gibddrf_cameras_change_*.xlsx"
+            "Ожидается файл: gibddrf_cameras_change_*.xls"
         )
         return
 
@@ -1989,12 +1989,23 @@ async def _handle_document(
     try:
         file = await document.get_file()
 
-        # Скачиваем в память (файлы камер небольшие, ~100-500 КБ)
+        # Скачиваем в память через BytesIO
         import io
+        import tempfile
+        import os
         from camera_loader import parse_camera_file
 
-        byte_content = await file.download_as_bytearray()
-        cameras = parse_camera_file(bytes(byte_content))
+        # Используем временный файл — самый надёжный способ
+        tmp_path = os.path.join(tempfile.gettempdir(), f"cam_{document.file_id}.xlsx")
+        try:
+            await file.download_to_drive(custom_path=tmp_path)
+            with open(tmp_path, "rb") as f:
+                file_bytes = f.read()
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        cameras = parse_camera_file(file_bytes)
 
         if not cameras:
             await wait_msg.edit_text(

@@ -57,61 +57,46 @@ _RE_URBAN = re.compile(
 
 def parse_camera_file(file_bytes: bytes) -> list[dict]:
     """
-    Парсит Excel-файл со списком камер.
+    Парсит Excel-файл со списком камер (.xls или .xlsx).
 
     Args:
-        file_bytes: Содержимое xlsx-файла.
+        file_bytes: Содержимое файла.
 
     Returns:
         Список словарей камер.
     """
-    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
-    ws = wb[wb.sheetnames[0]]
+    import pandas as pd
 
-    cameras: list[dict] = []
-    for row in ws.iter_rows(min_row=5, values_only=True):
-        # Столбцы: 0=№, 1=ID, 2=Комплекс, 3=Модель,
-        #           4=Широта, 5=Долгота, 6=Адрес, 7=Нарушения
-        if not row[0] or row[2] is None:
-            continue
+    # Логируем размер и сигнатуру для диагностики
+    logger.info(f"parse_camera_file: {len(file_bytes)} байт, "
+                f"начало: {file_bytes[:20]!r}")
 
-        try:
-            lat = float(row[4]) if row[4] else None
-            lon = float(row[5]) if row[5] else None
-        except (ValueError, TypeError):
-            lat = lon = None
+    if not file_bytes or len(file_bytes) < 4:
+        logger.error("parse_camera_file: пустой или слишком маленький файл")
+        return []
 
-        if lat is None or lon is None:
-            continue
+    # Определяем формат по сигнатуре
+    zip_sig = bytes([0x50, 0x4B, 0x03, 0x04])  # PK\x03\x04
+    ole_sig = bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])
+    is_xlsx = file_bytes[:4] == zip_sig
+    is_xls = file_bytes[:8] == ole_sig
 
-        address = str(row[6]).strip() if row[6] else ""
-
-        road_num, road_name, road_simple, piket, has_piket = (
-            _parse_camera_address(address)
+    if is_xls:
+        logger.info("parse_camera_file: формат .xls (OLE), используем pandas+xlrd")
+    elif is_xlsx:
+        logger.info("parse_camera_file: формат .xlsx (ZIP)")
+    else:
+        logger.warning(
+            f"parse_camera_file: неизвестная сигнатура: {file_bytes[:8].hex()}"
         )
 
-        cameras.append({
-            "id": str(row[1]) if row[1] else "",
-            "number": str(row[2]).strip(),
-            "model": str(row[3]).strip() if row[3] else "",
-            "lat": lat,
-            "lon": lon,
-            "address": address,
-            "road_num": road_num,
-            "road_name": road_name,
-            "road_simple": road_simple,
-            "piket": piket,
-            "has_piket": has_piket,
-        })
-
-    wb.close()
-
-    with_piket = sum(1 for c in cameras if c["has_piket"])
-    logger.info(
-        f"Загружено {len(cameras)} камер "
-        f"(с пикетажем: {with_piket}, городских: {len(cameras) - with_piket})"
-    )
-    return cameras
+    # pandas + xlrd для .xls, openpyxl для .xlsx — pd.read_excel сама выберет движок
+    try:
+        df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=None)
+        return _parse_from_dataframe(df)
+    except Exception as e:
+        logger.error(f"parse_camera_file: ошибка чтения: {e}")
+        raise
 
 
 def _parse_camera_address(
@@ -464,3 +449,54 @@ def format_camera_coords(cam: dict) -> str:
     if not cam:
         return ""
     return f"{cam['lat']:.6f}, {cam['lon']:.6f}"
+
+
+def _parse_from_dataframe(df) -> list[dict]:
+    """Парсинг камер из pandas DataFrame (фоллбэк если openpyxl не справился).
+
+    Используется когда файл в формате .xls или повреждённый .xlsx.
+    """
+    cameras: list[dict] = []
+    # Пропускаем первые 4 строки (заголовки), данные с 5-й (индекс 4)
+    for idx, row in df.iloc[4:].iterrows():
+        vals = row.tolist()
+        if len(vals) < 7:
+            continue
+        if not vals[0] or vals[2] is None:
+            continue
+
+        try:
+            lat = float(vals[4]) if vals[4] else None
+            lon = float(vals[5]) if vals[5] else None
+        except (ValueError, TypeError):
+            lat = lon = None
+
+        if lat is None or lon is None:
+            continue
+
+        address = str(vals[6]).strip() if vals[6] else ""
+
+        road_num, road_name, road_simple, piket, has_piket = (
+            _parse_camera_address(address)
+        )
+
+        cameras.append({
+            "id": str(vals[1]) if vals[1] else "",
+            "number": str(vals[2]).strip(),
+            "model": str(vals[3]).strip() if vals[3] else "",
+            "lat": lat,
+            "lon": lon,
+            "address": address,
+            "road_num": road_num,
+            "road_name": road_name,
+            "road_simple": road_simple,
+            "piket": piket,
+            "has_piket": has_piket,
+        })
+
+    with_piket = sum(1 for c in cameras if c["has_piket"])
+    logger.info(
+        f"Загружено {len(cameras)} камер "
+        f"(с пикетажем: {with_piket}, городских: {len(cameras) - with_piket})"
+    )
+    return cameras
