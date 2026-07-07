@@ -1989,14 +1989,14 @@ async def _handle_document(
     try:
         file = await document.get_file()
 
-        # Скачиваем в память через BytesIO
+        # Скачиваем файл
         import io
         import tempfile
         import os
         from camera_loader import parse_camera_file
 
         # Используем временный файл — самый надёжный способ
-        tmp_path = os.path.join(tempfile.gettempdir(), f"cam_{document.file_id}.xlsx")
+        tmp_path = os.path.join(tempfile.gettempdir(), f"cam_{document.file_id}.xls")
         try:
             await file.download_to_drive(custom_path=tmp_path)
             with open(tmp_path, "rb") as f:
@@ -2004,6 +2004,13 @@ async def _handle_document(
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+
+        # Диагностика: логируем сигнатуру до вызова парсера
+        sig_hex = file_bytes[:8].hex() if len(file_bytes) >= 8 else "<too short>"
+        logger.info(
+            f"Загружен файл: {document.file_name}, "
+            f"{len(file_bytes)} байт, сигнатура: {sig_hex}"
+        )
 
         cameras = parse_camera_file(file_bytes)
 
