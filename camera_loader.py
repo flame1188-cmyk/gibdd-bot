@@ -25,6 +25,7 @@ import io
 import logging
 import math
 import re
+import xml.etree.ElementTree as ET
 from typing import Optional
 
 import openpyxl
@@ -62,15 +63,8 @@ _RE_URBAN = re.compile(
 
 def parse_camera_file(file_bytes: bytes) -> list[dict]:
     """
-    Парсит Excel-файл со списком камер (.xls или .xlsx).
-
-    Args:
-        file_bytes: Содержимое файла.
-
-    Returns:
-        Список словарей камер.
+    Парсит Excel-файл со списком камер (.xlsx, .xls или XML Spreadsheet).
     """
-    # Логируем размер и сигнатуру для диагностики
     logger.info(f"parse_camera_file: {len(file_bytes)} байт, "
                 f"начало: {file_bytes[:20]!r}")
 
@@ -79,14 +73,23 @@ def parse_camera_file(file_bytes: bytes) -> list[dict]:
         return []
 
     # Определяем формат по сигнатуре
-    zip_sig = bytes([0x50, 0x4B, 0x03, 0x04])  # PK\x03\x04
+    zip_sig = bytes([0x50, 0x4B, 0x03, 0x04])
     ole_sig = bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])
-    is_xls = file_bytes[:8] == ole_sig
+    is_xml = file_bytes[:5] == b'<?xml'
 
-    if is_xls:
-        return _parse_xls(file_bytes)
-    else:
+    if file_bytes[:4] == zip_sig:
+        logger.info("parse_camera_file: формат .xlsx (ZIP)")
         return _parse_xlsx(file_bytes)
+    elif file_bytes[:8] == ole_sig:
+        logger.info("parse_camera_file: формат .xls (OLE), используем xlrd")
+        return _parse_xls(file_bytes)
+    elif is_xml:
+        logger.info("parse_camera_file: формат XML Spreadsheet")
+        return _parse_xml(file_bytes)
+    else:
+        sig = file_bytes[:8].hex()
+        logger.error(f"parse_camera_file: неизвестный формат, сигнатура: {sig}")
+        raise ValueError(f"Неизвестный формат файла (сигнатура: {sig})")
 
 
 def _row_to_camera(row) -> dict | None:
@@ -159,6 +162,71 @@ def _parse_xlsx(file_bytes: bytes) -> list[dict]:
             cameras.append(cam)
 
     wb.close()
+    _log_result(cameras)
+    return cameras
+
+
+def _parse_xml(file_bytes: bytes) -> list[dict]:
+    """Парсинг XML Spreadsheet (SpreadsheetML) — файл .xls с '<?xml' внутри."""
+    # Namespace SpreadsheetML
+    ns = {
+        "ss": "urn:schemas-microsoft-com:office:spreadsheet",
+        "ms": "urn:schemas-microsoft-com:office:spreadsheet",
+    }
+
+    try:
+        root = ET.fromstring(file_bytes)
+    except ET.ParseError as e:
+        # Часто проблема в BOM или кодировке — пробуем убрать BOM
+        logger.warning(f"XML parse error, пробуем без BOM: {e}")
+        cleaned = file_bytes.lstrip(b'\xef\xbb\xbf')
+        root = ET.fromstring(cleaned)
+
+    # Ищем первый Worksheet
+    ws = root.find(".//{urn:schemas-microsoft-com:office:spreadsheet}Worksheet")
+    if ws is None:
+        # Пробуем без namespace
+        ws = root.find(".//Worksheet")
+    if ws is None:
+        raise ValueError("Не найден Worksheet в XML")
+
+    # Собираем строки таблицы
+    rows = ws.findall(".//{urn:schemas-microsoft-com:office:spreadsheet}Row")
+    if not rows:
+        rows = ws.findall(".//Row")
+
+    cameras = []
+    for row_el in rows:
+        cells = row_el.findall(".//{urn:schemas-microsoft-com:office:spreadsheet}Cell")
+        if not cells:
+            cells = row_el.findall(".//Cell")
+
+        # Ячейки могут идти с пропуском (ss:Index). Восстанавливаем порядок.
+        row_values = []
+        for cell in cells:
+            idx_attr = cell.get(
+                "{urn:schemas-microsoft-com:office:spreadsheet}Index"
+            ) or cell.get("Index")
+            if idx_attr:
+                idx = int(idx_attr) - 1  # 1-based → 0-based
+                # Дополняем пустыми ячейками до нужного индекса
+                while len(row_values) < idx:
+                    row_values.append(None)
+            data_el = cell.find(
+                "{urn:schemas-microsoft-com:office:spreadsheet}Data"
+            )
+            if data_el is None:
+                data_el = cell.find("Data")
+            value = data_el.text if data_el is not None and data_el.text else None
+            row_values.append(value)
+
+        cam = _row_to_camera(row_values)
+        if cam:
+            cameras.append(cam)
+        elif len(row_values) >= 7 and row_values[0]:
+            # Строка с № но не прошла парсинг — возможно нечисловые координаты
+            logger.debug(f"XML row skipped: {row_values[0]!r}, row[4]={row_values[4]!r}")
+
     _log_result(cameras)
     return cameras
 
