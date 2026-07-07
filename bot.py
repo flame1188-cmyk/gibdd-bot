@@ -19,7 +19,7 @@ import sys
 from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import Conflict, NetworkError
+from telegram.error import Conflict, NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -30,6 +30,38 @@ from telegram.ext import (
 )
 
 from config import validate_config, ALLOWED_USER_IDS, LLM_API_KEY, ENABLE_NEWS_SEARCH
+
+# ========================
+# Утилита ретрая Telegram API
+# ========================
+
+_MAX_TG_RETRIES = 3
+_TG_RETRY_DELAYS = [2, 5, 10]  # секунды между попытками
+
+
+async def _tg_retry(coro, description="Telegram API"):
+    """Выполняет корутину Telegram API с ретраем при TimedOut/NetworkError.
+
+    Функция пытается выполнить переданную корутину до _MAX_TG_RETRIES раз.
+    Если все попытки исчерпаны — пробрасывает последнее исключение.
+    """
+    last_exc = None
+    for attempt in range(_MAX_TG_RETRIES):
+        try:
+            return await coro
+        except (TimedOut, NetworkError) as exc:
+            last_exc = exc
+            if attempt < _MAX_TG_RETRIES - 1:
+                delay = _TG_RETRY_DELAYS[attempt]
+                logger.warning(
+                    f"{description}: {exc.__class__.__name__}. "
+                    f"Попытка {attempt + 1}/{_MAX_TG_RETRIES}, "
+                    f"повтор через {delay} сек..."
+                )
+                await asyncio.sleep(delay)
+    raise last_exc  # type: ignore[misc]
+
+
 from api_client import fetch_dtp_data, fetch_regions, extract_accident_cards, error_brief, close_client
 from llm_analyzer import close_llm_client
 from gibdd_parser import build_file1_data, build_file2_data
@@ -105,10 +137,10 @@ async def _send_long_message(
     reply_markup прикрепляется только к последнему сообщению.
     """
     if len(text) <= TG_MSG_LIMIT:
-        await bot.send_message(
+        await _tg_retry(bot.send_message(
             chat_id=chat_id, text=text,
             parse_mode=parse_mode, reply_markup=reply_markup,
-        )
+        ), "send_message (короткое)")
         return
 
     # Разбиваем по двойным переносам строк
@@ -127,11 +159,11 @@ async def _send_long_message(
 
     for i, chunk in enumerate(chunks):
         is_last = (i == len(chunks) - 1)
-        await bot.send_message(
+        await _tg_retry(bot.send_message(
             chat_id=chat_id, text=chunk,
             parse_mode=parse_mode,
             reply_markup=reply_markup if is_last else None,
-        )
+        ), f"send_message (часть {i + 1}/{len(chunks)})")
 
 
 # ========================
@@ -804,13 +836,13 @@ async def _start_fetching(
 
     # Обработка и генерация Excel
     try:
-        await query.edit_message_text(
+        await _tg_retry(query.edit_message_text(
             f"Выгрузка данных:\n\n"
             f"Регион: {reg_name}\n"
             f"Период: {period.label}\n\n"
             f"Найдено ДТП: {len(all_cards)}\n"
             f"Генерация Excel-файлов..."
-        )
+        ), "edit_message_text (статус генерации)")
 
         file1_data = build_file1_data(all_cards)
         file2_data = build_file2_data(all_cards)
@@ -822,14 +854,15 @@ async def _start_fetching(
         filename1 = f"dtp_cards_{safe_reg}_{period.year}_{timestamp}.xlsx"
         filename2 = f"dtp_uch_{safe_reg}_{period.year}_{timestamp}.xlsx"
 
-        await query.edit_message_text("Готово! Отправляю файлы...")
+        await _tg_retry(query.edit_message_text("Готово! Отправляю файлы..."),
+                                 "edit_message_text (готово)")
 
         chat_id = query.message.chat_id
 
         from telegram import Bot
         bot: Bot = context.bot
 
-        await bot.send_document(
+        await _tg_retry(bot.send_document(
             chat_id=chat_id,
             document=file1_bytes,
             filename=filename1,
@@ -838,9 +871,9 @@ async def _start_fetching(
                 f"{reg_name} | {period.label}\n"
                 f"ДТП: {len(all_cards)}"
             ),
-        )
+        ), "send_document (карточки ДТП)")
 
-        await bot.send_document(
+        await _tg_retry(bot.send_document(
             chat_id=chat_id,
             document=file2_bytes,
             filename=filename2,
@@ -849,11 +882,11 @@ async def _start_fetching(
                 f"{reg_name} | {period.label}\n"
                 f"Участников: {len(file2_data)}"
             ),
-        )
+        ), "send_document (участники ДТП)")
 
         # Удаляем сообщение о статусе
         try:
-            await query.message.delete()
+            await _tg_retry(query.message.delete(), "delete message")
         except Exception:
             pass
 
@@ -981,7 +1014,7 @@ async def _run_analysis(
 
     mode_label = "\U0001F916 AI-анализ" if use_llm else "\U0001F4CA Анализ"
 
-    status_msg = await context.bot.send_message(
+    status_msg = await _tg_retry(context.bot.send_message(
         chat_id=chat_id,
         text=(
             f"{mode_label}: подготовка...\n\n"
@@ -990,7 +1023,7 @@ async def _run_analysis(
             f"Сравнение: {prev_label}\n\n"
             f"Загрузка данных за {prev_year} год..."
         ),
-    )
+    ), "send_message (статус аналитики)")
 
     # Запрашиваем данные за прошлый год
     async def progress(i, total, month_name, year):
@@ -1167,7 +1200,7 @@ async def _run_analysis(
     ai_suffix = "_ai" if use_llm else ""
     filename = f"dtp_analytics{ai_suffix}_{safe_reg}_{period.year}_vs_{prev_year}_{timestamp}.xlsx"
 
-    await context.bot.send_document(
+    await _tg_retry(context.bot.send_document(
         chat_id=chat_id,
         document=analytics_bytes,
         filename=filename,
@@ -1176,7 +1209,7 @@ async def _run_analysis(
             f"{current_label} vs {prev_label}\n"
             f"Текущий: {len(current_cards)} ДТП | Прошлый: {len(prev_cards)} ДТП"
         ),
-    )
+    ), "send_document (аналитика)")
 
     # Предлагаем задать вопросы (если есть LLM-ключ)
     if LLM_API_KEY:
