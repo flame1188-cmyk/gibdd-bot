@@ -255,11 +255,12 @@ def _parse_xml(file_bytes: bytes) -> list[dict]:
         # Debug: логируем первую непустую строку с данными
         if not debug_logged and row_values and row_values[0]:
             debug_logged = True
+            addr_preview = str(row_values[6])[:80] if row_values[6] else None
             logger.info(
                 f"XML первая строка данных: len={len(row_values)}, "
                 f"[0]={row_values[0]!r}, [2]={row_values[2]!r}, "
                 f"[4]={row_values[4]!r}, [5]={row_values[5]!r}, "
-                f"[6]={str(row_values[6])[:80]!r if row_values[6] else None}"
+                f"[6]={addr_preview!r}"
             )
 
         cam = _row_to_camera(row_values)
