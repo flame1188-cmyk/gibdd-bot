@@ -1141,6 +1141,16 @@ def _build_cluster(
     first_coords = _parse_coords(cards[0])
     last_coords = _parse_coords(cards[-1])
 
+    # Реальные границы очага по пикетажу ДТП (min/max из всех карточек)
+    dtp_piketazh_positions = [_get_km_m(c) for c in cards]
+    dtp_piketazh_positions = [p for p in dtp_piketazh_positions if p is not None]
+    if dtp_piketazh_positions:
+        dtp_pk_min = min(dtp_piketazh_positions)
+        dtp_pk_max = max(dtp_piketazh_positions)
+    else:
+        dtp_pk_min = None
+        dtp_pk_max = None
+
     return {
         "zone_type": zone_type,
         "road": road,
@@ -1156,10 +1166,13 @@ def _build_cluster(
         "start_pos": start_pos,
         "end_pos": end_pos,
         "cards": cards,
-        # Поля для camera_matcher
+        # Поля для camera_matcher (окно группировки — для поиска "ближайших")
         "has_piketazh": start_pos is not None,
         "start_km": start_pos,
         "end_km": end_pos,
+        # Реальные границы очага по ДТП (для определения "закрыт")
+        "dtp_pk_min": dtp_pk_min,
+        "dtp_pk_max": dtp_pk_max,
     }
 
 
