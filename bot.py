@@ -56,6 +56,7 @@ from concentration_points import (
     get_detail_column_names,
     get_dynamics_column_names,
     get_dynamics_detail_column_names,
+    enrich_clusters_with_cameras,
 )
 from point_statistics import (
     parse_coordinates,
@@ -645,7 +646,47 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         # --- Расчёт очагов ДТП ---
         if data == "do_concentration":
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "\U0001F4F7 Загрузить камеры",
+                        callback_data="cam_ask_upload",
+                    ),
+                    InlineKeyboardButton(
+                        "\u27A1 Без камер",
+                        callback_data="cam_skip",
+                    ),
+                ],
+            ])
+            await query.edit_message_text(
+                "\U0001F525 <b>Очаги ДТП</b>\n\n"
+                "Загрузите файл с камерами фотовидеофиксации\n"
+                "(gibddrf_cameras_change_*.xlsx)\n"
+                "или продолжите без камер.",
+                reply_markup=keyboard,
+                parse_mode="HTML",
+            )
+            return
+
+        # --- Камеры: пропустить ---
+        if data == "cam_skip":
+            context.user_data.pop("cameras_data", None)
+            await query.edit_message_text(
+                "\U0001F525 Запуск расчёта очагов (без камер)..."
+            )
             await _run_concentration_points(update, context)
+            return
+
+        # --- Камеры: запрос загрузки ---
+        if data == "cam_ask_upload":
+            context.user_data["waiting_camera_file"] = True
+            await query.edit_message_text(
+                "\U0001F4F7 <b>Загрузка камер</b>\n\n"
+                "Отправьте Excel-файл с камерами\n"
+                "(gibddrf_cameras_change_*.xlsx)\n\n"
+                "Или нажмите \u274C чтобы пропустить.",
+                parse_mode="HTML",
+            )
             return
 
         # --- Статистика по точке ---
@@ -1180,6 +1221,7 @@ def _clear_analytics_data(user_data: dict) -> None:
         "analytics_prev_cards", "analytics_clusters",
         "analytics_news_context", "qa_mode",
         "point_stats_mode", "point_stats_lat", "point_stats_lon", "point_stats_radius",
+        "cameras_data", "waiting_camera_file",
     ]:
         user_data.pop(key, None)
 
@@ -1283,6 +1325,20 @@ async def _run_concentration_points(
             c for c in clusters if not c.get("_is_lost", False)
         ]
 
+        # --- Обогащение камерами (если загружен файл) ---
+        cameras = context.user_data.get("cameras_data")
+        if cameras:
+            await progress_callback(
+                f"Сопоставление с камерами фотовидеофиксации...\n"
+                f"Камер: {len(cameras)}"
+            )
+            enrich_clusters_with_cameras(current_only_clusters, cameras)
+            lost_clusters = [
+                c for c in clusters if c.get("_is_lost", False)
+            ]
+            if lost_clusters:
+                enrich_clusters_with_cameras(lost_clusters, cameras)
+
         # --- Генерируем Excel с 3 листами ---
         # Лист 1: очаги запрашиваемого года (стандартный формат)
         current_data = build_concentration_excel_data(current_only_clusters)
@@ -1345,6 +1401,20 @@ async def _run_concentration_points(
             f"  \u2022 Погибло: {current_deaths}",
             f"  \u2022 Ранено: {current_injured}",
         ]
+
+        # Блок камер (если загружены)
+        if cameras:
+            cam_closed = sum(
+                1 for c in current_only_clusters
+                if (c.get("camera_match") or {}).get("status") == "закрыт"
+            )
+            cam_open = current_total_clusters - cam_closed
+            summary_lines.extend([
+                "",
+                f"\U0001F4F7 <b>Камеры фотовидеофиксации:</b>",
+                f"  \u2022 Закрыто камерой: {cam_closed}/{current_total_clusters}",
+                f"  \u2022 Открыто: {cam_open}",
+            ])
 
         # Блок 2: динамика (только если есть данные за прошлый год)
         if prev_cards:
@@ -1842,6 +1912,76 @@ def _make_progress_bar(current: int, total: int, width: int = 20) -> str:
 # Обработчик текстовых сообщений (NLP)
 # ========================
 
+async def _handle_document(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Обрабатывает загрузку файла (камеры фотовидеофиксации)."""
+    if not context.user_data.get("waiting_camera_file"):
+        # Не ожидаем файл — игнорируем
+        return
+
+    context.user_data.pop("waiting_camera_file", None)
+
+    document = update.message.document
+    if not document:
+        return
+
+    # Проверяем имя файла
+    filename = document.file_name or ""
+    if not filename.startswith("gibddrf_cameras_change"):
+        await update.message.reply_text(
+            "\u26A0\uFE0F Неверный файл.\n\n"
+            "Ожидается файл: gibddrf_cameras_change_*.xlsx"
+        )
+        return
+
+    wait_msg = await update.message.reply_text(
+        "\U0001F4F7 Обработка файла камер..."
+    )
+
+    try:
+        file = await document.get_file()
+
+        # Скачиваем в память (файлы камер небольшие, ~100-500 КБ)
+        import io
+        from camera_loader import parse_camera_file
+
+        byte_content = await file.download_as_bytearray()
+        cameras = parse_camera_file(bytes(byte_content))
+
+        if not cameras:
+            await wait_msg.edit_text(
+                "\u26A0\uFE0F В файле не найдено камер.\n"
+                "Проверьте формат файла."
+            )
+            return
+
+        # Сохраняем в сессию
+        context.user_data["cameras_data"] = cameras
+
+        with_pk = sum(1 for c in cameras if c["has_piket"])
+        without_pk = len(cameras) - with_pk
+
+        await wait_msg.edit_text(
+            f"\u2705 Загружено <b>{len(cameras)}</b> камер:\n"
+            f"  \u2022 С пикетажем: {with_pk}\n"
+            f"  \u2022 Городских: {without_pk}\n\n"
+            f"Запускаю расчёт очагов...",
+            parse_mode="HTML",
+        )
+
+        # Запускаем расчёт очагов
+        await _run_concentration_points(update, context)
+
+    except Exception as e:
+        logger.error(f"Ошибка обработки файла камер: {e}")
+        await wait_msg.edit_text(
+            f"\u26A0\uFE0F Ошибка обработки файла:\n\n<code>{e}</code>\n\n"
+            f"Попробуйте ещё раз или нажмите 'Без камер'.",
+            parse_mode="HTML",
+        )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Обрабатывает текстовые сообщения:
@@ -2060,6 +2200,9 @@ def main() -> None:
 
     # Сообщения с локацией (для статистики по точке)
     app.add_handler(MessageHandler(filters.LOCATION, _handle_location_message))
+
+    # Документы (загрузка камер фотовидеофиксации)
+    app.add_handler(MessageHandler(filters.Document, _handle_document))
 
     # Глобальный обработчик ошибок
     app.add_error_handler(error_handler)

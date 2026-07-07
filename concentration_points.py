@@ -1156,6 +1156,10 @@ def _build_cluster(
         "start_pos": start_pos,
         "end_pos": end_pos,
         "cards": cards,
+        # Поля для camera_matcher
+        "has_piketazh": start_pos is not None,
+        "start_km": start_pos,
+        "end_km": end_pos,
     }
 
 
@@ -1659,6 +1663,15 @@ CONCENTRATION_COLUMNS = [
     "Ранено",
     "Дата первого ДТП",
     "Дата последнего ДТП",
+    # --- Камеры фотовидеофиксации ---
+    "Статус покрытия камерой",
+    "Камера: номер",
+    "Камера: адрес",
+    "Камера: координаты",
+    "Ближайшая камера: номер",
+    "Ближайшая камера: адрес",
+    "Ближайшая камера: координаты",
+    "Расстояние до камеры (м)",
 ]
 
 DETAIL_COLUMNS = [
@@ -1706,6 +1719,94 @@ def get_concentration_column_names() -> list[str]:
 def get_detail_column_names() -> list[str]:
     """Названия колонок для листа детализации ДТП в очагах."""
     return list(DETAIL_COLUMNS)
+
+
+def _camera_row_fields(cluster: dict) -> dict[str, str]:
+    """Формирует словарь с полями камер для строки Excel.
+
+    Ожидает в cluster ключ "camera_match" — результат
+    camera_loader.find_cameras_for_cluster().
+    """
+    match = cluster.get("camera_match") or {}
+
+    # Статус покрытия
+    status = match.get("status", "открыт")
+    if status == "закрыт":
+        status_display = "Закрыт"
+    elif match.get("nearest"):
+        status_display = "Открыт (есть ближайшая)"
+    else:
+        status_display = "Открыт"
+
+    # Камера в очаге
+    cam_in = match.get("in_cluster")
+    if cam_in:
+        cam_num = cam_in.get("number", "")
+        cam_addr = cam_in.get("address", "")
+        cam_coords = (
+            f"{cam_in['lat']:.6f}, {cam_in['lon']:.6f}"
+        )
+    else:
+        cam_num = ""
+        cam_addr = ""
+        cam_coords = ""
+
+    # Ближайшая камера
+    near = match.get("nearest")
+    if near:
+        near_num = near.get("number", "")
+        near_addr = near.get("address", "")
+        near_coords = f"{near['lat']:.6f}, {near['lon']:.6f}"
+        near_dist = str(match.get("nearest_dist_m", ""))
+    else:
+        near_num = ""
+        near_addr = ""
+        near_coords = ""
+        near_dist = ""
+
+    return {
+        "Статус покрытия камерой": status_display,
+        "Камера: номер": cam_num,
+        "Камера: адрес": cam_addr,
+        "Камера: координаты": cam_coords,
+        "Ближайшая камера: номер": near_num,
+        "Ближайшая камера: адрес": near_addr,
+        "Ближайшая камера: координаты": near_coords,
+        "Расстояние до камеры (м)": near_dist,
+    }
+
+
+def enrich_clusters_with_cameras(
+    clusters: list[dict],
+    cameras: list[dict],
+) -> None:
+    """
+    Обогащает кластеры результатами поиска камер.
+
+    Модифицирует каждый кластер in-place, добавляя ключ
+    "camera_match" с результатом camera_loader.find_cameras_for_cluster().
+    """
+    if not cameras:
+        for c in clusters:
+            c["camera_match"] = None
+        return
+
+    from camera_loader import find_cameras_for_cluster
+
+    for cluster in clusters:
+        cluster["camera_match"] = find_cameras_for_cluster(
+            cluster, cameras,
+        )
+
+    # Статистика
+    closed = sum(
+        1 for c in clusters
+        if (c.get("camera_match") or {}).get("status") == "закрыт"
+    )
+    logger.info(
+        f"Камеры: {closed}/{len(clusters)} очагов закрыты "
+        f"({len(cameras)} камер проверено)"
+    )
 
 
 def build_concentration_excel_data(
@@ -1760,6 +1861,8 @@ def build_concentration_excel_data(
             "Ранено": str(cluster["injured"]),
             "Дата первого ДТП": first_date,
             "Дата последнего ДТП": last_date,
+            # --- Камеры фотовидеофиксации ---
+            **_camera_row_fields(cluster),
         })
 
     return rows
