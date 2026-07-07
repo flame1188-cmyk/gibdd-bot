@@ -28,6 +28,11 @@ import re
 from typing import Optional
 
 import openpyxl
+try:
+    import xlrd
+except ImportError:
+    xlrd = None  # type: ignore[assignment]
+
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +70,6 @@ def parse_camera_file(file_bytes: bytes) -> list[dict]:
     Returns:
         Список словарей камер.
     """
-    import pandas as pd
-
     # Логируем размер и сигнатуру для диагностики
     logger.info(f"parse_camera_file: {len(file_bytes)} байт, "
                 f"начало: {file_bytes[:20]!r}")
@@ -78,25 +81,94 @@ def parse_camera_file(file_bytes: bytes) -> list[dict]:
     # Определяем формат по сигнатуре
     zip_sig = bytes([0x50, 0x4B, 0x03, 0x04])  # PK\x03\x04
     ole_sig = bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])
-    is_xlsx = file_bytes[:4] == zip_sig
     is_xls = file_bytes[:8] == ole_sig
 
     if is_xls:
-        logger.info("parse_camera_file: формат .xls (OLE), используем pandas+xlrd")
-    elif is_xlsx:
-        logger.info("parse_camera_file: формат .xlsx (ZIP)")
+        return _parse_xls(file_bytes)
     else:
-        logger.warning(
-            f"parse_camera_file: неизвестная сигнатура: {file_bytes[:8].hex()}"
-        )
+        return _parse_xlsx(file_bytes)
 
-    # pandas + xlrd для .xls, openpyxl для .xlsx — pd.read_excel сама выберет движок
+
+def _row_to_camera(row) -> dict | None:
+    """Общая логика извлечения камеры из строки (tuple или list)."""
+    # Столбцы: 0=№, 1=ID, 2=Комплекс, 3=Модель,
+    #           4=Широта, 5=Долгота, 6=Адрес, 7=Нарушения
+    if not row[0] or row[2] is None:
+        return None
+
     try:
-        df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=None)
-        return _parse_from_dataframe(df)
-    except Exception as e:
-        logger.error(f"parse_camera_file: ошибка чтения: {e}")
-        raise
+        lat = float(row[4]) if row[4] else None
+        lon = float(row[5]) if row[5] else None
+    except (ValueError, TypeError):
+        lat = lon = None
+
+    if lat is None or lon is None:
+        return None
+
+    address = str(row[6]).strip() if row[6] else ""
+
+    road_num, road_name, road_simple, piket, has_piket = (
+        _parse_camera_address(address)
+    )
+
+    return {
+        "id": str(row[1]) if row[1] else "",
+        "number": str(row[2]).strip(),
+        "model": str(row[3]).strip() if row[3] else "",
+        "lat": lat,
+        "lon": lon,
+        "address": address,
+        "road_num": road_num,
+        "road_name": road_name,
+        "road_simple": road_simple,
+        "piket": piket,
+        "has_piket": has_piket,
+    }
+
+
+def _parse_xls(file_bytes: bytes) -> list[dict]:
+    """Парсинг .xls файла через xlrd."""
+    if xlrd is None:
+        raise ImportError(
+            "xlrd не установлен. Выполните: pip install xlrd"
+        )
+    wb = xlrd.open_workbook(file_contents=file_bytes)
+    ws = wb.sheet_by_index(0)
+
+    cameras = []
+    for row_idx in range(4, ws.nrows):  # данные с 5-й строки (индекс 4)
+        row = ws.row_values(row_idx)
+        cam = _row_to_camera(row)
+        if cam:
+            cameras.append(cam)
+
+    wb.release_resources()
+    _log_result(cameras)
+    return cameras
+
+
+def _parse_xlsx(file_bytes: bytes) -> list[dict]:
+    """Парсинг .xlsx файла через openpyxl."""
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
+    ws = wb[wb.sheetnames[0]]
+
+    cameras = []
+    for row in ws.iter_rows(min_row=5, values_only=True):
+        cam = _row_to_camera(row)
+        if cam:
+            cameras.append(cam)
+
+    wb.close()
+    _log_result(cameras)
+    return cameras
+
+
+def _log_result(cameras: list[dict]) -> None:
+    with_piket = sum(1 for c in cameras if c["has_piket"])
+    logger.info(
+        f"Загружено {len(cameras)} камер "
+        f"(с пикетажем: {with_piket}, городских: {len(cameras) - with_piket})"
+    )
 
 
 def _parse_camera_address(
