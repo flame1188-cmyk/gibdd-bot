@@ -97,6 +97,8 @@ def _row_to_camera(row) -> dict | None:
     """Общая логика извлечения камеры из строки (tuple или list)."""
     # Столбцы: 0=№, 1=ID, 2=Комплекс, 3=Модель,
     #           4=Широта, 5=Долгота, 6=Адрес, 7=Нарушения
+    if not row or len(row) < 7:
+        return None
     if not row[0] or row[2] is None:
         return None
 
