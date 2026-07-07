@@ -227,6 +227,7 @@ def _parse_xml(file_bytes: bytes) -> list[dict]:
         rows = ws.findall(".//Row")
 
     cameras = []
+    debug_logged = False
     for row_el in rows:
         cells = row_el.findall(".//{urn:schemas-microsoft-com:office:spreadsheet}Cell")
         if not cells:
@@ -250,6 +251,16 @@ def _parse_xml(file_bytes: bytes) -> list[dict]:
                 data_el = cell.find("Data")
             value = data_el.text if data_el is not None and data_el.text else None
             row_values.append(value)
+
+        # Debug: логируем первую непустую строку с данными
+        if not debug_logged and row_values and row_values[0]:
+            debug_logged = True
+            logger.info(
+                f"XML первая строка данных: len={len(row_values)}, "
+                f"[0]={row_values[0]!r}, [2]={row_values[2]!r}, "
+                f"[4]={row_values[4]!r}, [5]={row_values[5]!r}, "
+                f"[6]={str(row_values[6])[:80]!r if row_values[6] else None}"
+            )
 
         cam = _row_to_camera(row_values)
         if cam:
