@@ -22,6 +22,7 @@
 """
 
 import io
+import html as html_mod
 import logging
 import math
 import re
@@ -166,20 +167,48 @@ def _parse_xlsx(file_bytes: bytes) -> list[dict]:
     return cameras
 
 
+# HTML-сущности, которые часто встречаются в XML Spreadsheet от Excel,
+# но не являются стандартными XML-сущностями
+_HTML_ENTITY_MAP = {
+    "laquo": "\u00ab",    # «
+    "raquo": "\u00bb",    # »
+    "ldquo": "\u201c",    # "
+    "rdquo": "\u201d",    # "
+    "lsquo": "\u2018",    # '
+    "rsquo": "\u2019",    # '
+    "ndash": "\u2013",    # –
+    "mdash": "\u2014",    # —
+    "nbsp": "\u00a0",     # неразрывный пробел
+    "quot": '"',
+    "amp": "&",
+    "lt": "<",
+    "gt": ">",
+}
+
+_HTML_ENTITY_RE = re.compile(r"&(\w+);")
+
+
+def _replace_html_entities(text: str) -> str:
+    """Заменяет HTML-сущности на Unicode-символы. Неизвестные — удаляет."""
+    def _repl(m):
+        name = m.group(1)
+        return _HTML_ENTITY_MAP.get(name, "")
+    return _HTML_ENTITY_RE.sub(_repl, text)
+
+
 def _parse_xml(file_bytes: bytes) -> list[dict]:
     """Парсинг XML Spreadsheet (SpreadsheetML) — файл .xls с '<?xml' внутри."""
-    # Namespace SpreadsheetML
-    ns = {
-        "ss": "urn:schemas-microsoft-com:office:spreadsheet",
-        "ms": "urn:schemas-microsoft-com:office:spreadsheet",
-    }
+    # Заменяем HTML-сущности, которые стандартный XML-парсер не знает
+    text = file_bytes.decode("utf-8", errors="replace")
+    text = _replace_html_entities(text)
+    xml_bytes = text.encode("utf-8")
 
     try:
-        root = ET.fromstring(file_bytes)
+        root = ET.fromstring(xml_bytes)
     except ET.ParseError as e:
-        # Часто проблема в BOM или кодировке — пробуем убрать BOM
+        # Пробуем убрать BOM
         logger.warning(f"XML parse error, пробуем без BOM: {e}")
-        cleaned = file_bytes.lstrip(b'\xef\xbb\xbf')
+        cleaned = xml_bytes.lstrip(b'\xef\xbb\xbf')
         root = ET.fromstring(cleaned)
 
     # Ищем первый Worksheet
