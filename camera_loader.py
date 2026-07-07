@@ -42,11 +42,24 @@ logger = logging.getLogger(__name__)
 # Регулярные выражения
 # ========================
 
-# Номер дороги: Р-217, А-167, М-4 (с опциональным пробелом после буквы)
-_RE_ROAD_NUM = re.compile(r'([РАМ]-?\s*\d+)', re.IGNORECASE)
+# Номер дороги: федеральные (Р-217, А-167, М-4, Р160) и региональные (22К-0125, 22Н-0408)
+# Федеральные: буква + опц. дефис + цифры (Р-217, Р160)
+# Региональные: 2 цифры + буква + ОБЯЗАТЕЛЬНЫЙ дефис + цифры (22К-0125)
+# Дефис обязателен для региональных, чтобы не спутать с номерами домов (27К12, 13К3)
+_RE_ROAD_NUM_FED = re.compile(r'\b([РАМ]-?\d+(?:-\d+)?)\b', re.IGNORECASE)
+_RE_ROAD_NUM_REG = re.compile(r'\b(\d{2}\s*[КНР]-\d+(?:-\d+)?)\b', re.IGNORECASE)
+_RE_ROAD_NUM = None  # используется через _extract_road_num()
 
-# Пикетаж: "775км +890м", "82км +080м", "0км +000м"
-_RE_PIKET = re.compile(r'(\d+)\s*км\s*\+\s*(\d+)\s*м?')
+# Пикетаж — несколько форматов по приоритету:
+#   1) "775км +890м", "82км +080м"          — классический с +
+#   2) "117 км 620 м", "265км 035м"         — через пробел без +
+#   3) "км 17+175", "км 208+040"             — км перед числом
+#   4) "9км.", "45км."                       — только километры
+#   5) "3км 0м"                                — km+0m через пробел
+_RE_PIKET_PLUS = re.compile(r'(\d+)\s*км\.?\s*\+\s*(\d+)\s*м?')
+_RE_PIKET_SPACE = re.compile(r'(\d+)\s*км[\s,.]+(\d{1,3})\s*м(?!\s*\+)')
+_RE_PIKET_KM_FIRST = re.compile(r'км\s*(\d+)\s*\+\s*(\d+)')
+_RE_PIKET_KM_ONLY = re.compile(r'(\d+)\s*км[.,\s)]')
 
 # Название дороги в кавычках (елочки и стандартные)
 _RE_QUOTED = re.compile(r'[«\"\u201c](.+?)[»\"\u201d]')
@@ -56,6 +69,23 @@ _RE_URBAN = re.compile(
     r'(перекресток|пер\.\s|ул\.|пр-т|пр-кт|проспект|просп\.)',
     re.IGNORECASE,
 )
+
+
+def _extract_road_num(text: str) -> str | None:
+    """Извлекает номер дороги (федеральный или региональный) из текста.
+
+    Приоритет: региональный (22К-0125) > федеральный (Р-217, Р160).
+    Возвращает верхний регистр без пробелов, или None.
+    """
+    # Региональные: 2 цифры + буква + дефис + цифры
+    m = _RE_ROAD_NUM_REG.search(text)
+    if m:
+        return m.group(1).upper().replace(" ", "")
+    # Федеральные: буква + опц.дефис + цифры
+    m = _RE_ROAD_NUM_FED.search(text)
+    if m:
+        return m.group(1).upper().replace(" ", "")
+    return None
 
 
 # ========================
@@ -305,24 +335,120 @@ def _parse_camera_address(
     has_piket = False
 
     # 1. Номер дороги
-    m_num = _RE_ROAD_NUM.search(address)
-    if m_num:
-        road_num = m_num.group(1).upper().replace(" ", "")
+    road_num = _extract_road_num(address)
 
-    # 2. Название в кавычках
+    # 2. Название дороги
+    #    а) Из кавычек (приоритет)
     m_quoted = _RE_QUOTED.search(address)
     if m_quoted:
         road_name = m_quoted.group(1)
+    #    б) Для региональной дороги — извлекаем название после номера
+    elif road_num and re.match(r'\d{2}[КНР]-', road_num):
+        road_name = _extract_regional_road_name(address, road_num)
+
+    if road_name:
         road_simple = road_name.lower().replace("-", " ")
         road_simple = re.sub(r"\s+", " ", road_simple).strip()
 
-    # 3. Пикетаж
-    m_piket = _RE_PIKET.search(address)
-    if m_piket:
+    # 3. Пикетаж — пробуем несколько форматов по приоритету
+    piket = _extract_piket(address)
+    if piket is not None:
         has_piket = True
-        piket = int(m_piket.group(1)) + int(m_piket.group(2)) / 1000.0
 
     return road_num, road_name, road_simple, piket, has_piket
+
+
+def _extract_regional_road_name(address: str, road_num: str) -> str | None:
+    """Извлекает название дороги из адреса камеры для региональной дороги.
+
+    Форматы адреса:
+      а/д 22К-0079 Владимир-Муром-Арзамас 265км 035м
+      а/д 22 ОП РЗ 22К-0021 Неклюдово-Бор-Валки-Макарьево 14 км+ 390 м
+      а/д 22 ОП MЗ 22Н-0408 Богородск-Арапово-Тимонино 0 км 640 м
+      а/д 22Р-0159 г. Н.Новгород-Шахунья-Киров 30 км 835 м
+
+    Логика:
+      1. Находим позицию номера дороги в адресе
+      2. Пропускаем классификационный префикс (22 ОП РЗ / ОП MЗ / ОП Р3 / ОП М3)
+      3. Берём текст после номера до: пикетажа (км), запятой, скобки
+      4. Очищаем от мусора (г., а/д, «Подъезд к» и т.п.)
+    """
+    # Ищем номер дороги в адресе (case-insensitive)
+    rn_pattern = re.compile(re.escape(road_num), re.IGNORECASE)
+    m = rn_pattern.search(address)
+    if not m:
+        return None
+
+    # Текст после номера дороги
+    after = address[m.end():].strip()
+
+    # Пропускаем классификационный префикс (если номер был частью "22 ОП РЗ 22К-XXXX")
+    # и trailing part like "/1" in "22К-0035/1"
+    after = re.sub(r'^\s*/?\d*\s*', '', after)
+
+    # Обрезаем до пикетажа, запятой, скобки
+    # Ищем начало piketazh pattern
+    m_pk = re.search(r'\d+\s*км', after, re.IGNORECASE)
+    m_comma = re.search(r',', after)
+    m_paren = re.search(r'\(', after)
+
+    # Берём ближайшую границу
+    end_pos = len(after)
+    for candidate in [m_pk, m_comma, m_paren]:
+        if candidate and candidate.start() < end_pos:
+            end_pos = candidate.start()
+
+    name_part = after[:end_pos].strip()
+
+    # Очищаем от мусорных префиксов/суффиксов
+    # Убираем "г. " в начале (просто указание на город, не часть названия)
+    name_part = re.sub(r'^г\.\s*', '', name_part)
+    # Убираем "а/д " в начале
+    name_part = re.sub(r'^а/д\s*', '', name_part)
+    # Убираем ведущие/завершающие пробелы, точки, тире
+    name_part = name_part.strip(' .-—')
+
+    # Фильтруем слишком короткие или подозрительные результаты
+    # (напр. если номер был внутри скобок — адрес не про эту дорогу)
+    if len(name_part) < 4:
+        return None
+
+    # Фильтр: если название начинается с мусора от скобок/улиц — не дорога
+    if re.match(r'^[\)\s]', name_part):
+        return None
+    if re.match(r'^ул\.|^пер\.', name_part, re.IGNORECASE):
+        return None
+
+    return name_part
+
+
+def _extract_piket(address: str) -> float | None:
+    """Извлекает пикетаж из адреса, пробуя несколько форматов."""
+    # 1) Классический с +: "775км +890м"
+    m = _RE_PIKET_PLUS.search(address)
+    if m:
+        return int(m.group(1)) + int(m.group(2)) / 1000.0
+
+    # 2) Через пробел без +: "117 км 620 м", "265км 035м", "3км 0м"
+    m = _RE_PIKET_SPACE.search(address)
+    if m:
+        km_val = int(m.group(1))
+        m_val = int(m.group(2))
+        # Фильтр: метры должны быть 0-999
+        if 0 <= m_val <= 999:
+            return km_val + m_val / 1000.0
+
+    # 3) км перед числом: "км 17+175", "км 208+040"
+    m = _RE_PIKET_KM_FIRST.search(address)
+    if m:
+        return int(m.group(1)) + int(m.group(2)) / 1000.0
+
+    # 4) Только километры: "9км.", "45км.", "388 км"
+    m = _RE_PIKET_KM_ONLY.search(address)
+    if m:
+        return float(m.group(1))
+
+    return None
 
 
 # ========================
@@ -337,17 +463,16 @@ def normalize_gibdd_road(
 
     Returns:
         (road_num, road_simple)
-        - road_num: "Р-217", "А-167" или None
-        - road_simple: "р 217 кавказ", "махачкала буйнакск леваши в.гуниб"
+        - road_num: "Р-217", "А-167", "22К-0125" или None
+        - road_simple: "р 217 кавказ", "22к 0125 неклюдово бор валки макарьево"
     """
     if not dor:
         return None, None
 
     d = dor.strip()
 
-    # Номер дороги
-    m = _RE_ROAD_NUM.search(d)
-    road_num = m.group(1).upper().replace(" ", "") if m else None
+    # Номер дороги (федеральный или региональный)
+    road_num = _extract_road_num(d)
 
     # Убираем всё после скобки "(основное направление)"
     d_clean = re.split(r"\s*\(", d)[0].strip()
