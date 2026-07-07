@@ -227,7 +227,7 @@ def _parse_xml(file_bytes: bytes) -> list[dict]:
         rows = ws.findall(".//Row")
 
     cameras = []
-    debug_logged = False
+    debug_logged = 0
     for row_idx, row_el in enumerate(rows):
         try:
             cells = row_el.findall(".//{urn:schemas-microsoft-com:office:spreadsheet}Cell")
@@ -252,19 +252,19 @@ def _parse_xml(file_bytes: bytes) -> list[dict]:
                 value = data_el.text if data_el is not None and data_el.text else None
                 row_values.append(value)
 
-            # Debug: логируем первые 3 непустые строки
-            if not debug_logged and row_values and row_values[0]:
-                debug_logged = True
-                safe_get = lambda lst, i: lst[i] if len(lst) > i else "<MISSING>"
-                logger.info(
-                    f"XML row[{row_idx}]: len={len(row_values)}, "
-                    f"cells={len(cells)}, "
-                    f"[0]={safe_get(row_values, 0)!r}, "
-                    f"[2]={safe_get(row_values, 2)!r}, "
-                    f"[4]={safe_get(row_values, 4)!r}, "
-                    f"[5]={safe_get(row_values, 5)!r}, "
-                    f"[6]={str(safe_get(row_values, 6))[:80]!r}"
-                )
+            # Debug: логируем первые 3 строки с len >= 5 и пропущенные
+            if len(row_values) >= 5 and row_values[0]:
+                if debug_logged < 3:
+                    debug_logged += 1
+                    safe_get = lambda lst, i: lst[i] if len(lst) > i else "<MISSING>"
+                    logger.info(
+                        f"XML row[{row_idx}]: len={len(row_values)}, "
+                        f"[0]={safe_get(row_values, 0)!r}, "
+                        f"[2]={safe_get(row_values, 2)!r}, "
+                        f"[4]={safe_get(row_values, 4)!r}, "
+                        f"[5]={safe_get(row_values, 5)!r}, "
+                        f"[6]={str(safe_get(row_values, 6))[:100]!r}"
+                    )
 
             cam = _row_to_camera(row_values)
             if cam:
