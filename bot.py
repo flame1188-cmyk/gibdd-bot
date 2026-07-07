@@ -83,11 +83,13 @@ from concentration_points import (
     calculate_concentration_dynamics,
     build_concentration_excel_data,
     build_concentration_detail_data,
+    build_precluster_excel_data,
     build_dynamics_excel_data,
     build_dynamics_detail_data,
     build_dynamics_summary,
     get_concentration_column_names,
     get_detail_column_names,
+    get_precluster_column_names,
     get_dynamics_column_names,
     get_dynamics_detail_column_names,
     enrich_clusters_with_cameras,
@@ -1110,7 +1112,7 @@ async def _run_analysis(
                 await status_msg.edit_text(
                     f"{mode_label}: рассчитываю очаги ДТП..."
                 )
-                clusters = await calculate_concentration_points(
+                clusters, _preclusters = await calculate_concentration_points(
                     current_cards,
                 )
                 if clusters:
@@ -1391,7 +1393,7 @@ async def _run_concentration_points(
             if lost_clusters:
                 enrich_clusters_with_cameras(lost_clusters, cameras)
 
-        # --- Генерируем Excel с 3 листами ---
+        # --- Генерируем Excel с 4 листами ---
         # Лист 1: очаги запрашиваемого года (стандартный формат)
         current_data = build_concentration_excel_data(current_only_clusters)
         current_columns = get_concentration_column_names()
@@ -1406,10 +1408,22 @@ async def _run_concentration_points(
         )
         detail_columns = get_dynamics_detail_column_names()
 
+        # Лист 4: предочаги
+        preclusters = clusters[0].get("_preclusters", []) if clusters else []
+        precluster_data = None
+        precluster_columns = None
+        if preclusters:
+            # Обогащаем предочаги камерами
+            if cameras:
+                enrich_clusters_with_cameras(preclusters, cameras)
+            precluster_data = build_precluster_excel_data(preclusters)
+            precluster_columns = get_precluster_column_names()
+
         conc_bytes = generate_concentration_dynamics_file(
             current_data, current_columns,
             dyn_data, dyn_columns,
             detail_data, detail_columns,
+            precluster_data, precluster_columns,
         )
 
         # Удаляем статус
@@ -1491,6 +1505,22 @@ async def _run_concentration_points(
                     f"({delta_dtp:+d})"
                 )
 
+        # Блок 3: предочаги
+        if preclusters:
+            pre_np = sum(
+                1 for p in preclusters
+                if p["zone_type"].startswith("settlement")
+            )
+            pre_nonp = len(preclusters) - pre_np
+            pre_dtp = sum(p["total_accidents"] for p in preclusters)
+            summary_lines.extend([
+                "",
+                f"\u26A0\uFE0F <b>Предочаги:</b> <b>{len(preclusters)}</b>",
+                f"  \u2022 В НП: {pre_np}",
+                f"  \u2022 Вне НП: {pre_nonp}",
+                f"  \u2022 ДТП в предочагах: {pre_dtp}",
+            ])
+
         await _send_long_message(
             context.bot, chat_id,
             text="\n".join(summary_lines),
@@ -1516,6 +1546,7 @@ async def _run_concentration_points(
                 + f"\n"
                 f"Очагов: {current_total_clusters} | "
                 f"ДТП в очагах: {current_total_dtp}"
+                + (f" | Предочагов: {len(preclusters)}" if preclusters else "")
             ),
         )
 

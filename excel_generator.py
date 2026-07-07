@@ -507,6 +507,8 @@ DYN_SHRINKING_FILL = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_
 DYN_STABLE_FILL = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
 DYN_LOST_FILL = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
 
+PRECLUSTER_FILL = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")  # светло-оранжевый
+
 DYN_STATUS_FILLS = {
     "Новый": DYN_NEW_FILL,
     "Рост": DYN_GROWING_FILL,
@@ -523,6 +525,8 @@ def generate_concentration_dynamics_file(
     dynamics_columns: list[str],
     detail_data: list[dict[str, str]] | None = None,
     detail_columns: list[str] | None = None,
+    precluster_data: list[dict[str, str]] | None = None,
+    precluster_columns: list[str] | None = None,
 ) -> bytes:
     """
     Генерирует Excel-файл с очагами ДТП и исторической динамикой.
@@ -539,6 +543,8 @@ def generate_concentration_dynamics_file(
       - Светло-зелёный = Исчезнувший
 
     Лист 3 «Детализация ДТП» — все ДТП с пометкой периода.
+
+    Лист 4 «Предочаги» — места, которым не хватает 1 ДТП до очага.
 
     Args:
         current_year_data: Данные очагов только за запрашиваемый год
@@ -735,5 +741,42 @@ def generate_concentration_dynamics_file(
 
         if detail_data:
             ws3.auto_filter.ref = ws3.dimensions
+
+    # ==============================
+    # Лист 4: Предочаги (если есть)
+    # ==============================
+    if precluster_data and precluster_columns:
+        ws4 = wb.create_sheet("Предочаги")
+
+        col_count4 = len(precluster_columns)
+
+        for col_idx, col_name in enumerate(precluster_columns, start=1):
+            cell = ws4.cell(row=1, column=col_idx, value=col_name)
+            cell.font = HEADER_FONT
+            cell.fill = HEADER_FILL
+            cell.alignment = HEADER_ALIGNMENT
+            cell.border = THIN_BORDER
+
+        for row_idx, row_data in enumerate(precluster_data, start=2):
+            for col_idx, col_name in enumerate(precluster_columns, start=1):
+                value = row_data.get(col_name, "")
+                cell = ws4.cell(row=row_idx, column=col_idx, value=value)
+                cell.alignment = CELL_ALIGNMENT
+                cell.border = THIN_BORDER
+                cell.fill = PRECLUSTER_FILL
+
+        # Ширина колонок (переиспользуем ширину очагов + добавляем свои)
+        pre_widths = {
+            "№ предочага": 12,
+            "Критерий предочага": 25,
+        }
+        for col_idx, col_name in enumerate(precluster_columns, start=1):
+            col_letter = ws4.cell(row=1, column=col_idx).column_letter
+            ws4.column_dimensions[col_letter].width = pre_widths.get(col_name, 20)
+
+        ws4.freeze_panes = "A2"
+
+        if precluster_data:
+            ws4.auto_filter.ref = ws4.dimensions
 
     return workbook_to_bytes(wb)

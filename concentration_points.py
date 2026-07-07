@@ -74,6 +74,10 @@ NON_SETTLEMENT_NO_PK_WINDOW_KM = 0.2  # 200 метров
 SAME_TYPE_THRESHOLD = 3   # 3+ ДТП одного вида = очаг
 ANY_TYPE_THRESHOLD = 5    # 5+ ДТП любых видов = очаг
 
+# Пороги для предочагов (на 1 ДТП меньше очага)
+PRE_SAME_TYPE_THRESHOLD = 2   # 2 ДТП одного вида = предочаг
+PRE_ANY_TYPE_THRESHOLD = 4    # 4 ДТП разных видов = предочаг
+
 # Ключевые слова для определения перекрёстка
 INTERSECTION_KEYWORDS = [
     # перекрёсток — разные падежи/окончания
@@ -275,6 +279,28 @@ def _check_cluster_criteria(
         if count >= SAME_TYPE_THRESHOLD:
             return True, dtp_type
     if total >= ANY_TYPE_THRESHOLD:
+        return True, None
+    return False, None
+
+
+def _check_precluster_criteria(
+    type_counter: Counter,
+    total: int,
+) -> tuple[bool, str | None]:
+    """
+    Проверяет, выполняется ли критерий предочага.
+
+    Предочаг — место, которому не хватает 1 ДТП до очага:
+      - 2+ ДТП одного вида (до порога 3)
+      - 4+ ДТП любых видов (до порога 5)
+
+    Returns:
+        (is_precluster, dominant_type)
+    """
+    for dtp_type, count in type_counter.most_common():
+        if count >= PRE_SAME_TYPE_THRESHOLD:
+            return True, dtp_type
+    if total >= PRE_ANY_TYPE_THRESHOLD:
         return True, None
     return False, None
 
@@ -1176,6 +1202,74 @@ def _build_cluster(
     }
 
 
+def _build_precluster(
+    cards: list[dict],
+    center: tuple[float, float] | None,
+    zone_type: str,
+    road_name: str = "",
+    start_pos: float | None = None,
+    end_pos: float | None = None,
+) -> dict:
+    """Формирует словарь предочага из группы карточек."""
+    total_deaths = sum(_safe_int(c.get("pog")) for c in cards)
+    total_injured = sum(_safe_int(c.get("ran")) for c in cards)
+    dates = [_get_date(c) for c in cards]
+    type_counter = Counter(_get_dtp_type(c) for c in cards)
+
+    dominant = None
+    for t, cnt in type_counter.most_common():
+        if cnt >= PRE_SAME_TYPE_THRESHOLD:
+            dominant = t
+            break
+
+    road = road_name or _get_road_name(cards[0])
+
+    first_coords = _parse_coords(cards[0])
+    last_coords = _parse_coords(cards[-1])
+
+    # Реальные границы предочага по пикетажу ДТП
+    dtp_piketazh_positions = [_get_km_m(c) for c in cards]
+    dtp_piketazh_positions = [p for p in dtp_piketazh_positions if p is not None]
+    if dtp_piketazh_positions:
+        dtp_pk_min = min(dtp_piketazh_positions)
+        dtp_pk_max = max(dtp_piketazh_positions)
+    else:
+        dtp_pk_min = None
+        dtp_pk_max = None
+
+    # Определяем критерий, по которому сработал предочаг
+    max_same = max(type_counter.values()) if type_counter else 0
+    if max_same >= PRE_SAME_TYPE_THRESHOLD:
+        criterion = f"{max_same} ДТП одного вида"
+    else:
+        criterion = f"{len(cards)} ДТП разных видов"
+
+    return {
+        "zone_type": zone_type,
+        "road": road,
+        "total_accidents": len(cards),
+        "deaths": total_deaths,
+        "injured": total_injured,
+        "dates": dates,
+        "type_counter": dict(type_counter),
+        "dominant_type": dominant,
+        "first_coords": first_coords,
+        "last_coords": last_coords,
+        "center": center or first_coords or (0, 0),
+        "start_pos": start_pos,
+        "end_pos": end_pos,
+        "cards": cards,
+        "has_piketazh": start_pos is not None,
+        "start_km": start_pos,
+        "end_km": end_pos,
+        "dtp_pk_min": dtp_pk_min,
+        "dtp_pk_max": dtp_pk_max,
+        # Специфичные поля предочага
+        "is_precluster": True,
+        "precluster_criterion": criterion,
+    }
+
+
 def _cluster_cards_by_radius(
     cards_with_idx: list[tuple[int, dict]],
     radius_m: float,
@@ -1216,6 +1310,291 @@ def _cluster_cards_by_radius(
     if is_cluster:
         return group_indices
     return None
+
+
+def _extract_assigned_indices(
+    clusters: list[dict],
+    cards: list[dict],
+) -> set[int]:
+    """Извлекает множество индексов карточек, вошедших в кластеры.
+
+    Используется для передачи в find_*_preclusters, чтобы предочаги
+    не включали карточки уже из очагов.
+    """
+    # Строим map: id(card) -> index в списке cards
+    id_to_idx = {id(c): i for i, c in enumerate(cards)}
+    assigned: set[int] = set()
+    for cluster in clusters:
+        for card in cluster.get("cards", []):
+            idx = id_to_idx.get(id(card))
+            if idx is not None:
+                assigned.add(idx)
+    return assigned
+
+
+def find_settlement_preclusters(
+    cards: list[dict],
+    cluster_assigned: set[int],
+) -> list[dict]:
+    """
+    Поиск предочагов в населённых пунктах.
+
+    Алгоритм идентичен find_settlement_concentration_points (3 прохода),
+    но:
+    - Использует _check_precluster_criteria (2 одного вида / 4 разных)
+    - Исключает карточки, уже вошедшие в очаги (cluster_assigned)
+    - Карточки, вошедшие в предочаг, тоже помечаются (pre_assigned),
+      чтобы не дублироваться
+    """
+    if not cards:
+        return []
+
+    indexed = [(i, c) for i, c in enumerate(cards)]
+    indexed.sort(key=lambda x: _get_date(x[1]))
+    indexed_with_coords = [(i, c) for i, c in indexed if _parse_coords(c)]
+
+    assigned: set[int] = set(cluster_assigned)  # исключаем очаговые
+    preclusters: list[dict] = []
+
+    # --- 1-й проход: перекрёстки (50 м) ---
+
+    # Шаг 1a: Перекрёстки С дорогой+пикетажем
+    for idx, card in indexed_with_coords:
+        if idx in assigned:
+            continue
+        if not _is_intersection(card):
+            continue
+        if not _has_road_and_piketazh(card):
+            continue
+
+        center_road = _get_road_name(card)
+        center_km = _get_km_m(card)
+        center = _parse_coords(card)
+        if center is None:
+            continue
+
+        # 1a-1: По пикетажу
+        piketazh_candidates = []
+        for j, c in indexed_with_coords:
+            if j in assigned or j == idx:
+                continue
+            if _get_road_name(c) != center_road:
+                continue
+            other_km = _get_km_m(c)
+            if other_km is None:
+                continue
+            if abs(center_km - other_km) * 1000.0 > SETTLEMENT_INTERSECTION_RADIUS_M:
+                continue
+            if not _is_intersection(c):
+                continue
+            piketazh_candidates.append((j, c))
+
+        if piketazh_candidates:
+            group_cards = [card] + [c for _, c in piketazh_candidates]
+            type_counter = Counter(_get_dtp_type(c) for c in group_cards)
+            is_pre, _ = _check_precluster_criteria(type_counter, len(group_cards))
+            if is_pre:
+                assigned.add(idx)
+                for j, _ in piketazh_candidates:
+                    assigned.add(j)
+                group_cards.sort(key=lambda c: _get_date(c))
+                preclusters.append(
+                    _build_precluster(group_cards, center, "settlement_intersection")
+                )
+                continue
+
+        # 1a-2: Fallback — радиус 50 м по GPS
+        gps_candidates = [
+            (j, c) for j, c in indexed_with_coords
+            if j not in assigned and j != idx
+        ]
+
+        group_indices = [idx]
+        group_cards = [card]
+
+        for j, c in gps_candidates:
+            if not _is_intersection(c):
+                continue
+            coords = _parse_coords(c)
+            if coords is None:
+                continue
+            dist = haversine_meters(center[0], center[1], coords[0], coords[1])
+            if dist > SETTLEMENT_INTERSECTION_RADIUS_M:
+                continue
+
+            other_road = _get_road_name(c)
+            other_km = _get_km_m(c)
+            if other_road == center_road and other_km is not None:
+                piketazh_diff_m = abs(other_km - center_km) * 1000.0
+                if piketazh_diff_m > SETTLEMENT_INTERSECTION_RADIUS_M:
+                    continue
+
+            group_indices.append(j)
+            group_cards.append(c)
+
+        type_counter = Counter(_get_dtp_type(c) for c in group_cards)
+        is_pre, _ = _check_precluster_criteria(type_counter, len(group_cards))
+        if is_pre:
+            assigned.update(group_indices)
+            group_cards.sort(key=lambda c: _get_date(c))
+            preclusters.append(
+                _build_precluster(group_cards, center, "settlement_intersection")
+            )
+
+    # Шаг 1b: Перекрёстки БЕЗ пикетажа
+    for idx, card in indexed_with_coords:
+        if idx in assigned:
+            continue
+        if not _is_intersection(card):
+            continue
+        if _has_road_and_piketazh(card):
+            continue
+
+        center = _parse_coords(card)
+        if center is None:
+            continue
+
+        group_indices = [idx]
+        group_cards = [card]
+
+        for j, c in indexed_with_coords:
+            if j in assigned or j == idx:
+                continue
+            if not _is_intersection(c):
+                continue
+            coords = _parse_coords(c)
+            if coords is None:
+                continue
+            dist = haversine_meters(center[0], center[1], coords[0], coords[1])
+            if dist <= SETTLEMENT_INTERSECTION_RADIUS_M:
+                group_indices.append(j)
+                group_cards.append(c)
+
+        type_counter = Counter(_get_dtp_type(c) for c in group_cards)
+        is_pre, _ = _check_precluster_criteria(type_counter, len(group_cards))
+
+        if is_pre:
+            assigned.update(group_indices)
+            group_cards.sort(key=lambda c: _get_date(c))
+            preclusters.append(
+                _build_precluster(group_cards, center, "settlement_intersection")
+            )
+
+    # --- 2-й проход: дороги с пикетажем, окно 200 м ---
+    road_cards_with_km = [
+        (idx, card) for idx, card in indexed_with_coords
+        if idx not in assigned and _has_road_and_piketazh(card)
+    ]
+
+    road_groups: dict[str, list[tuple[int, dict]]] = {}
+    for idx, card in road_cards_with_km:
+        road = _get_road_name(card)
+        road_groups.setdefault(road, []).append((idx, card))
+
+    for road_name, items in road_groups.items():
+        items_pos: list[tuple[int, dict, float]] = []
+        for idx, card in items:
+            pos = _get_km_m(card)
+            if pos is not None:
+                items_pos.append((idx, card, pos))
+
+        if not items_pos:
+            continue
+
+        items_pos.sort(key=lambda x: x[2])
+
+        for i, (idx, card, pos) in enumerate(items_pos):
+            if idx in assigned:
+                continue
+
+            window_end = pos + SETTLEMENT_ROAD_WINDOW_KM
+
+            group_indices = [idx]
+            group_cards = [card]
+
+            for j in range(i + 1, len(items_pos)):
+                other_idx, other_card, other_pos = items_pos[j]
+                if other_idx in assigned:
+                    continue
+                if other_pos <= window_end:
+                    group_indices.append(other_idx)
+                    group_cards.append(other_card)
+
+            type_counter = Counter(_get_dtp_type(c) for c in group_cards)
+            is_pre, _ = _check_precluster_criteria(type_counter, len(group_cards))
+
+            if is_pre:
+                assigned.update(group_indices)
+                group_cards.sort(key=lambda c: _get_date(c))
+                center = _parse_coords(card)
+                preclusters.append(
+                    _build_precluster(
+                        group_cards, center, "settlement_road",
+                        road_name=road_name,
+                        start_pos=pos,
+                        end_pos=window_end,
+                    )
+                )
+
+    # --- 3-й проход: радиус 100 м ---
+    for idx, card in indexed_with_coords:
+        if idx in assigned:
+            continue
+
+        center = _parse_coords(card)
+        if center is None:
+            assigned.add(idx)
+            continue
+
+        center_road = _get_road_name(card)
+        center_km = _get_km_m(card)
+        center_has_road_km = bool(center_road) and center_km is not None
+
+        candidates = [
+            (j, c) for j, c in indexed_with_coords
+            if j not in assigned and j != idx
+        ]
+
+        group_indices = [idx]
+        group_cards = [card]
+
+        for j, c in candidates:
+            coords = _parse_coords(c)
+            if coords is None:
+                continue
+            dist = haversine_meters(center[0], center[1], coords[0], coords[1])
+            if dist > SETTLEMENT_OTHER_RADIUS_M:
+                continue
+
+            other_road = _get_road_name(c)
+            other_km = _get_km_m(c)
+
+            if (
+                center_has_road_km
+                and other_road == center_road
+                and other_km is not None
+            ):
+                piketazh_diff_m = abs(other_km - center_km) * 1000.0
+                if piketazh_diff_m > SETTLEMENT_ROAD_WINDOW_KM * 1000.0:
+                    continue
+
+            group_indices.append(j)
+            group_cards.append(c)
+
+        type_counter = Counter(_get_dtp_type(c) for c in group_cards)
+        is_pre, _ = _check_precluster_criteria(type_counter, len(group_cards))
+
+        if is_pre:
+            assigned.update(group_indices)
+            group_cards.sort(key=lambda c: _get_date(c))
+            preclusters.append(
+                _build_precluster(group_cards, center, "settlement_segment")
+            )
+        else:
+            assigned.add(idx)
+
+    logger.info(f"Предочаги в НП: {len(preclusters)} найдено")
+    return preclusters
 
 
 def find_settlement_concentration_points(cards: list[dict]) -> list[dict]:
@@ -1541,6 +1920,110 @@ def find_settlement_concentration_points(cards: list[dict]) -> list[dict]:
 # Алгоритм: Вне НП (окна 1 км по дорогам)
 # ========================
 
+
+def find_nonsettlement_preclusters(
+    cards: list[dict],
+    cluster_assigned: set[int],
+) -> list[dict]:
+    """
+    Поиск предочагов вне населённых пунктов.
+
+    Алгоритм идентичен find_nonsettlement_concentration_points (окна по дорогам),
+    но использует _check_precluster_criteria и исключает карточки из очагов.
+    """
+    if not cards:
+        return []
+
+    road_groups: dict[str, list[dict]] = {}
+    for i, card in enumerate(cards):
+        if i in cluster_assigned:
+            continue
+        road = _get_road_name(card)
+        if not road:
+            continue
+        road_groups.setdefault(road, []).append((i, card))
+
+    all_preclusters: list[dict] = []
+
+    for road_name, road_items in road_groups.items():
+        cards_pos: list[tuple[int, dict, float, tuple | None]] = []
+        for i, card in road_items:
+            pos = _get_km_m(card)
+            coords = _parse_coords(card)
+            if pos is not None:
+                cards_pos.append((i, card, pos, coords))
+            elif coords is not None:
+                cards_pos.append((i, card, 0.0, coords))
+
+        if not cards_pos:
+            continue
+
+        ref_coords = None
+        for _, _, _, coords in cards_pos:
+            if coords:
+                ref_coords = coords
+                break
+        if ref_coords is None:
+            continue
+
+        # Пересчитываем позиции для карточек без km/m
+        for k, (i, card, pos, coords) in enumerate(cards_pos):
+            if pos == 0.0 and _get_km_m(card) is None and coords:
+                dist_km = haversine_meters(
+                    ref_coords[0], ref_coords[1],
+                    coords[0], coords[1],
+                ) / 1000.0
+                cards_pos[k] = (i, card, dist_km, coords)
+
+        cards_pos.sort(key=lambda x: (x[2], _get_date(x[1])))
+
+        has_piketazh = any(_get_km_m(card) is not None for _, card, _, _ in cards_pos)
+        window_km = NON_SETTLEMENT_WINDOW_KM if has_piketazh else NON_SETTLEMENT_NO_PK_WINDOW_KM
+
+        assigned: set[int] = set()  # ki — индексы внутри cards_pos
+
+        for ki, (i, card, pos, coords) in enumerate(cards_pos):
+            if ki in assigned:
+                continue
+
+            window_start = pos
+            window_end = pos + window_km
+
+            group_indices = [ki]
+            group_cards = [card]
+
+            for kj, (oj, other_card, other_pos, other_coords) in enumerate(cards_pos):
+                if kj in assigned or kj == ki:
+                    continue
+                if window_start <= other_pos <= window_end:
+                    group_indices.append(kj)
+                    group_cards.append(other_card)
+
+            type_counter = Counter(_get_dtp_type(c) for c in group_cards)
+            is_pre, _ = _check_precluster_criteria(type_counter, len(group_cards))
+
+            if is_pre:
+                assigned.update(group_indices)
+                group_cards.sort(key=lambda c: _get_date(c))
+
+                first_coords = _parse_coords(group_cards[0])
+                last_coords = _parse_coords(group_cards[-1])
+
+                all_preclusters.append(
+                    _build_precluster(
+                        group_cards, coords or first_coords, "nonsettlement",
+                        road_name=road_name,
+                        start_pos=window_start,
+                        end_pos=window_end,
+                    )
+                )
+            else:
+                assigned.add(ki)
+
+    logger.info(f"Предочаги вне НП: {len(all_preclusters)} найдено")
+    return all_preclusters
+
+
 def find_nonsettlement_concentration_points(cards: list[dict]) -> list[dict]:
     """
     Поиск очагов вне населённых пунктов.
@@ -1698,6 +2181,40 @@ DETAIL_COLUMNS = [
     "Погибло",
     "Ранено",
 ]
+
+PRECLUSTER_COLUMNS = [
+    "№ предочага",
+    "Тип зоны",
+    "Дорога/Улица",
+    "Пикетаж начало",
+    "Пикетаж конец",
+    "Широта первого ДТП",
+    "Долгота первого ДТП",
+    "Широта последнего ДТП",
+    "Долгота последнего ДТП",
+    "Кол-во ДТП",
+    "Виды ДТП (детализация)",
+    "Доминирующий вид",
+    "Погибло",
+    "Ранено",
+    "Дата первого ДТП",
+    "Дата последнего ДТП",
+    "Критерий предочага",
+    # --- Камеры фотовидеофиксации ---
+    "Статус покрытия камерой",
+    "Камера: номер",
+    "Камера: адрес",
+    "Камера: координаты",
+    "Ближайшая камера: номер",
+    "Ближайшая камера: адрес",
+    "Ближайшая камера: координаты",
+    "Расстояние до камеры (м)",
+]
+
+
+def get_precluster_column_names() -> list[str]:
+    """Названия колонок для Excel-файла предочагов."""
+    return list(PRECLUSTER_COLUMNS)
 
 
 def _format_piketazh(pos: float | None) -> str:
@@ -1881,6 +2398,66 @@ def build_concentration_excel_data(
     return rows
 
 
+def build_precluster_excel_data(
+    preclusters: list[dict],
+) -> list[dict[str, str]]:
+    """Строит данные для Excel-файла предочагов."""
+    rows = []
+
+    for i, pc in enumerate(preclusters, start=1):
+        # Виды ДТП
+        types_parts = [
+            f"{t}: {c}" for t, c in pc["type_counter"].items()
+        ]
+        types_str = "; ".join(types_parts)
+
+        # Координаты
+        fc = pc.get("first_coords")
+        lc = pc.get("last_coords")
+        first_lat = f"{fc[0]:.6f}" if fc else ""
+        first_lon = f"{fc[1]:.6f}" if fc else ""
+        last_lat = f"{lc[0]:.6f}" if lc else ""
+        last_lon = f"{lc[1]:.6f}" if lc else ""
+
+        # Пикетаж
+        start_pos, end_pos = _first_last_piketazh(pc["cards"])
+        start_str = _format_piketazh(start_pos)
+        end_str = _format_piketazh(end_pos)
+
+        # Даты
+        dates = pc["dates"]
+        first_date = dates[0] if dates else ""
+        last_date = dates[-1] if dates else ""
+
+        zone_label = ZONE_TYPE_LABELS.get(
+            pc["zone_type"], pc["zone_type"],
+        )
+
+        rows.append({
+            "№ предочага": str(i),
+            "Тип зоны": zone_label,
+            "Дорога/Улица": pc["road"],
+            "Пикетаж начало": start_str,
+            "Пикетаж конец": end_str,
+            "Широта первого ДТП": first_lat,
+            "Долгота первого ДТП": first_lon,
+            "Широта последнего ДТП": last_lat,
+            "Долгота последнего ДТП": last_lon,
+            "Кол-во ДТП": str(pc["total_accidents"]),
+            "Виды ДТП (детализация)": types_str,
+            "Доминирующий вид": pc.get("dominant_type", ""),
+            "Погибло": str(pc["deaths"]),
+            "Ранено": str(pc["injured"]),
+            "Дата первого ДТП": first_date,
+            "Дата последнего ДТП": last_date,
+            "Критерий предочага": pc.get("precluster_criterion", ""),
+            # --- Камеры фотовидеофиксации ---
+            **_camera_row_fields(pc),
+        })
+
+    return rows
+
+
 def build_concentration_detail_data(
     clusters: list[dict],
 ) -> list[dict[str, str]]:
@@ -2015,7 +2592,35 @@ async def calculate_concentration_points(
         f"вне НП: {len(non_settlement_clusters)})"
     )
 
-    return all_clusters
+    # Шаг 6: Предочаги (после очагов, исключая их карточки)
+    if progress_callback:
+        await progress_callback(
+            f"Поиск предочагов..."
+        )
+
+    settlement_assigned = _extract_assigned_indices(
+        settlement_clusters, settlement_cards,
+    )
+    settlement_preclusters = find_settlement_preclusters(
+        settlement_cards, settlement_assigned,
+    )
+
+    non_settlement_assigned = _extract_assigned_indices(
+        non_settlement_clusters, non_settlement_cards,
+    )
+    non_settlement_preclusters = find_nonsettlement_preclusters(
+        non_settlement_cards, non_settlement_assigned,
+    )
+
+    all_preclusters = settlement_preclusters + non_settlement_preclusters
+
+    logger.info(
+        f"Итого предочагов: {len(all_preclusters)} "
+        f"(НП: {len(settlement_preclusters)}, "
+        f"вне НП: {len(non_settlement_preclusters)})"
+    )
+
+    return all_clusters, all_preclusters
 
 
 # ========================
@@ -2162,7 +2767,7 @@ async def calculate_concentration_dynamics(
     # --- Очаги текущего периода ---
     if progress_callback:
         await progress_callback("Расчёт очагов текущего периода...")
-    current_clusters = await calculate_concentration_points(
+    current_clusters, current_preclusters = await calculate_concentration_points(
         current_cards,
         progress_callback,
         settlement_polygons=settlement_polygons,
@@ -2182,6 +2787,9 @@ async def calculate_concentration_dynamics(
             f"Динамика: нет данных за прошлый год, "
             f"{len(current_clusters)} очагов помечены как новые"
         )
+        # Сохраняем предочаги в поле текущих очагов для передачи наверх
+        if current_clusters:
+            current_clusters[0]["_preclusters"] = current_preclusters
         return current_clusters
 
     # --- Очаги прошлого периода (те же полигоны!) ---
@@ -2189,7 +2797,7 @@ async def calculate_concentration_dynamics(
         await progress_callback(
             f"Расчёт очагов за прошлый год ({len(prev_cards)} ДТП)..."
         )
-    prev_clusters = await calculate_concentration_points(
+    prev_clusters, prev_preclusters = await calculate_concentration_points(
         prev_cards,
         progress_callback,
         settlement_polygons=settlement_polygons,
@@ -2209,6 +2817,8 @@ async def calculate_concentration_dynamics(
             f"Динамика: за прошлый год очагов не найдено, "
             f"{len(current_clusters)} очагов помечены как новые"
         )
+        if current_clusters:
+            current_clusters[0]["_preclusters"] = current_preclusters
         return current_clusters
 
     # --- Сопоставление ---
@@ -2282,6 +2892,10 @@ async def calculate_concentration_dynamics(
         f"исчезнувших={lost_count}, "
         f"всего={len(current_clusters)}"
     )
+
+    # Сохраняем предочаги текущего периода для передачи наверх
+    if current_clusters:
+        current_clusters[0]["_preclusters"] = current_preclusters
 
     return current_clusters
 
