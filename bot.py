@@ -107,6 +107,20 @@ from user_request_parser import (
 )
 
 # ========================
+# Кастомные фильтры
+# ========================
+
+class _IsDocument(filters.BaseFilter):
+    """Фильтр для сообщений с прикреплённым документом (файлом).
+
+    Используется вместо filters.Document, который в некоторых версиях
+    python-telegram-bot разрешается в класс telegram.Document вместо фильтра.
+    """
+    def check_update(self, update):
+        return bool(update.message and update.message.document is not None)
+
+
+# ========================
 # Настройка логирования
 # ========================
 logging.basicConfig(
@@ -2235,7 +2249,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.LOCATION, _handle_location_message))
 
     # Документы (загрузка камер фотовидеофиксации)
-    app.add_handler(MessageHandler(filters.Document, _handle_document))
+    app.add_handler(MessageHandler(_IsDocument(), _handle_document))
 
     # Глобальный обработчик ошибок
     app.add_error_handler(error_handler)
