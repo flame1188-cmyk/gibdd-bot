@@ -700,7 +700,14 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # --- Расчёт очагов ДТП ---
         if data == "do_concentration":
             # Проверяем, есть ли камеры в кэше для этого региона
-            reg_code = context.user_data.get("reg_code", "")
+            reg_code = (
+                context.user_data.get("concentration_reg_code", "")
+                or context.user_data.get("reg_code", "")
+                or context.user_data.get("analytics_reg_code", "")
+            )
+            # Запоминаем код региона для последующей загрузки файла камер
+            if reg_code:
+                context.user_data["concentration_reg_code"] = reg_code
             from camera_cache import has_cached_cameras, load_cameras_from_cache
 
             cached_cameras = None
@@ -773,7 +780,11 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # --- Камеры: использовать сохранённые из кэша ---
         if data == "cam_use_cached":
             from camera_cache import load_cameras_from_cache
-            reg_code = context.user_data.get("reg_code", "")
+            reg_code = (
+                context.user_data.get("concentration_reg_code", "")
+                or context.user_data.get("reg_code", "")
+                or context.user_data.get("analytics_reg_code", "")
+            )
             cameras = load_cameras_from_cache(reg_code) if reg_code else None
             if cameras:
                 context.user_data["cameras_data"] = cameras
@@ -2119,21 +2130,43 @@ async def _handle_document(
         context.user_data["cameras_data"] = cameras
 
         # Сохраняем файл на диск (кэш по региону)
-        reg_code = context.user_data.get("reg_code", "")
+        # reg_code мог быть удалён после выгрузки ДТП, проверяем все источники
+        reg_code = (
+            context.user_data.get("concentration_reg_code", "")
+            or context.user_data.get("reg_code", "")
+            or context.user_data.get("analytics_reg_code", "")
+        )
         if reg_code and file_bytes:
             try:
                 from camera_cache import save_camera_file
-                save_camera_file(reg_code, file_bytes)
+                path = save_camera_file(reg_code, file_bytes)
+                logger.info(f"Камеры сохранены в кэш: {path}")
+                save_ok = True
             except Exception as save_err:
-                logger.warning(f"Не удалось сохранить камеры в кэш: {save_err}")
+                logger.error(f"Ошибка сохранения камер в кэш: {save_err}", exc_info=True)
+                save_ok = False
+        else:
+            logger.warning(
+                f"Кэширование камер пропущено: "
+                f"reg_code={reg_code!r}, file_bytes={len(file_bytes) if file_bytes else 0}, "
+                f"user_data keys={list(context.user_data.keys())}"
+            )
+            save_ok = False
 
         with_pk = sum(1 for c in cameras if c["has_piket"])
         without_pk = len(cameras) - with_pk
 
+        save_line = ""
+        if reg_code and save_ok:
+            save_line = f"  \u2022 Файл сохранён для региона {reg_code}\n"
+        elif reg_code and not save_ok:
+            save_line = f"  \u26A0\uFE0F Не удалось сохранить файл на сервере\n"
+
         await wait_msg.edit_text(
             f"\u2705 Загружено <b>{len(cameras)}</b> камер:\n"
             f"  \u2022 С пикетажем: {with_pk}\n"
-            f"  \u2022 Городских: {without_pk}\n\n"
+            f"  \u2022 Городских: {without_pk}\n"
+            f"{save_line}\n"
             f"Запускаю расчёт очагов...",
             parse_mode="HTML",
         )

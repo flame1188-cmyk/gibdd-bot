@@ -43,14 +43,32 @@ def save_camera_file(reg_code: str, file_bytes: bytes) -> str:
 
     Returns:
         Путь к сохранённому файлу.
+
+    Raises:
+        OSError: Если файл не удалось записать или верифицировать.
     """
     _ensure_data_dir()
     path = _camera_filepath(reg_code)
+
     with open(path, "wb") as f:
         f.write(file_bytes)
+
+    # Верификация: проверяем что файл реально создан и размер совпадает
+    if not os.path.isfile(path):
+        raise OSError(f"Файл не был создан: {path}")
+
+    actual_size = os.path.getsize(path)
+    if actual_size != len(file_bytes):
+        raise OSError(
+            f"Размер файла не совпадает: записано {actual_size}, "
+            f"ожидалось {len(file_bytes)}"
+        )
+
+    # Логируем абсолютный путь для отладки на Amvera
+    abs_path = os.path.abspath(path)
     logger.info(
-        f"Камеры региона {reg_code} сохранены: {path} "
-        f"({len(file_bytes)} байт)"
+        f"Камеры региона {reg_code} сохранены: {abs_path} "
+        f"({len(file_bytes)} байт), DATA_DIR={os.path.abspath(DATA_DIR)}"
     )
     return path
 
@@ -93,7 +111,13 @@ def load_cameras_from_cache(reg_code: str) -> Optional[list[dict]]:
 
 def has_cached_cameras(reg_code: str) -> bool:
     """Быстренько проверяет наличие файла (без парсинга)."""
-    return os.path.isfile(_camera_filepath(reg_code))
+    path = _camera_filepath(reg_code)
+    exists = os.path.isfile(path)
+    if not exists:
+        logger.debug(
+            f"Кэш камер региона {reg_code} не найден: {os.path.abspath(path)}"
+        )
+    return exists
 
 
 def delete_cached_cameras(reg_code: str) -> bool:
