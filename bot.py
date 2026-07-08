@@ -699,26 +699,66 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         # --- Расчёт очагов ДТП ---
         if data == "do_concentration":
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "\U0001F4F7 Загрузить камеры",
-                        callback_data="cam_ask_upload",
-                    ),
-                    InlineKeyboardButton(
-                        "\u27A1 Без камер",
-                        callback_data="cam_skip",
-                    ),
-                ],
-            ])
-            await query.edit_message_text(
-                "\U0001F525 <b>Очаги ДТП</b>\n\n"
-                "Загрузите файл с камерами фотовидеофиксации\n"
-                "(gibddrf_cameras_change_*.xlsx)\n"
-                "или продолжите без камер.",
-                reply_markup=keyboard,
-                parse_mode="HTML",
-            )
+            # Проверяем, есть ли камеры в кэше для этого региона
+            reg_code = context.user_data.get("reg_code", "")
+            from camera_cache import has_cached_cameras, load_cameras_from_cache
+
+            cached_cameras = None
+            if reg_code and has_cached_cameras(reg_code):
+                cached_cameras = load_cameras_from_cache(reg_code)
+
+            if cached_cameras:
+                # Камеры в кэше — предлагаем использовать их или загрузить новые
+                with_pk = sum(1 for c in cached_cameras if c["has_piket"])
+                keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            f"\U0001F4F7 Использовать сохранённые ({len(cached_cameras)} камер)",
+                            callback_data="cam_use_cached",
+                        ),
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "\U0001F4E4 Загрузить новый файл",
+                            callback_data="cam_ask_upload",
+                        ),
+                        InlineKeyboardButton(
+                            "\u27A1 Без камер",
+                            callback_data="cam_skip",
+                        ),
+                    ],
+                ])
+                await query.edit_message_text(
+                    "\U0001F525 <b>Очаги ДТП</b>\n\n"
+                    f"Для региона <b>{reg_code}</b> найден сохранённый файл камер:\n"
+                    f"  \u2022 Всего: {len(cached_cameras)}\n"
+                    f"  \u2022 С пикетажем: {with_pk}\n\n"
+                    "Использовать его или загрузить новый?",
+                    reply_markup=keyboard,
+                    parse_mode="HTML",
+                )
+            else:
+                # Камер в кэше нет — просим загрузить
+                keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "\U0001F4F7 Загрузить камеры",
+                            callback_data="cam_ask_upload",
+                        ),
+                        InlineKeyboardButton(
+                            "\u27A1 Без камер",
+                            callback_data="cam_skip",
+                        ),
+                    ],
+                ])
+                await query.edit_message_text(
+                    "\U0001F525 <b>Очаги ДТП</b>\n\n"
+                    "Загрузите файл с камерами фотовидеофиксации\n"
+                    "(gibddrf_cameras_change_*.xls)\n"
+                    "или продолжите без камер.",
+                    reply_markup=keyboard,
+                    parse_mode="HTML",
+                )
             return
 
         # --- Камеры: пропустить ---
@@ -728,6 +768,24 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 "\U0001F525 Запуск расчёта очагов (без камер)..."
             )
             await _run_concentration_points(update, context)
+            return
+
+        # --- Камеры: использовать сохранённые из кэша ---
+        if data == "cam_use_cached":
+            from camera_cache import load_cameras_from_cache
+            reg_code = context.user_data.get("reg_code", "")
+            cameras = load_cameras_from_cache(reg_code) if reg_code else None
+            if cameras:
+                context.user_data["cameras_data"] = cameras
+                await query.edit_message_text(
+                    f"\U0001F525 Запуск расчёта очагов "
+                    f"(с сохранёнными камерами: {len(cameras)})..."
+                )
+                await _run_concentration_points(update, context)
+            else:
+                await query.edit_message_text(
+                    "\u26A0\uFE0F Файл камер не найден. Загрузите заново."
+                )
             return
 
         # --- Камеры: запрос загрузки ---
@@ -2059,6 +2117,15 @@ async def _handle_document(
 
         # Сохраняем в сессию
         context.user_data["cameras_data"] = cameras
+
+        # Сохраняем файл на диск (кэш по региону)
+        reg_code = context.user_data.get("reg_code", "")
+        if reg_code and file_bytes:
+            try:
+                from camera_cache import save_camera_file
+                save_camera_file(reg_code, file_bytes)
+            except Exception as save_err:
+                logger.warning(f"Не удалось сохранить камеры в кэш: {save_err}")
 
         with_pk = sum(1 for c in cameras if c["has_piket"])
         without_pk = len(cameras) - with_pk
