@@ -167,7 +167,7 @@ async def _request_with_retries(
 
     Raises:
         ConnectionError: после исчерпания всех ретраев
-        httpx.HTTPStatusError: при HTTP-ошибке (без ретраев)
+        httpx.HTTPStatusError: при HTTP-ошибке 4xx (без ретраев) или 5xx после всех ретраев
     """
     client = await get_client()
     retries = max_retries if max_retries is not None else MAX_RETRIES
@@ -199,12 +199,20 @@ async def _request_with_retries(
             # открывал новый TCP-сокет, что на Amvera вызывало rate-limit.
 
         except httpx.HTTPStatusError as e:
-            error_desc = _classify_error(e)
-            body_preview = e.response.text[:300] if e.response.text else "пусто"
-            logger.error(
-                f"{description} | попытка {attempt} | {error_desc} | тело={body_preview}"
-            )
-            raise
+            status = e.response.status_code
+            # Серверные ошибки (5xx) — ретраим как сетевые
+            if status >= 500:
+                error_desc = _classify_error(e)
+                last_error = e
+                logger.warning(f"{description} | попытка {attempt}/{retries} | {error_desc}")
+            else:
+                # Клиентские ошибки (4xx) — не ретраим
+                error_desc = _classify_error(e)
+                body_preview = e.response.text[:300] if e.response.text else "пусто"
+                logger.error(
+                    f"{description} | попытка {attempt} | {error_desc} | тело={body_preview}"
+                )
+                raise
 
         except Exception as e:
             last_error = e
@@ -220,6 +228,10 @@ async def _request_with_retries(
             await asyncio.sleep(wait)
 
     # Все ретраи исчерпаны
+    if isinstance(last_error, httpx.HTTPStatusError):
+        # Серверная ошибка (5xx) — пробрасываем как есть, чтобы bot.py
+        # мог показать конкретный статус
+        raise last_error
     error_desc = _classify_error(last_error) if last_error else "неизвестная ошибка"
     raise ConnectionError(
         f"Не удалось выполнить запрос после {retries} попыток. "
