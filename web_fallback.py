@@ -4,52 +4,42 @@
 Используется как fallback, когда API ГИБДД (opendataapi) недоступен (5xx).
 
 Как работает:
-  1. POST на /export/getCardsXML — генерация файла на сервере
-  2. GET на /getFileById?data=<id> — скачивание XML
-  3. Парсинг XML в формат, совместимый с extract_accident_cards() из API
+  1. Открывает сайт в headless-браузере (Playwright)
+  2. Заполняет форму выгрузки (регион, даты, формат XML)
+  3. Нажимает «Скачать» и перехватывает скачивание
+  4. Распаковывает ZIP-архив и парсит XML
+  5. Конвертирует в формат, совместимый с extract_accident_cards() из API
 
-Ограничения сайта:
-  - Максимум 30 дней за один запрос
-  - Код региона короткий (19), а не API-формат (1119)
+Важно:
+  - Сайт защищён WAF, который блокирует прямые HTTP-запросы к /export/*.
+  - Поэтому используется headless-браузер с антидетект-мерами.
+  - Требуется установленный playwright (playwright install chromium).
+  - Максимум 31 день за один запрос.
+
+Ограничения:
+  - Код региона короткий (19), а не API-формат (1119).
+  - Работает только там, где доступен stat.gibdd.ru и установлен Chromium.
 """
 
 import asyncio
+import io
+import json
 import logging
+import time
 import xml.etree.ElementTree as ET
-from datetime import date, datetime, timedelta
+import zipfile
+from datetime import date, timedelta
 from typing import Any
-
-import httpx
 
 logger = logging.getLogger(__name__)
 
-# Список базовых URL для web-fallback, перебираются по порядку.
-# xn--80a7adb.xn--90adear.xn--p1ai — тот же домен, что использует API,
-# поэтому с хостинга он гарантированно доступен (в отличие от stat.gibdd.ru).
-WEB_FALLBACK_BASES = [
-    "http://stat.gibdd.ru",
-    "http://xn--80a7adb.xn--90adear.xn--p1ai",
-]
+# Базовый URL для web-fallback
+GIBDD_WEB_BASE = "http://stat.gibdd.ru"
 
-# Таймауты для веб-запросов (сайт генерирует файлы медленнее API)
-_WEB_CONNECT_TIMEOUT = 30
-_WEB_READ_TIMEOUT = 120  # генерация файла может занимать время
-
-# Задержка между запросами к сайту (не DDOS-ить)
-_WEB_THROTTLE_SEC = 2
-
-_last_web_request_time = 0.0
-
-
-async def _web_throttle():
-    """Минимальная пауза между запросами к сайту."""
-    global _last_web_request_time
-    import time
-    now = time.monotonic()
-    elapsed = now - _last_web_request_time
-    if elapsed < _WEB_THROTTLE_SEC:
-        await asyncio.sleep(_WEB_THROTTLE_SEC - elapsed)
-    _last_web_request_time = time.monotonic()
+# Таймауты
+_PAGE_LOAD_TIMEOUT = 30_000   # мс, загрузка страницы
+_FORM_INTERACT_TIMEOUT = 5   # секунд, ожидание между действиями
+_DOWNLOAD_TIMEOUT = 120_000  # мс, ожидание скачивания файла
 
 
 def api_reg_to_web_reg(api_reg: str) -> str:
@@ -60,7 +50,6 @@ def api_reg_to_web_reg(api_reg: str) -> str:
     Сайт использует короткие коды: 19, 22, 01...
 
     Правило: API код = "11" + двухзначный код сайта с ведущим нулём.
-    Следовательно: сайт_код = API_код[2:].lstrip("0") или "0" если все нули.
 
     Examples:
         "1119" -> "19"
@@ -68,9 +57,12 @@ def api_reg_to_web_reg(api_reg: str) -> str:
         "1101" -> "01"
         "1182" -> "82"
     """
-    short = api_reg[2:]  # убираем "11"
-    # Сохраняем ведущий ноль если есть (01, 02...), но убираем лишние
-    return short
+    return api_reg[2:]  # убираем "11"
+
+
+def _date_to_web_format(d: date) -> str:
+    """Конвертирует дату в формат сайта: dd.mm.yy."""
+    return d.strftime("%d.%m.%y")
 
 
 def _split_period_to_intervals(
@@ -80,9 +72,7 @@ def _split_period_to_intervals(
 ) -> list[tuple[date, date]]:
     """
     Разбивает период на интервалы не более max_days.
-
-    Сайт ГИБДД ограничивает один запрос 30 днями (проверка в JS:
-    range >= -30 означает разница >= -30 дней).
+    Сайт ГИБДД ограничивает один запрос ~31 днем.
     """
     intervals = []
     current = start_date
@@ -91,112 +81,6 @@ def _split_period_to_intervals(
         intervals.append((current, interval_end))
         current = interval_end + timedelta(days=1)
     return intervals
-
-
-def _month_to_dat(month: int, year: int) -> str:
-    """Конвертирует месяц и год в формат 'm.YYYY' для совместимости."""
-    return f"{month}.{year}"
-
-
-def _date_to_web_format(d: date) -> str:
-    """Конвертирует дату в формат сайта: dd.mm.yy."""
-    return d.strftime("%d.%m.%y")
-
-
-async def _request_file_generation(
-    client: httpx.AsyncClient,
-    base_url: str,
-    reg_web: str,
-    date_st: str,
-    date_end: str,
-) -> str:
-    """
-    POST-запрос на генерацию файла карточек ДТП.
-
-    Returns:
-        ID файла для скачивания через getFileById.
-
-    Raises:
-        Exception: если сервер не вернул file_id.
-    """
-    url = f"{base_url}/export/getCardsXML"
-
-    payload = {
-        "date_st": date_st,
-        "date_end": date_end,
-        "ParReg": "877",
-        "order": {"type": 1, "fieldName": "dat"},
-        "reg": int(reg_web),
-        "ind": 1,
-        "exportType": 1,
-    }
-
-    await _web_throttle()
-
-    logger.info(
-        f"Web fallback: генерация файла "
-        f"reg={reg_web}, {date_st} - {date_end}"
-    )
-
-    response = await client.post(
-        url,
-        json=payload,
-        timeout=httpx.Timeout(_WEB_CONNECT_TIMEOUT, read=_WEB_READ_TIMEOUT),
-    )
-
-    if response.status_code != 200:
-        raise Exception(
-            f"Сайт ГИБДД вернул HTTP {response.status_code} "
-            f"при генерации файла"
-        )
-
-    # Ответ: JSON с полем data (ID файла)
-    try:
-        result = response.json()
-    except Exception:
-        raise Exception(
-            f"Сайт вернул не-JSON: {response.text[:200]}"
-        )
-
-    file_id = result.get("data") if isinstance(result, dict) else None
-
-    if not file_id:
-        # Пустой ответ = нет данных за период
-        logger.info("Web fallback: сервер вернул пустой ответ (нет ДТП)")
-        return ""
-
-    return str(file_id)
-
-
-async def _download_file(
-    client: httpx.AsyncClient,
-    base_url: str,
-    file_id: str,
-) -> bytes:
-    """
-    Скачивает сгенерированный файл по ID.
-
-    Returns:
-        Содержимое файла (XML bytes).
-    """
-    url = f"{base_url}/getFileById"
-    params = {"data": file_id}
-
-    await _web_throttle()
-
-    response = await client.get(
-        url,
-        params=params,
-        timeout=httpx.Timeout(_WEB_CONNECT_TIMEOUT, read=_WEB_READ_TIMEOUT),
-    )
-
-    if response.status_code != 200:
-        raise Exception(
-            f"Сайт ГИБДД вернул HTTP {response.status_code} "
-            f"при скачивании файла (id={file_id})"
-        )
-
-    return response.content
 
 
 def _parse_xml_cards(xml_bytes: bytes) -> list[dict[str, Any]]:
@@ -216,22 +100,7 @@ def _parse_xml_cards(xml_bytes: bytes) -> list[dict[str, Any]]:
             <COORD_W>59.224894</COORD_W>
             <dor>А-114</dor>
             <dor_z>Федеральная</dor_z>
-            <dor_k></dor_k>
-            <k_ul>Вне НП</k_ul>
-            <km>122</km>
-            <m>480</m>
-            <NP></NP>
-            <street></street>
-            <house></house>
-            <s_dtp>940</s_dtp>
-            <sdor>Перегон</sdor>
-            <s_pch>Мокрое</s_pch>
-            <osv>Сумерки</osv>
-            <spog>Дождь</spog>
-            <ndu>Не установлены</ndu>
-            <OBJ_DTP>Перекрёсток</OBJ_DTP>
-            <factor>Сведения отсутствуют</factor>
-            <CHOM>Режим движения не изменялся</CHOM>
+            ...
             <ts_info>
               <color>Синий</color>
               <marka_ts>FORD</marka_ts>
@@ -243,47 +112,11 @@ def _parse_xml_cards(xml_bytes: bytes) -> list[dict[str, Any]]:
           <KUCH>2</KUCH>
           <POG>0</POG>
           <RAN>1</RAN>
-          <kartId>225722112</kartId>
         </tab>
-        ...
       </dtpCardList>
 
-    Конвертирует в формат API (для совместимости с gibdd_parser.py и
-    concentration_points.py):
-      {
-        "date_dtp": "30.06.2026",
-        "time": "20:50",
-        "dtpv": "Наезд на препятствие",
-        "coord_w": "59.224894",
-        "coord_l": "37.958488",
-        "district": "Череповецкий",
-        "empt_number": "190009147",
-        "dor": "А-114",
-        "dor_z": "Федеральная",
-        "dor_k": "",
-        "k_ul": "Вне НП",
-        "km": "122",
-        "m": "480",
-        "np": "",
-        "street": "",
-        "house": "",
-        "s_dtp": "940",
-        "k_ts": "1",
-        "k_uch": "2",
-        "pog": "0",
-        "ran": "1",
-        "dor_usl": {
-            "sdor": ["Перегон"],
-            "s_pch": "Мокрое",
-            "osv": "Сумерки",
-            "spog": ["Дождь"],
-            "ndu": ["Не установлены"],
-            "obj_dtp": ["Перекрёсток"],
-            "factor": ["Сведения отсутствуют"],
-            "chom": "Режим движения не изменялся",
-        },
-        "ts_info": [...],
-      }
+    Конвертирует в формат, совместимый с gibdd_parser.py и
+    concentration_points.py.
     """
     try:
         root = ET.fromstring(xml_bytes)
@@ -329,7 +162,6 @@ def _parse_xml_cards(xml_bytes: bytes) -> list[dict[str, Any]]:
         }
 
         # --- dor_usl (дорожные условия) ---
-        # В XML — строки, в API — массивы. Оборачиваем в список.
         sdor_text = _text(info, "sdor")
         spog_text = _text(info, "spog")
         ndu_text = _text(info, "ndu")
@@ -367,7 +199,6 @@ def _parse_xml_cards(xml_bytes: bytes) -> list[dict[str, Any]]:
             # Участники внутри ТС
             ts_uch_list = []
             for uch_el in ts_info_el.findall("ts_uch"):
-                # В XML поля NPDD и SOP_NPDD могут быть множественными
                 npdd_vals = []
                 sop_npdd_vals = []
                 for npdd_el in uch_el.findall("NPDD"):
@@ -403,6 +234,241 @@ def _parse_xml_cards(xml_bytes: bytes) -> list[dict[str, Any]]:
     return cards
 
 
+def _extract_xml_from_zip(zip_bytes: bytes) -> bytes:
+    """
+    Извлекает XML из ZIP-архива, который возвращает сайт.
+
+    Сайт всегда отдаёт ZIP с файлом «Карточки ДТП.xml» внутри.
+    """
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    except zipfile.BadZipFile:
+        # Возможно, это голый XML (если формат ответа изменится)
+        logger.warning("Web fallback: ответ не ZIP, пробуем как XML")
+        return zip_bytes
+
+    # Ищем XML-файл в архиве
+    xml_names = [n for n in zf.namelist() if n.endswith(".xml")]
+    if not xml_names:
+        raise Exception(
+            f"В ZIP-архиве нет XML-файлов: {zf.namelist()}"
+        )
+
+    xml_bytes = zf.read(xml_names[0])
+    logger.debug(
+        f"Web fallback: извлечён {xml_names[0]} "
+        f"({len(xml_bytes)} байт) из ZIP"
+    )
+    return xml_bytes
+
+
+# ---------------------------------------------------------------------------
+# Playwright-based загрузка (синхронная, вызывается из asyncio через to_thread)
+# ---------------------------------------------------------------------------
+
+def _download_cards_via_browser(
+    reg_web: str,
+    date_st: str,
+    date_end: str,
+) -> list[dict[str, Any]]:
+    """
+    Скачивает карточки ДТП через headless-браузер.
+
+    Использует Playwright для обхода WAF сайта stat.gibdd.ru.
+    Заполняет форму выгрузки и скачивает результат.
+
+    Args:
+        reg_web: код региона в формате сайта (строка, например "19").
+        date_st: начальная дата в формате dd.mm.yy.
+        date_end: конечная дата в формате dd.mm.yy.
+
+    Returns:
+        Список карточек ДТП.
+
+    Raises:
+        Exception: при ошибках браузера, формы или парсинга.
+    """
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/130.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1920, "height": 1080},
+            accept_downloads=True,
+        )
+        # Антидетект: убираем маркеры headless-режима
+        context.add_init_script(
+            'Object.defineProperty(navigator, "webdriver", '
+            '{get: () => undefined}); '
+            'delete window.__playwright; '
+            'delete window.__pw_manual;'
+        )
+        page = context.new_page()
+
+        try:
+            # 1. Загрузка главной страницы
+            page.goto(
+                GIBDD_WEB_BASE,
+                wait_until="networkidle",
+                timeout=_PAGE_LOAD_TIMEOUT,
+            )
+            time.sleep(_FORM_INTERACT_TIMEOUT)
+
+            # 2. Переход на вкладку «Выгрузка»
+            page.evaluate(
+                '() => { document.getElementById("downloadAction").click(); }'
+            )
+            time.sleep(_FORM_INTERACT_TIMEOUT + 2)
+
+            # 3. Открытие формы «Карточки ДТП»
+            page.evaluate('''() => {
+                document.querySelectorAll(".dui-links-list__title")
+                    .forEach(e => {
+                        if (e.textContent.trim() === "Карточки ДТП") e.click();
+                    });
+            }''')
+            time.sleep(_FORM_INTERACT_TIMEOUT + 1)
+
+            # 4. Заполнение формы
+            _hide_loader_js = """\
+                () => {\
+                    const l = document.getElementById('jquery-loader-background');\
+                    if (l) l.style.display = 'none';\
+                }\
+            """
+
+            def _hl(page):
+                page.evaluate(_hide_loader_js)
+
+            # Тип: «Карточки ДТП» (type 41, а не «Список» type 31)
+            _hl(page)
+            page.evaluate('''() => {
+                document.querySelectorAll(".dui-controls-btn")
+                    .forEach(b => {
+                        if (b.textContent.trim() === "Карточки ДТП") b.click();
+                    });
+            }''')
+            _hl(page)
+            time.sleep(1)
+
+            # Формат: XML
+            page.evaluate('''() => {
+                document.querySelectorAll(".dui-controls-btn")
+                    .forEach(b => {
+                        if (b.textContent.trim() === "XML") b.click();
+                    });
+            }''')
+            time.sleep(1)
+
+            # Регион (строковый ID!)
+            page.evaluate(
+                '(reg) => { if (typeof regDDList !== "undefined") regDDList.setSelect([reg]); }',
+                reg_web,
+            )
+            time.sleep(1)
+
+            # Показатель: ДТП (value="1")
+            page.evaluate('''() => {
+                if (typeof pokList !== "undefined") pokList.setSelect(["1"]);
+            }''')
+            time.sleep(1)
+
+            # Даты через jQuery datepicker (передаём как объект)
+            d_st_parts = date_st.split(".")
+            d_en_parts = date_end.split(".")
+            page.evaluate(
+                '''(d) => {
+                    if (typeof duiDatePickerStart !== "undefined") {
+                        $(duiDatePickerStart.datePickerInput).datepicker(
+                            "setDate", new Date(d.sy, d.sm, d.sd)
+                        );
+                        duiDatePickerStart.datePickerInput.onchange();
+                    }
+                    if (typeof duiDatePickerEnd !== "undefined") {
+                        $(duiDatePickerEnd.datePickerInput).datepicker(
+                            "setDate", new Date(d.ey, d.em, d.ed)
+                        );
+                        duiDatePickerEnd.datePickerInput.onchange();
+                    }
+                }''',
+                {
+                    "sd": int(d_st_parts[0]),
+                    "sm": int(d_st_parts[1]) - 1,
+                    "sy": 2000 + int(d_st_parts[2]),
+                    "ed": int(d_en_parts[0]),
+                    "em": int(d_en_parts[1]) - 1,
+                    "ey": 2000 + int(d_en_parts[2]),
+                },
+            )
+            time.sleep(1)
+
+            # Проверяем что кнопка активна
+            btn_ok = page.evaluate('''() => {
+                if (typeof downloadChecker === "function") downloadChecker(3);
+                const btn = Array.from(document.querySelectorAll(".dui-controls-btn"))
+                    .find(b => b.textContent.trim() === "Скачать");
+                return btn && !btn.disabled;
+            }''')
+
+            if not btn_ok:
+                raise Exception(
+                    "Кнопка «Скачать» неактивна — форма не заполнена корректно"
+                )
+
+            # 5. Нажимаем «Скачать» и перехватываем скачивание
+            logger.info(
+                f"Web fallback: скачивание reg={reg_web}, "
+                f"{date_st} - {date_end}"
+            )
+
+            with page.expect_download(timeout=_DOWNLOAD_TIMEOUT) as dl_info:
+                page.evaluate('''() => {
+                    const btn = Array.from(
+                        document.querySelectorAll(".dui-controls-btn")
+                    ).find(b => b.textContent.trim() === "Скачать");
+                    if (btn) btn.click();
+                }''')
+
+            download = dl_info.value
+
+            # 6. Сохраняем ZIP во временный файл и читаем
+            import tempfile
+            import os
+
+            with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+                tmp_path = tmp.name
+
+            try:
+                download.save_as(tmp_path)
+                with open(tmp_path, "rb") as f:
+                    zip_bytes = f.read()
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            logger.info(
+                f"Web fallback: скачан файл "
+                f"{download.suggested_filename} ({len(zip_bytes)} байт)"
+            )
+
+            # 7. Извлекаем XML из ZIP
+            xml_bytes = _extract_xml_from_zip(zip_bytes)
+
+            # 8. Парсим XML
+            cards = _parse_xml_cards(xml_bytes)
+            return cards
+
+        finally:
+            browser.close()
+
+
 async def fetch_dtp_via_web(
     dat: str,
     reg_api: str,
@@ -420,7 +486,7 @@ async def fetch_dtp_via_web(
         Список карточек ДТП в формате, совместимом с API.
 
     Raises:
-        Exception: при ошибках сети или парсинга.
+        Exception: при ошибках браузера, сети или парсинга.
     """
     month = int(dat.split(".")[0])
     year = int(dat.split(".")[1])
@@ -439,55 +505,30 @@ async def fetch_dtp_via_web(
 
     all_cards: list[dict[str, Any]] = []
 
-    async with httpx.AsyncClient() as client:
-        for interval_start, interval_end in intervals:
-            date_st = _date_to_web_format(interval_start)
-            date_end = _date_to_web_format(interval_end)
+    for interval_start, interval_end in intervals:
+        date_st = _date_to_web_format(interval_start)
+        date_end = _date_to_web_format(interval_end)
 
-            # Пробуем каждую базу по очереди, при ConnectTimeout — следующая
-            base_error: Exception | None = None
-            for base_url in WEB_FALLBACK_BASES:
-                try:
-                    # Шаг 1: генерация файла
-                    file_id = await _request_file_generation(
-                        client, base_url, reg_web, date_st, date_end
-                    )
+        try:
+            # Playwright работает синхронно — запускаем в потоке
+            cards = await asyncio.to_thread(
+                _download_cards_via_browser,
+                reg_web,
+                date_st,
+                date_end,
+            )
+            all_cards.extend(cards)
 
-                    if not file_id:
-                        # Нет данных за этот интервал — нормально
-                        break
+            logger.info(
+                f"Web fallback: {date_st}-{date_end} -> "
+                f"{len(cards)} ДТП"
+            )
 
-                    # Шаг 2: скачивание файла
-                    xml_bytes = await _download_file(client, base_url, file_id)
-
-                    # Шаг 3: парсинг XML
-                    cards = _parse_xml_cards(xml_bytes)
-                    all_cards.extend(cards)
-
-                    logger.info(
-                        f"Web fallback [{base_url}]: {date_st}-{date_end} -> "
-                        f"{len(cards)} ДТП (file_id={file_id[:20]}...)"
-                    )
-                    base_error = None  # успех
-                    break
-                except (httpx.ConnectTimeout, httpx.ConnectError) as e:
-                    base_error = e
-                    logger.warning(
-                        f"Web fallback: {base_url} недоступен "
-                        f"({type(e).__name__}), пробую следующий..."
-                    )
-                    continue
-                except Exception as e:
-                    logger.error(
-                        f"Web fallback: ошибка {date_st}-{date_end}: {e}"
-                    )
-                    raise
-
-            if base_error is not None:
-                logger.error(
-                    f"Web fallback: все базы недоступны для {date_st}-{date_end}"
-                )
-                raise base_error
+        except Exception as e:
+            logger.error(
+                f"Web fallback: ошибка {date_st}-{date_end}: {e}"
+            )
+            raise
 
     logger.info(
         f"Web fallback: всего загружено {len(all_cards)} ДТП "
@@ -498,28 +539,28 @@ async def fetch_dtp_via_web(
 
 
 def _is_server_unreachable(e: Exception) -> bool:
-    """Проверяет, указывает ли ошибка на полную недоступность сервера.
+    """Проверяет, указывает ли ошибка на полную недоступность.
 
-    Если сервер unreachable — нет смысла пробовать остальные месяцы.
+    Для web-fallback через браузер это означает:
+    - Ошибки Playwright (браузер не установлен, crash)
+    - Ошибки подключения к сайту
     """
-    import httpx
-    # Непосредственная ошибка подключения
-    if isinstance(e, (httpx.ConnectTimeout, httpx.ConnectError)):
+    msg = str(e).lower()
+    # Playwright ошибки
+    if "playwright" in msg or "chromium" in msg:
         return True
-    # Обёрнутая в ConnectionError (как в api_client._request_with_retries)
-    cause = e.__cause__
-    if cause is not None and isinstance(cause, (httpx.ConnectTimeout, httpx.ConnectError)):
+    # Таймауты
+    if "timeout" in msg and ("navigate" in msg or "load" in msg):
         return True
     return False
 
 
 def _is_server_error(e: Exception) -> bool:
-    """Проверяет, является ли ошибка HTTP 5xx от сервера ГИБДД."""
-    import httpx
-    # Сайт вернул HTTP 500 и мы пробросили Exception с текстом
-    if isinstance(e, Exception) and "HTTP 500" in str(e):
+    """Проверяет, является ли ошибка серверной (5xx)."""
+    msg = str(e)
+    if "HTTP 500" in msg or "HTTP 502" in msg or "HTTP 503" in msg:
         return True
-    if isinstance(e, httpx.HTTPStatusError) and e.response.status_code >= 500:
+    if "Ошибка на стороне сервера" in msg:
         return True
     return False
 
@@ -536,13 +577,12 @@ async def fetch_dtp_via_web_period(
     Полный аналог _fetch_cards_for_period() из bot.py, но через сайт.
 
     Fail-fast: если первый запрос падает с ошибкой подключения
-    (ConnectTimeout/ConnectError) или HTTP 500 — цикл прерывается,
-    т.к. это означает полную недоступность сервера.
+    или HTTP 500 — цикл прерывается.
     """
     cards: list[dict] = []
     errors: list[str] = []
     consecutive_server_failures = 0
-    _CONSECUTIVE_FAILURE_LIMIT = 2  # после N подряд идущих сбоев — стоп
+    _CONSECUTIVE_FAILURE_LIMIT = 2
 
     for i, dat in enumerate(dat_list, start=1):
         month_num = int(dat.split(".")[0])
@@ -560,40 +600,37 @@ async def fetch_dtp_via_web_period(
             extracted = await fetch_dtp_via_web(dat=dat, reg_api=reg_api)
             cards.extend(extracted)
             logger.info(f"  {log_prefix}: {dat} -> {len(extracted)} ДТП")
-            # Успешный запрос — сбрасываем счётчик
             consecutive_server_failures = 0
         except Exception as e:
-            from api_client import error_brief
-            err_msg = f"{month_name} {year}: {error_brief(e)}"
+            try:
+                from api_client import error_brief
+                err_msg = f"{month_name} {year}: {error_brief(e)}"
+            except ImportError:
+                err_msg = f"{month_name} {year}: {e}"
             errors.append(err_msg)
             logger.error(
                 f"  {log_prefix}: {dat} -> ОШИБКА [{type(e).__name__}] "
-                f"{error_brief(e)}"
+                f"{err_msg}"
             )
 
-            # Fail-fast: сервер полностью недоступен
             if _is_server_unreachable(e):
                 logger.warning(
-                    f"  {log_prefix}: сервер stat.gibdd.ru недоступен "
-                    f"(ошибка подключения). Прерываю выгрузку остальных "
+                    f"  {log_prefix}: сервер stat.gibdd.ru недоступен. "
+                    f"Прерываю выгрузку остальных "
                     f"{len(dat_list) - i} месяцев."
                 )
                 break
 
-            # Fail-fast: подряд идущие HTTP 500 (сервер падает)
             if _is_server_error(e):
                 consecutive_server_failures += 1
                 if consecutive_server_failures >= _CONSECUTIVE_FAILURE_LIMIT:
                     logger.warning(
                         f"  {log_prefix}: {consecutive_server_failures} "
-                        f"подряд идущих HTTP-ошибок сервера. "
-                        f"Прерываю выгрузку остальных "
-                        f"{len(dat_list) - i} месяцев."
+                        f"подряд идущих ошибок сервера. "
+                        f"Прерываю выгрузку."
                     )
                     break
             else:
-                # Другие ошибки (парсинг и т.д.) — тоже считаем как сбой сервера,
-                # но только если первый запрос
                 if i == 1 and len(cards) == 0:
                     logger.warning(
                         f"  {log_prefix}: ошибка при первом запросе. "

@@ -2497,7 +2497,31 @@ def main() -> None:
     print("  Текст — 'Вологодская область за 2025 год'")
     print("  Нажмите Ctrl+C для остановки.\n")
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Ретрай при запуске: Telegram API может быть временно недоступен
+    # с хостинга (ConnectTimeout на get_me). Без ретрая бот крашится
+    # и Amvera перезапускает его, создавая Conflict с ещё живым экземпляром.
+    _STARTUP_RETRIES = 5
+    _STARTUP_DELAYS = [5, 10, 15, 30, 60]
+
+    for attempt in range(1, _STARTUP_RETRIES + 1):
+        try:
+            app.run_polling(allowed_updates=Update.ALL_TYPES)
+            return  # нормальный выход (Ctrl+C или shutdown)
+        except (TimedOut, NetworkError) as e:
+            if attempt < _STARTUP_RETRIES:
+                delay = _STARTUP_DELAYS[attempt - 1]
+                logger.warning(
+                    f"Telegram API недоступен при запуске ({type(e).__name__}). "
+                    f"Попытка {attempt}/{_STARTUP_RETRIES}, повтор через {delay}с..."
+                )
+                import time as _time
+                _time.sleep(delay)
+            else:
+                logger.error(
+                    f"Telegram API недоступен после {_STARTUP_RETRIES} попыток. "
+                    f"Останавливаюсь."
+                )
+                raise
 
 
 if __name__ == "__main__":
