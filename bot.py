@@ -954,13 +954,16 @@ async def _start_fetching(
     dat_list = period.get_dat_list()
     total_months = len(dat_list)
 
-    await query.edit_message_text(
-        f"Выгрузка данных:\n\n"
-        f"Регион: {reg_name}\n"
-        f"Период: {period.label}\n"
-        f"Запросов: {total_months}\n\n"
-        f"Подготовка..."
-    )
+    try:
+        await _tg_retry(lambda: query.edit_message_text(
+            f"Выгрузка данных:\n\n"
+            f"Регион: {reg_name}\n"
+            f"Период: {period.label}\n"
+            f"Запросов: {total_months}\n\n"
+            f"Подготовка..."
+        ), "edit_message_text (старт выгрузки)")
+    except (TimedOut, NetworkError):
+        logger.warning("Не удалось отправить стартовое сообщение выгрузки")
 
     # Прогресс-колбэк для обновления сообщения в Telegram
     async def _progress(i: int, total: int, month_name: str, year: str):
@@ -1000,10 +1003,13 @@ async def _start_fetching(
     # Проверяем результат
     if not all_cards and errors:
         error_text = "\n".join(f"- {e}" for e in errors)
-        await query.edit_message_text(
-            f"Не удалось получить данные.\n\nОшибки:\n{error_text}\n\n"
-            f"Попробуйте позже или измените параметры."
-        )
+        try:
+            await _tg_retry(lambda: query.edit_message_text(
+                f"Не удалось получить данные.\n\nОшибки:\n{error_text}\n\n"
+                f"Попробуйте позже или измените параметры."
+            ), "edit_message_text (ошибки выгрузки)")
+        except (TimedOut, NetworkError):
+            logger.warning("Не удалось отправить сообщение об ошибках выгрузки")
         return
 
     # Обработка и генерация Excel

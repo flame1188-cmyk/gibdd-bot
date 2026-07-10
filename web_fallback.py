@@ -32,11 +32,15 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# Базовый URL для web-fallback
-GIBDD_WEB_BASE = "http://stat.gibdd.ru"
+# Базовые URL для web-fallback (перебираются по порядку)
+# Punycode-домен приоритетнее: он доступен с хостингов, блокирующих stat.gibdd.ru
+_GIBDD_WEB_URLS = [
+    "http://xn--80a7adb.xn--90adear.xn--p1ai",  # punycode (доступен с Amvera)
+    "http://stat.gibdd.ru",                       # основное имя (может быть заблокировано хостингом)
+]
 
 # Таймауты
-_WEB_CONNECT_TIMEOUT = 15  # секунд, подключение
+_WEB_CONNECT_TIMEOUT = 10  # секунд, подключение (короткий — быстро пробуем следующий домен)
 _WEB_READ_TIMEOUT = 120    # секунд, чтение ответа / скачивание
 
 # Заголовки, имитирующие браузер
@@ -273,28 +277,18 @@ def _extract_xml_from_zip(zip_bytes: bytes) -> bytes:
 # HTTP-based загрузка (без браузера, через httpx)
 # ---------------------------------------------------------------------------
 
-def _download_cards_via_http(
+def _try_download_via_base(
+    base_url: str,
     reg_web: str,
     date_st: str,
     date_end: str,
 ) -> list[dict[str, Any]]:
     """
-    Скачивает карточки ДТП через HTTP-запросы к сайту stat.gibdd.ru.
-
-    Двухшаговый процесс:
-      1. POST /export/getCardsXML → получаем file ID
-      2. GET /getFileById?data=<id> → скачиваем ZIP с XML
-
-    Args:
-        reg_web: код региона в формате сайта (строка, например "19").
-        date_st: начальная дата в формате dd.mm.YYYY.
-        date_end: конечная дата в формате dd.mm.YYYY.
-
-    Returns:
-        Список карточек ДТП.
+    Пытается скачать карточки ДТП через один конкретный base_url.
 
     Raises:
-        Exception: при ошибках сети, 403, или парсинга.
+        httpx.ConnectError / httpx.ConnectTimeout: если домен недоступен.
+        Exception: при серверных ошибках (403, 500 и т.д.).
     """
     timeout = httpx.Timeout(
         connect=_WEB_CONNECT_TIMEOUT,
@@ -303,56 +297,36 @@ def _download_cards_via_http(
         pool=30,
     )
 
-    with httpx.Client(base_url=GIBDD_WEB_BASE, timeout=timeout) as client:
+    with httpx.Client(base_url=base_url, timeout=timeout) as client:
         # Шаг 0: Получаем сессию (JSESSIONID)
-        try:
-            client.get("/", headers=_BROWSER_HEADERS)
-        except httpx.ConnectError as e:
-            raise Exception(
-                f"stat.gibdd.ru недоступен: {e}"
-            ) from e
-        except httpx.ConnectTimeout:
-            raise Exception(
-                "Таймаут подключения к stat.gibdd.ru "
-                f"(>{_WEB_CONNECT_TIMEOUT}с)"
-            )
+        client.get("/", headers=_BROWSER_HEADERS)
 
         # Шаг 1: Запрашиваем генерацию файла
         inner = {
             "date_st": date_st,
             "date_end": date_end,
-            "ParReg": "877",   # Российская Федерация
+            "ParReg": "877",
             "order": {"type": 1, "fieldName": "dat"},
             "reg": [reg_web],
-            "ind": "1",         # Все ДТП
-            "exportType": 1,   # По показателям
+            "ind": "1",
+            "exportType": 1,
         }
 
-        try:
-            resp = client.post(
-                "/export/getCardsXML",
-                headers={
-                    **_BROWSER_HEADERS,
-                    "Content-Type": "application/json; charset=utf-8",
-                    "Referer": f"{GIBDD_WEB_BASE}/",
-                },
-                json={"data": json.dumps(inner)},
-            )
-        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
-            raise Exception(
-                f"Ошибка подключения к stat.gibdd.ru: {e}"
-            ) from e
+        resp = client.post(
+            "/export/getCardsXML",
+            headers={
+                **_BROWSER_HEADERS,
+                "Content-Type": "application/json; charset=utf-8",
+                "Referer": f"{base_url}/",
+            },
+            json={"data": json.dumps(inner)},
+        )
 
         if resp.status_code == 403:
-            raise Exception(
-                "Доступ запрещён (403). Сайт заблокировал запрос. "
-                "Возможно, WAF определил автоматический запрос."
-            )
+            raise Exception("Доступ запрещён (403)")
 
         if resp.status_code != 200:
-            raise Exception(
-                f"HTTP {resp.status_code} при запросе выгрузки"
-            )
+            raise Exception(f"HTTP {resp.status_code} при запросе выгрузки")
 
         try:
             file_id = resp.json().get("data", "")
@@ -362,7 +336,6 @@ def _download_cards_via_http(
             )
 
         if not file_id:
-            # Пустой результат — ДТП за период нет, это не ошибка
             logger.info(
                 f"Web fallback: reg={reg_web}, "
                 f"{date_st}-{date_end} -> нет данных (пустой ответ)"
@@ -375,39 +348,80 @@ def _download_cards_via_http(
             f"{date_st} - {date_end} (file_id={file_id})"
         )
 
-        try:
-            dl = client.get(
-                f"/getFileById?data={file_id}",
-                headers=_BROWSER_HEADERS,
-            )
-        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
-            raise Exception(
-                f"Ошибка скачивания файла: {e}"
-            ) from e
+        dl = client.get(
+            f"/getFileById?data={file_id}",
+            headers=_BROWSER_HEADERS,
+        )
 
         if dl.status_code == 403:
-            raise Exception(
-                "Доступ запрещён при скачивании (403). "
-                "Сессия могла истечь."
-            )
+            raise Exception("Доступ запрещён при скачивании (403)")
 
         if dl.status_code != 200:
-            raise Exception(
-                f"HTTP {dl.status_code} при скачивании файла"
-            )
+            raise Exception(f"HTTP {dl.status_code} при скачивании файла")
 
         zip_bytes = dl.content
-        logger.info(
-            f"Web fallback: скачан файл "
-            f"({len(zip_bytes)} байт)"
-        )
+        logger.info(f"Web fallback: скачан файл ({len(zip_bytes)} байт)")
 
         # Шаг 3: Извлекаем XML из ZIP
         xml_bytes = _extract_xml_from_zip(zip_bytes)
 
         # Шаг 4: Парсим XML
-        cards = _parse_xml_cards(xml_bytes)
-        return cards
+        return _parse_xml_cards(xml_bytes)
+
+
+def _download_cards_via_http(
+    reg_web: str,
+    date_st: str,
+    date_end: str,
+) -> list[dict[str, Any]]:
+    """
+    Скачивает карточки ДТП через HTTP к сайту ГИБДД.
+
+    Перебирает несколько доменов по порядку (punycode → stat.gibdd.ru).
+    Если первый домен недоступен (ConnectTimeout/ConnectError) —
+    пробует следующий.
+
+    Args:
+        reg_web: код региона (например "19").
+        date_st: начальная дата dd.mm.YYYY.
+        date_end: конечная дата dd.mm.YYYY.
+
+    Returns:
+        Список карточек ДТП.
+
+    Raises:
+        Exception: если все домены недоступны или серверная ошибка.
+    """
+    last_exc: Exception | None = None
+
+    for base_url in _GIBDD_WEB_URLS:
+        try:
+            cards = _try_download_via_base(
+                base_url, reg_web, date_st, date_end,
+            )
+            if cards:
+                logger.info(
+                    f"Web fallback: успешно через {base_url}"
+                )
+            return cards
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            logger.warning(
+                f"Web fallback: {base_url} недоступен, "
+                f"пробую следующий домен..."
+            )
+            last_exc = e
+            continue
+        except Exception:
+            # Серверная ошибка (403, 500 и т.д.) — не пробуем другой домен,
+            # это одна и та же серверная инфраструктура
+            raise
+
+    # Ни один домен не доступен
+    raise Exception(
+        f"Все домены ГИБДД недоступны "
+        f"(>{_WEB_CONNECT_TIMEOUT}с): "
+        + ", ".join(_GIBDD_WEB_URLS)
+    ) from last_exc
 
 
 async def fetch_dtp_via_web(
