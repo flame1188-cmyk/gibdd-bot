@@ -89,18 +89,42 @@ _regions_cache: list[dict[str, str]] | None = None
 
 
 async def ensure_regions_loaded() -> list[dict[str, str]]:
-    """Загружает справочник регионов при первом обращении (с кэшированием)."""
+    """Загружает справочник регионов при первом обращении (с кэшированием).
+
+    Порядок:
+      1. Модульный кэш (переменная _regions_cache)
+      2. API ГИБДД (при успехе — сохраняет в файловый кэш)
+      3. Файловый кэш (data/regions_cache.json)
+    """
     global _regions_cache
     if _regions_cache is not None:
         return _regions_cache
 
     from api_client import fetch_regions
+    from regions_cache import save_regions_to_cache, load_regions_from_cache
+
+    # --- Пытаемся загрузить с API ---
     try:
         _regions_cache = await fetch_regions()
         logger.info(f"Справочник регионов загружен: {len(_regions_cache)} записей")
+        # Сохраняем в файловый кэш для будущих запусков
+        if _regions_cache:
+            save_regions_to_cache(_regions_cache)
+        return _regions_cache
     except Exception as e:
         logger.error(f"Не удалось загрузить справочник регионов: {e}")
-        _regions_cache = []
+
+    # --- Fallback: файловый кэш ---
+    logger.info("Попытка загрузить справочник регионов из файлового кэша...")
+    cached = load_regions_from_cache()
+    if cached:
+        _regions_cache = cached
+        logger.warning(
+            f"API недоступен, использован кэш: {len(cached)} записей"
+        )
+        return _regions_cache
+
+    _regions_cache = []
     return _regions_cache
 
 

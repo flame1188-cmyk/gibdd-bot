@@ -240,6 +240,7 @@ async def _fetch_cards_for_period(
     reg_code: str,
     log_prefix: str,
     progress_callback=None,
+    notify_callback=None,
 ) -> tuple[list[dict], list[str]]:
     """Загружает карточки ДТП за список месяцев с GIBDD API.
 
@@ -255,6 +256,9 @@ async def _fetch_cards_for_period(
         log_prefix: Префикс для логов (например "Аналитика", "Очаги")
         progress_callback: Опциональная async-функция(i, total, month_name, year)
                            для обновления статуса
+        notify_callback: Опциональная async-функция(str) для одноразовых
+                         уведомлений пользователю (например, о переключении
+                         на запасной метод)
 
     Returns:
         (cards, errors) — список карточек ДТП и список строк-ошибок
@@ -283,13 +287,20 @@ async def _fetch_cards_for_period(
             except _httpx.HTTPStatusError as e:
                 status = e.response.status_code
                 if status >= 500:
-                    # Серверная ошибка — переключаемся на веб-fallback
+                    use_web_fallback = True
                     logger.warning(
                         f"  {log_prefix}: {dat} -> HTTP {status}, "
                         f"переключаюсь на запасной метод (сайт ГИБДД)"
                     )
-                    use_web_fallback = True
-                    # Добавляем текущий месяц в список для обработки через fallback
+                    if notify_callback:
+                        try:
+                            await notify_callback(
+                                "\u26A0\uFE0F API ГИБДД недоступен (HTTP "
+                                f"{status}).\n"
+                                "Переключаюсь на запасной метод (сайт)..."
+                            )
+                        except Exception:
+                            pass
                     remaining_dats = [dat] + dat_list[i:]
                     from web_fallback import fetch_dtp_via_web_period
                     fb_cards, fb_errors = await fetch_dtp_via_web_period(
@@ -308,6 +319,32 @@ async def _fetch_cards_for_period(
                         f"  {log_prefix}: {dat} -> ОШИБКА "
                         f"[{type(e).__name__}] {error_brief(e)}"
                     )
+            except ConnectionError as e:
+                # Сетевая ошибка / таймаут — переключаемся на fallback
+                use_web_fallback = True
+                logger.warning(
+                    f"  {log_prefix}: {dat} -> {error_brief(e)}, "
+                    f"переключаюсь на запасной метод (сайт ГИБДД)"
+                )
+                if notify_callback:
+                    try:
+                        await notify_callback(
+                            "\u26A0\uFE0F API ГИБДД недоступен "
+                            f"({error_brief(e)}).\n"
+                            "Переключаюсь на запасной метод (сайт)..."
+                        )
+                    except Exception:
+                        pass
+                remaining_dats = [dat] + dat_list[i:]
+                from web_fallback import fetch_dtp_via_web_period
+                fb_cards, fb_errors = await fetch_dtp_via_web_period(
+                    remaining_dats, reg_code,
+                    log_prefix=f"{log_prefix} [сайт]",
+                    progress_callback=progress_callback,
+                )
+                cards.extend(fb_cards)
+                errors.extend(fb_errors)
+                break  # fallback обработал все оставшиеся месяцы
             except Exception as e:
                 err_msg = f"{month_name} {year}: {error_brief(e)}"
                 errors.append(err_msg)
@@ -517,11 +554,19 @@ async def _show_region_keyboard(
 
     regions = await _load_regions_if_needed(context)
     if not regions:
-        text = "Не удалось загрузить список регионов. Попробуйте позже."
+        text = (
+            "Не удалось загрузить список регионов.\n\n"
+            "Сервер ГИБДД недоступен, а локальный кэш пуст.\n\n"
+            "Возможные действия:\n"
+            "• Подождите и попробуйте позже\n"
+            "• Используйте текстовый формат:\n"
+            "  <code>месяц.год код_региона</code>\n"
+            "  Например: <code>6.2026 1119</code>"
+        )
         if msg:
-            await msg.edit_text(text)
+            await msg.edit_text(text, parse_mode="HTML")
         else:
-            await update.callback_query.edit_message_text(text)
+            await update.callback_query.edit_message_text(text, parse_mode="HTML")
         return
 
     keyboard = build_region_keyboard(regions, page)
@@ -901,7 +946,8 @@ async def _start_fetching(
 ) -> None:
     """
     Начинает выгрузку данных для выбранного региона и периода.
-    Поддерживает несколько месяцев (последовательные запросы).
+    Использует _fetch_cards_for_period, который при 5xx
+    автоматически переключается на запасной метод через сайт ГИБДД.
     """
     reg_code = context.user_data.get("reg_code", "")
     reg_name = context.user_data.get("reg_name", "Регион " + reg_code)
@@ -916,41 +962,40 @@ async def _start_fetching(
         f"Подготовка..."
     )
 
-    # Выполняем запросы
-    all_cards = []
-    errors = []
-
-    for i, dat in enumerate(dat_list, start=1):
-        # Обновляем прогресс
-        month_num = int(dat.split(".")[0])
-        month_name = MONTH_FULL.get(month_num, dat)
-
-        progress_bar = _make_progress_bar(i, total_months)
+    # Прогресс-колбэк для обновления сообщения в Telegram
+    async def _progress(i: int, total: int, month_name: str, year: str):
+        progress_bar = _make_progress_bar(i, total)
         status_text = (
             f"Выгрузка данных:\n\n"
             f"Регион: {reg_name}\n"
             f"Период: {period.label}\n\n"
-            f"{progress_bar} {i}/{total_months}\n"
-            f"Запрос: {month_name} {period.year}..."
+            f"{progress_bar} {i}/{total}\n"
+            f"Запрос: {month_name} {year}..."
         )
-
         try:
             await query.edit_message_text(status_text)
         except Exception:
-            pass  # Не критично, если не удалось обновить
+            pass  # Не критично
 
-        # API-запрос
+    # Уведомление о переключении на запасной метод
+    async def _notify(text: str):
         try:
-            api_response = await fetch_dtp_data(dat=dat, reg=reg_code, pok="1")
-            cards = extract_accident_cards(api_response)
-            all_cards.extend(cards)
-            logger.info(f"  {dat}: {len(cards)} ДТП")
-        except Exception as e:
-            error_msg = f"{month_name} {period.year}: {error_brief(e)}"
-            errors.append(error_msg)
-            logger.error(
-                f"  {dat}: ОШИБКА [{type(e).__name__}] {error_brief(e)}"
+            await query.edit_message_text(
+                f"Выгрузка данных:\n\n"
+                f"Регион: {reg_name}\n"
+                f"Период: {period.label}\n\n"
+                f"{text}"
             )
+        except Exception:
+            pass
+
+    # Загружаем данные (с автоматическим web-fallback при 5xx)
+    all_cards, errors = await _fetch_cards_for_period(
+        dat_list, reg_code,
+        log_prefix="Выгрузка",
+        progress_callback=_progress,
+        notify_callback=_notify,
+    )
 
     # Проверяем результат
     if not all_cards and errors:
