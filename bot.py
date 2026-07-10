@@ -303,26 +303,14 @@ async def _fetch_cards_for_period(
                             pass
                     remaining_dats = [dat] + dat_list[i:]
                     from web_fallback import fetch_dtp_via_web_period
-                    try:
-                        fb_cards, fb_errors = await fetch_dtp_via_web_period(
-                            remaining_dats, reg_code,
-                            log_prefix=f"{log_prefix} [сайт]",
-                            progress_callback=progress_callback,
-                        )
-                        cards.extend(fb_cards)
-                        errors.extend(fb_errors)
-                    except RuntimeError as fb_err:
-                        # playwright не установлен на хостинге
-                        errors.append(str(fb_err))
-                        logger.error(f"  {log_prefix}: web-fallback недоступен: {fb_err}")
-                        if notify_callback:
-                            try:
-                                await notify_callback(
-                                    f"\u274C {fb_err}"
-                                )
-                            except Exception:
-                                pass
-                    break  # fallback обработал все оставшиеся (или упал)
+                    fb_cards, fb_errors = await fetch_dtp_via_web_period(
+                        remaining_dats, reg_code,
+                        log_prefix=f"{log_prefix} [сайт]",
+                        progress_callback=progress_callback,
+                    )
+                    cards.extend(fb_cards)
+                    errors.extend(fb_errors)
+                    break  # fallback обработал все оставшиеся месяцы
                 else:
                     # Клиентская ошибка — не ретраим
                     err_msg = f"{month_name} {year}: {error_brief(e)}"
@@ -349,26 +337,14 @@ async def _fetch_cards_for_period(
                         pass
                 remaining_dats = [dat] + dat_list[i:]
                 from web_fallback import fetch_dtp_via_web_period
-                try:
-                    fb_cards, fb_errors = await fetch_dtp_via_web_period(
-                        remaining_dats, reg_code,
-                        log_prefix=f"{log_prefix} [сайт]",
-                        progress_callback=progress_callback,
-                    )
-                    cards.extend(fb_cards)
-                    errors.extend(fb_errors)
-                except RuntimeError as fb_err:
-                    # playwright не установлен на хостинге
-                    errors.append(str(fb_err))
-                    logger.error(f"  {log_prefix}: web-fallback недоступен: {fb_err}")
-                    if notify_callback:
-                        try:
-                            await notify_callback(
-                                f"\u274C {fb_err}"
-                            )
-                        except Exception:
-                            pass
-                break  # fallback обработал все оставшиеся (или упал)
+                fb_cards, fb_errors = await fetch_dtp_via_web_period(
+                    remaining_dats, reg_code,
+                    log_prefix=f"{log_prefix} [сайт]",
+                    progress_callback=progress_callback,
+                )
+                cards.extend(fb_cards)
+                errors.extend(fb_errors)
+                break  # fallback обработал все оставшиеся месяцы
             except Exception as e:
                 err_msg = f"{month_name} {year}: {error_brief(e)}"
                 errors.append(err_msg)
