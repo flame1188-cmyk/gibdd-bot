@@ -23,7 +23,13 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-GIBDD_WEB_BASE = "http://stat.gibdd.ru"
+# Список базовых URL для web-fallback, перебираются по порядку.
+# xn--80a7adb.xn--90adear.xn--p1ai — тот же домен, что использует API,
+# поэтому с хостинга он гарантированно доступен (в отличие от stat.gibdd.ru).
+WEB_FALLBACK_BASES = [
+    "http://stat.gibdd.ru",
+    "http://xn--80a7adb.xn--90adear.xn--p1ai",
+]
 
 # Таймауты для веб-запросов (сайт генерирует файлы медленнее API)
 _WEB_CONNECT_TIMEOUT = 30
@@ -99,6 +105,7 @@ def _date_to_web_format(d: date) -> str:
 
 async def _request_file_generation(
     client: httpx.AsyncClient,
+    base_url: str,
     reg_web: str,
     date_st: str,
     date_end: str,
@@ -112,7 +119,7 @@ async def _request_file_generation(
     Raises:
         Exception: если сервер не вернул file_id.
     """
-    url = f"{GIBDD_WEB_BASE}/export/getCardsXML"
+    url = f"{base_url}/export/getCardsXML"
 
     payload = {
         "date_st": date_st,
@@ -163,6 +170,7 @@ async def _request_file_generation(
 
 async def _download_file(
     client: httpx.AsyncClient,
+    base_url: str,
     file_id: str,
 ) -> bytes:
     """
@@ -171,7 +179,7 @@ async def _download_file(
     Returns:
         Содержимое файла (XML bytes).
     """
-    url = f"{GIBDD_WEB_BASE}/getFileById"
+    url = f"{base_url}/getFileById"
     params = {"data": file_id}
 
     await _web_throttle()
@@ -436,33 +444,50 @@ async def fetch_dtp_via_web(
             date_st = _date_to_web_format(interval_start)
             date_end = _date_to_web_format(interval_end)
 
-            try:
-                # Шаг 1: генерация файла
-                file_id = await _request_file_generation(
-                    client, reg_web, date_st, date_end
-                )
+            # Пробуем каждую базу по очереди, при ConnectTimeout — следующая
+            base_error: Exception | None = None
+            for base_url in WEB_FALLBACK_BASES:
+                try:
+                    # Шаг 1: генерация файла
+                    file_id = await _request_file_generation(
+                        client, base_url, reg_web, date_st, date_end
+                    )
 
-                if not file_id:
-                    # Нет данных за этот интервал — нормально
+                    if not file_id:
+                        # Нет данных за этот интервал — нормально
+                        break
+
+                    # Шаг 2: скачивание файла
+                    xml_bytes = await _download_file(client, base_url, file_id)
+
+                    # Шаг 3: парсинг XML
+                    cards = _parse_xml_cards(xml_bytes)
+                    all_cards.extend(cards)
+
+                    logger.info(
+                        f"Web fallback [{base_url}]: {date_st}-{date_end} -> "
+                        f"{len(cards)} ДТП (file_id={file_id[:20]}...)"
+                    )
+                    base_error = None  # успех
+                    break
+                except (httpx.ConnectTimeout, httpx.ConnectError) as e:
+                    base_error = e
+                    logger.warning(
+                        f"Web fallback: {base_url} недоступен "
+                        f"({type(e).__name__}), пробую следующий..."
+                    )
                     continue
+                except Exception as e:
+                    logger.error(
+                        f"Web fallback: ошибка {date_st}-{date_end}: {e}"
+                    )
+                    raise
 
-                # Шаг 2: скачивание файла
-                xml_bytes = await _download_file(client, file_id)
-
-                # Шаг 3: парсинг XML
-                cards = _parse_xml_cards(xml_bytes)
-                all_cards.extend(cards)
-
-                logger.info(
-                    f"Web fallback: {date_st}-{date_end} -> "
-                    f"{len(cards)} ДТП (file_id={file_id[:20]}...)"
-                )
-
-            except Exception as e:
+            if base_error is not None:
                 logger.error(
-                    f"Web fallback: ошибка {date_st}-{date_end}: {e}"
+                    f"Web fallback: все базы недоступны для {date_st}-{date_end}"
                 )
-                raise
+                raise base_error
 
     logger.info(
         f"Web fallback: всего загружено {len(all_cards)} ДТП "
@@ -470,6 +495,33 @@ async def fetch_dtp_via_web(
     )
 
     return all_cards
+
+
+def _is_server_unreachable(e: Exception) -> bool:
+    """Проверяет, указывает ли ошибка на полную недоступность сервера.
+
+    Если сервер unreachable — нет смысла пробовать остальные месяцы.
+    """
+    import httpx
+    # Непосредственная ошибка подключения
+    if isinstance(e, (httpx.ConnectTimeout, httpx.ConnectError)):
+        return True
+    # Обёрнутая в ConnectionError (как в api_client._request_with_retries)
+    cause = e.__cause__
+    if cause is not None and isinstance(cause, (httpx.ConnectTimeout, httpx.ConnectError)):
+        return True
+    return False
+
+
+def _is_server_error(e: Exception) -> bool:
+    """Проверяет, является ли ошибка HTTP 5xx от сервера ГИБДД."""
+    import httpx
+    # Сайт вернул HTTP 500 и мы пробросили Exception с текстом
+    if isinstance(e, Exception) and "HTTP 500" in str(e):
+        return True
+    if isinstance(e, httpx.HTTPStatusError) and e.response.status_code >= 500:
+        return True
+    return False
 
 
 async def fetch_dtp_via_web_period(
@@ -482,9 +534,15 @@ async def fetch_dtp_via_web_period(
     Загружает карточки ДТП за список месяцев через сайт.
 
     Полный аналог _fetch_cards_for_period() из bot.py, но через сайт.
+
+    Fail-fast: если первый запрос падает с ошибкой подключения
+    (ConnectTimeout/ConnectError) или HTTP 500 — цикл прерывается,
+    т.к. это означает полную недоступность сервера.
     """
     cards: list[dict] = []
     errors: list[str] = []
+    consecutive_server_failures = 0
+    _CONSECUTIVE_FAILURE_LIMIT = 2  # после N подряд идущих сбоев — стоп
 
     for i, dat in enumerate(dat_list, start=1):
         month_num = int(dat.split(".")[0])
@@ -502,6 +560,8 @@ async def fetch_dtp_via_web_period(
             extracted = await fetch_dtp_via_web(dat=dat, reg_api=reg_api)
             cards.extend(extracted)
             logger.info(f"  {log_prefix}: {dat} -> {len(extracted)} ДТП")
+            # Успешный запрос — сбрасываем счётчик
+            consecutive_server_failures = 0
         except Exception as e:
             from api_client import error_brief
             err_msg = f"{month_name} {year}: {error_brief(e)}"
@@ -510,5 +570,35 @@ async def fetch_dtp_via_web_period(
                 f"  {log_prefix}: {dat} -> ОШИБКА [{type(e).__name__}] "
                 f"{error_brief(e)}"
             )
+
+            # Fail-fast: сервер полностью недоступен
+            if _is_server_unreachable(e):
+                logger.warning(
+                    f"  {log_prefix}: сервер stat.gibdd.ru недоступен "
+                    f"(ошибка подключения). Прерываю выгрузку остальных "
+                    f"{len(dat_list) - i} месяцев."
+                )
+                break
+
+            # Fail-fast: подряд идущие HTTP 500 (сервер падает)
+            if _is_server_error(e):
+                consecutive_server_failures += 1
+                if consecutive_server_failures >= _CONSECUTIVE_FAILURE_LIMIT:
+                    logger.warning(
+                        f"  {log_prefix}: {consecutive_server_failures} "
+                        f"подряд идущих HTTP-ошибок сервера. "
+                        f"Прерываю выгрузку остальных "
+                        f"{len(dat_list) - i} месяцев."
+                    )
+                    break
+            else:
+                # Другие ошибки (парсинг и т.д.) — тоже считаем как сбой сервера,
+                # но только если первый запрос
+                if i == 1 and len(cards) == 0:
+                    logger.warning(
+                        f"  {log_prefix}: ошибка при первом запросе. "
+                        f"Прерываю выгрузку."
+                    )
+                    break
 
     return cards, errors
