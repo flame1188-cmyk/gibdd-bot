@@ -243,6 +243,9 @@ async def _fetch_cards_for_period(
 ) -> tuple[list[dict], list[str]]:
     """Загружает карточки ДТП за список месяцев с GIBDD API.
 
+    При получении 5xx от API автоматически переключается на запасной
+    метод через сайт stat.gibdd.ru (web_fallback).
+
     Общая функция для аналитики, очагов и точечной статистики —
     устраняет дублирование одного и того же цикла в 3 местах.
 
@@ -256,8 +259,11 @@ async def _fetch_cards_for_period(
     Returns:
         (cards, errors) — список карточек ДТП и список строк-ошибок
     """
+    import httpx as _httpx
+
     cards: list[dict] = []
     errors: list[str] = []
+    use_web_fallback = False  # переключаемся после первой 5xx
 
     for i, dat in enumerate(dat_list, start=1):
         month_num = int(dat.split(".")[0])
@@ -267,17 +273,48 @@ async def _fetch_cards_for_period(
         if progress_callback:
             await progress_callback(i, len(dat_list), month_name, year)
 
-        try:
-            api_response = await fetch_dtp_data(dat=dat, reg=reg_code, pok="1")
-            extracted = extract_accident_cards(api_response)
-            cards.extend(extracted)
-            logger.info(f"  {log_prefix}: {dat} -> {len(extracted)} ДТП")
-        except Exception as e:
-            err_msg = f"{month_name} {year}: {error_brief(e)}"
-            errors.append(err_msg)
-            logger.error(
-                f"  {log_prefix}: {dat} -> ОШИБКА [{type(e).__name__}] {error_brief(e)}"
-            )
+        if not use_web_fallback:
+            # --- Основной метод: API ГИБДД ---
+            try:
+                api_response = await fetch_dtp_data(dat=dat, reg=reg_code, pok="1")
+                extracted = extract_accident_cards(api_response)
+                cards.extend(extracted)
+                logger.info(f"  {log_prefix}: {dat} -> {len(extracted)} ДТП")
+            except _httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                if status >= 500:
+                    # Серверная ошибка — переключаемся на веб-fallback
+                    logger.warning(
+                        f"  {log_prefix}: {dat} -> HTTP {status}, "
+                        f"переключаюсь на запасной метод (сайт ГИБДД)"
+                    )
+                    use_web_fallback = True
+                    # Добавляем текущий месяц в список для обработки через fallback
+                    remaining_dats = [dat] + dat_list[i:]
+                    from web_fallback import fetch_dtp_via_web_period
+                    fb_cards, fb_errors = await fetch_dtp_via_web_period(
+                        remaining_dats, reg_code,
+                        log_prefix=f"{log_prefix} [сайт]",
+                        progress_callback=progress_callback,
+                    )
+                    cards.extend(fb_cards)
+                    errors.extend(fb_errors)
+                    break  # fallback обработал все оставшиеся месяцы
+                else:
+                    # Клиентская ошибка — не ретраим
+                    err_msg = f"{month_name} {year}: {error_brief(e)}"
+                    errors.append(err_msg)
+                    logger.error(
+                        f"  {log_prefix}: {dat} -> ОШИБКА "
+                        f"[{type(e).__name__}] {error_brief(e)}"
+                    )
+            except Exception as e:
+                err_msg = f"{month_name} {year}: {error_brief(e)}"
+                errors.append(err_msg)
+                logger.error(
+                    f"  {log_prefix}: {dat} -> ОШИБКА "
+                    f"[{type(e).__name__}] {error_brief(e)}"
+                )
 
     return cards, errors
 
