@@ -95,6 +95,7 @@ async def ensure_regions_loaded() -> list[dict[str, str]]:
       1. Модульный кэш (переменная _regions_cache)
       2. API ГИБДД (при успехе — сохраняет в файловый кэш)
       3. Файловый кэш (data/regions_cache.json)
+      4. Встроенный справочник (regions_builtin.BUILTIN_REGIONS)
     """
     global _regions_cache
     if _regions_cache is not None:
@@ -114,13 +115,23 @@ async def ensure_regions_loaded() -> list[dict[str, str]]:
     except Exception as e:
         logger.error(f"Не удалось загрузить справочник регионов: {e}")
 
-    # --- Fallback: файловый кэш ---
+    # --- Fallback 1: файловый кэш ---
     logger.info("Попытка загрузить справочник регионов из файлового кэша...")
     cached = load_regions_from_cache()
     if cached:
         _regions_cache = cached
         logger.warning(
-            f"API недоступен, использован кэш: {len(cached)} записей"
+            f"API недоступен, использован файловый кэш: {len(cached)} записей"
+        )
+        return _regions_cache
+
+    # --- Fallback 2: встроенный справочник ---
+    from regions_builtin import BUILTIN_REGIONS
+    if BUILTIN_REGIONS:
+        _regions_cache = list(BUILTIN_REGIONS)  # копия
+        logger.warning(
+            f"API и кэш недоступны, использован встроенный справочник: "
+            f"{len(_regions_cache)} записей"
         )
         return _regions_cache
 
