@@ -538,19 +538,31 @@ async def fetch_dtp_via_web(
     return all_cards
 
 
-def _is_server_unreachable(e: Exception) -> bool:
-    """Проверяет, указывает ли ошибка на полную недоступность.
+def _is_missing_dependency(e: Exception) -> bool:
+    """Проверяет, что ошибка — отсутствие модуля (playwright не установлен)."""
+    return isinstance(e, ModuleNotFoundError)
 
-    Для web-fallback через браузер это означает:
-    - Ошибки Playwright (браузер не установлен, crash)
-    - Ошибки подключения к сайту
+
+def _is_server_unreachable(e: Exception) -> bool:
+    """Проверяет, указывает ли ошибка на полную недоступность сайта.
+
+    Сюда входят ТОЛЬko сетевые ошибки и таймауты навигации.
+    ModuleNotFoundError (playwright не установлен) сюда НЕ входит —
+    это проблема окружения, а не доступности сервера.
     """
+    # Отсутствие зависимости — не сетевая ошибка
+    if _is_missing_dependency(e):
+        return False
+
     msg = str(e).lower()
-    # Playwright ошибки
-    if "playwright" in msg or "chromium" in msg:
-        return True
-    # Таймауты
+    # Таймауты навигации/загрузки страницы
     if "timeout" in msg and ("navigate" in msg or "load" in msg):
+        return True
+    # Ошибки подключения (net::ERR_CONNECTION_REFUSED и т.п.)
+    if "err_connection" in msg or "connection refused" in msg:
+        return True
+    # Браузер упал (crash), но НЕ «не установлен»
+    if "browser closed" in msg or "target closed" in msg:
         return True
     return False
 
@@ -563,6 +575,22 @@ def _is_server_error(e: Exception) -> bool:
     if "Ошибка на стороне сервера" in msg:
         return True
     return False
+
+
+def _check_playwright_available() -> None:
+    """Проверяет, что playwright установлен и Chromium доступен.
+
+    Вызывается один раз в начале fetch_dtp_via_web_period,
+    чтобы сразу выдать понятную ошибку вместо «No module named playwright»
+    на каждом месяце.
+    """
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        raise RuntimeError(
+            "Модуль playwright не установлен. Web-fallback требует: "
+            "pip install playwright && playwright install chromium"
+        )
 
 
 async def fetch_dtp_via_web_period(
@@ -579,6 +607,9 @@ async def fetch_dtp_via_web_period(
     Fail-fast: если первый запрос падает с ошибкой подключения
     или HTTP 500 — цикл прерывается.
     """
+    # Ранняя проверка: playwright должен быть установлен
+    _check_playwright_available()
+
     cards: list[dict] = []
     errors: list[str] = []
     consecutive_server_failures = 0
