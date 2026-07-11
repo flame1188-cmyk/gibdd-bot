@@ -79,11 +79,11 @@ def _date_to_web_format(d: date) -> str:
 def _split_period_to_intervals(
     start_date: date,
     end_date: date,
-    max_days: int = 30,
+    max_days: int = 31,
 ) -> list[tuple[date, date]]:
     """
     Разбивает период на интервалы не более max_days.
-    Сайт ГИБДД ограничивает один запрос ~31 днем.
+    Сайт ГИБДД позволяет выгрузить до полного месяца (31 день).
     """
     intervals = []
     current = start_date
@@ -457,8 +457,8 @@ async def fetch_dtp_via_web(
 
     reg_web = api_reg_to_web_reg(reg_api)
 
-    # Разбиваем на интервалы <= 30 дней
-    intervals = _split_period_to_intervals(start_date, end_date, max_days=30)
+    # Разбиваем на интервалы (до 31 дня за запрос)
+    intervals = _split_period_to_intervals(start_date, end_date)
 
     all_cards: list[dict[str, Any]] = []
 
@@ -488,44 +488,6 @@ async def fetch_dtp_via_web(
     return all_cards
 
 
-# ---------------------------------------------------------------------------
-# Классификация ошибок (для fail-fast в fetch_dtp_via_web_period)
-# ---------------------------------------------------------------------------
-
-def _is_missing_dependency(e: Exception) -> bool:
-    """Проверяет, что ошибка — отсутствие модуля."""
-    return isinstance(e, ModuleNotFoundError)
-
-
-def _is_server_unreachable(e: Exception) -> bool:
-    """Проверяет, указывает ли ошибка на полную недоступность сайта.
-
-    Сюда входят ТОЛЬКО сетевые ошибки и таймауты.
-    """
-    if _is_missing_dependency(e):
-        return False
-
-    msg = str(e).lower()
-    # Таймауты подключения
-    if "таймаут подключения" in msg or "timeout" in msg:
-        return True
-    # Ошибки подключения
-    if "недоступен" in msg or "connection" in msg:
-        return True
-    return False
-
-
-def _is_server_error(e: Exception) -> bool:
-    """Проверяет, является ли ошибка серверной (5xx / 403 WAF)."""
-    msg = str(e)
-    if "HTTP 500" in msg or "HTTP 502" in msg or "HTTP 503" in msg:
-        return True
-    if "403" in msg:
-        return True
-    if "Ошибка на стороне сервера" in msg:
-        return True
-    return False
-
 
 async def fetch_dtp_via_web_period(
     dat_list: list[str],
@@ -536,15 +498,18 @@ async def fetch_dtp_via_web_period(
     """
     Загружает карточки ДТП за список месяцев через сайт.
 
-    Полный аналог _fetch_cards_for_period() из bot.py, но через сайт.
-
-    Fail-fast: если первый запрос падает с ошибкой подключения
-    или серверной ошибкой — цикл прерывается.
+    Каждый месяц — до 3 попыток с задержкой 5/10/15с.
+    Прерываем только при 3 подряд идущих неудачных месяцах
+    (сервер точно лежит).
     """
+    import asyncio as _asyncio
+
     cards: list[dict] = []
     errors: list[str] = []
-    consecutive_server_failures = 0
-    _CONSECUTIVE_FAILURE_LIMIT = 2
+    consecutive_failures = 0
+    _CONSECUTIVE_FAILURE_LIMIT = 3
+    _MONTH_RETRIES = 3
+    _MONTH_RETRY_DELAYS = [5, 10, 15]  # секунд между попытками
 
     for i, dat in enumerate(dat_list, start=1):
         month_num = int(dat.split(".")[0])
@@ -558,46 +523,51 @@ async def fetch_dtp_via_web_period(
         if progress_callback:
             await progress_callback(i, len(dat_list), month_name, year)
 
-        try:
-            extracted = await fetch_dtp_via_web(dat=dat, reg_api=reg_api)
+        # Пробуем загрузить месяц с ретраями
+        extracted = None
+        last_err: Exception | None = None
+
+        for attempt in range(1, _MONTH_RETRIES + 1):
+            try:
+                extracted = await fetch_dtp_via_web(dat=dat, reg_api=reg_api)
+                break  # успех
+            except Exception as e:
+                last_err = e
+                if attempt < _MONTH_RETRIES:
+                    delay = _MONTH_RETRY_DELAYS[attempt - 1]
+                    logger.warning(
+                        f"  {log_prefix}: {dat} -> "
+                        f"попытка {attempt}/{_MONTH_RETRIES} "
+                        f"не удалась ({type(e).__name__}), "
+                        f"повтор через {delay}с..."
+                    )
+                    await _asyncio.sleep(delay)
+
+        if extracted is not None:
             cards.extend(extracted)
             logger.info(f"  {log_prefix}: {dat} -> {len(extracted)} ДТП")
-            consecutive_server_failures = 0
-        except Exception as e:
+            consecutive_failures = 0
+        else:
+            # Все попытки провалились
             try:
                 from api_client import error_brief
-                err_msg = f"{month_name} {year}: {error_brief(e)}"
+                err_msg = f"{month_name} {year}: {error_brief(last_err)}"
             except ImportError:
-                err_msg = f"{month_name} {year}: {e}"
+                err_msg = f"{month_name} {year}: {last_err}"
             errors.append(err_msg)
             logger.error(
-                f"  {log_prefix}: {dat} -> ОШИБКА [{type(e).__name__}] "
-                f"{err_msg}"
+                f"  {log_prefix}: {dat} -> ОШИБКА после "
+                f"{_MONTH_RETRIES} попыток: {err_msg}"
             )
 
-            if _is_server_unreachable(e):
+            consecutive_failures += 1
+            if consecutive_failures >= _CONSECUTIVE_FAILURE_LIMIT:
                 logger.warning(
-                    f"  {log_prefix}: сервер stat.gibdd.ru недоступен. "
+                    f"  {log_prefix}: {consecutive_failures} "
+                    f"подряд идущих ошибок. "
                     f"Прерываю выгрузку остальных "
                     f"{len(dat_list) - i} месяцев."
                 )
                 break
-
-            if _is_server_error(e):
-                consecutive_server_failures += 1
-                if consecutive_server_failures >= _CONSECUTIVE_FAILURE_LIMIT:
-                    logger.warning(
-                        f"  {log_prefix}: {consecutive_server_failures} "
-                        f"подряд идущих ошибок сервера. "
-                        f"Прерываю выгрузку."
-                    )
-                    break
-            else:
-                if i == 1 and len(cards) == 0:
-                    logger.warning(
-                        f"  {log_prefix}: ошибка при первом запросе. "
-                        f"Прерываю выгрузку."
-                    )
-                    break
 
     return cards, errors

@@ -1509,6 +1509,17 @@ async def _run_concentration_points(
                 logger.warning(
                     f"Ошибки загрузки прошлого года: {errors}"
                 )
+                # Предупреждаем пользователя о неполных данных
+                err_text = "\n".join(f"- {e}" for e in errors)
+                try:
+                    await progress_callback(
+                        f"Загрузка данных за прошлый год...\n"
+                        f"⚠ Не удалось скачать:\n{err_text}\n\n"
+                        f"Данные за эти месяцы отсутствуют, "
+                        f"сравнение будет неполным."
+                    )
+                except Exception:
+                    pass
 
         # --- Расчёт очагов с динамикой ---
         clusters = await calculate_concentration_dynamics(
