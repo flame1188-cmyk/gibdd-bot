@@ -1012,6 +1012,28 @@ async def _start_fetching(
             logger.warning("Не удалось отправить сообщение об ошибках выгрузки")
         return
 
+    # Предупреждение о пропущенных месяцах (частичная выгрузка)
+    if errors:
+        skipped_text = "\n".join(f"- {e}" for e in errors)
+        warn_msg = (
+            f"⚠ Не удалось скачать данные за следующие месяцы:\n"
+            f"{skipped_text}\n\n"
+            f"Выгрузка неполная — сравнение периодов "
+            f"может быть некорректным.\n"
+            f"Рекомендуется повторить запрос позже."
+        )
+        try:
+            await _tg_retry(lambda: query.edit_message_text(
+                f"Выгрузка данных:\n\n"
+                f"Регион: {reg_name}\n"
+                f"Период: {period.label}\n\n"
+                f"{warn_msg}\n\n"
+                f"Найдено ДТП: {len(all_cards)}\n"
+                f"Генерация Excel-файлов..."
+            ), "edit_message_text (предупреждение о пропущенных)")
+        except (TimedOut, NetworkError):
+            logger.warning("Не удалось отправить предупреждение о пропущенных месяцах")
+
     # Обработка и генерация Excel
     try:
         await _tg_retry(lambda: query.edit_message_text(
@@ -1227,6 +1249,19 @@ async def _run_analysis(
             f"Возможно, данные за этот период ещё не опубликованы."
         )
         return
+
+    # Предупреждение о неполных данных за прошлый год
+    if errors:
+        err_text = "\n".join(f"- {e}" for e in errors)
+        try:
+            await status_msg.edit_text(
+                f"{mode_label}: данные за {prev_label} "
+                f"загружены неполностью.\n\n"
+                f"Не удалось скачать:\n{err_text}\n\n"
+                f"Сравнение может быть некорректным."
+            )
+        except Exception:
+            pass
 
     # Считаем метрики
     await status_msg.edit_text(f"{mode_label}: считаю метрики...")
@@ -1792,10 +1827,23 @@ async def _start_point_stats(
                 f"{i}/{total} — {month_name} {year}"
             )
 
-        prev_cards, _ = await _fetch_cards_for_period(
+        prev_cards, pt_errors = await _fetch_cards_for_period(
             dat_list_prev, reg_code, "Точечная статистика",
             progress_callback=pt_progress,
         )
+
+        # Предупреждение о неполных данных
+        if pt_errors:
+            err_text = "\n".join(f"- {e}" for e in pt_errors)
+            try:
+                await status_msg.edit_text(
+                    f"\U0001F4CD Данные за {prev_label} "
+                    f"загружены неполностью.\n\n"
+                    f"Не удалось скачать:\n{err_text}\n\n"
+                    f"Сравнение может быть некорректным."
+                )
+            except Exception:
+                pass
 
         # Сохраняем для повторного использования
         if prev_cards:
