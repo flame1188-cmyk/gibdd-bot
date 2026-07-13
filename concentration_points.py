@@ -105,8 +105,9 @@ EXCLUDED_SDOR_FOR_KUL = [
     "иное место",
 ]
 
-# Кэширование границ НП
-CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+# Кэширование границ НП (в постоянном хранилище, /data на Amvera)
+_DATA_DIR = os.environ.get("CAMERA_DATA_DIR", "data")
+CACHE_DIR = os.path.join(_DATA_DIR, "osm_cache")
 CACHE_TTL_SECONDS = 24 * 60 * 60  # 24 часа
 
 # In-memory LRU-кэш распарсенных полигонов (избегает повторного парсинга JSON)

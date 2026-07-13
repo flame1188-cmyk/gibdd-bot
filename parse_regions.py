@@ -6,6 +6,7 @@
 """
 
 import json
+import os
 import re
 import urllib.request
 
@@ -134,11 +135,14 @@ def main():
         if len(code_num) > 2:
             print(f"  {r['code']} — {r['name']}")
 
-    output_path = "regions_builtin.py"
-    generate_python_file(api_regions, output_path)
+    # Путь к директории скрипта (файлы рядом с parse_regions.py)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    py_path = os.path.join(script_dir, "regions_builtin.py")
+    generate_python_file(api_regions, py_path)
 
     # Также выводим JSON для проверки
-    json_path = "regions_builtin.json"
+    json_path = os.path.join(script_dir, "regions_builtin.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(api_regions, f, ensure_ascii=False, indent=2)
     print(f"✓ Сохранён {json_path}")
