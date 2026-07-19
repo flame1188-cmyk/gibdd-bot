@@ -937,6 +937,33 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await _send_point_stats_html(update, context)
             return
 
+        # --- Возврат в главное меню ---
+        if data == "back_to_menu":
+            # Сбрасываем временные флаги режимов, но НЕ удаляем данные
+            for key in [
+                "qa_mode", "point_stats_mode",
+                "waiting_camera_file", "waiting_camera_for_map",
+            ]:
+                context.user_data.pop(key, None)
+
+            menu_text, menu_kb = _build_menu_keyboard(context)
+            if menu_text and menu_kb:
+                try:
+                    await query.edit_message_text(
+                        menu_text, reply_markup=menu_kb, parse_mode="HTML",
+                    )
+                except Exception:
+                    # Если не удалось отредактировать — отправляем новым сообщением
+                    await context.bot.send_message(
+                        chat_id=query.from_user.id,
+                        text=menu_text, reply_markup=menu_kb, parse_mode="HTML",
+                    )
+            else:
+                await query.edit_message_text(
+                    "Данные не найдены. Отправьте /dtp для новой выгрузки."
+                )
+            return
+
         # --- Завершить режим вопросов ---
         if data == "end_qa":
             _clear_analytics_data(context.user_data)
@@ -1116,30 +1143,24 @@ async def _start_fetching(
             context.user_data.pop(key, None)
 
 
-async def _offer_analysis(
+def _build_menu_keyboard(
     context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    reg_name: str,
-    reg_code: str,
-    period: ParsedPeriod,
-    current_cards: list[dict],
-) -> None:
+) -> tuple[str, "InlineKeyboardMarkup"] | tuple[None, None]:
     """
-    После выгрузки предлагает кнопки для проведения анализа
-    (сравнение с аналогичным периодом прошлого года).
-    Два режима: без ИИ и с ИИ (нейросеть GLM).
+    Строит клавиатуру главного меню по кэшированным данным.
+    Возвращает (text, keyboard) или (None, None) если данных нет.
+    Переиспользуется после каждого сценария для возврата в меню.
     """
+    reg_name = context.user_data.get("analytics_reg_name", "")
+    period = context.user_data.get("analytics_period")
+    current_cards = context.user_data.get("analytics_cards", [])
+
+    if not period or not current_cards:
+        return None, None
+
     prev_year = period.year - 1
     prev_label = period.label.replace(str(period.year), str(prev_year))
 
-    # Сохраняем данные для аналитики в user_data
-    context.user_data["analytics_ready"] = True
-    context.user_data["analytics_reg_code"] = reg_code
-    context.user_data["analytics_reg_name"] = reg_name
-    context.user_data["analytics_period"] = period
-    context.user_data["analytics_cards"] = current_cards
-
-    # Формируем кнопки
     buttons = []
     buttons.append([InlineKeyboardButton(
         f"\U0001F4CA Анализ ({prev_label})",
@@ -1169,30 +1190,59 @@ async def _offer_analysis(
 
     if LLM_API_KEY:
         text = (
-            f"\u2705 Выгрузка завершена: {len(current_cards)} ДТП.\n\n"
-            f"Хотите провести сравнительный анализ с аналогичным периодом {prev_year} года?\n\n"
+            f"\u2705 Данные: <b>{reg_name}</b> — {period.label}\n"
+            f"ДТП: {len(current_cards)}\n\n"
+            f"Выберите действие:\n\n"
             f"\U0001F4CA <b>Без ИИ</b> — математический анализ (таблицы, проценты)\n"
             f"\U0001F916 <b>С ИИ</b> — анализ + резюме от нейросети\n"
             f"\U0001F525 <b>Очаги ДТП</b> — места концентрации аварийности\n"
             f"\U0001F4CD <b>По точке</b> — статистика ДТП по координатам\n"
-            f"\U0001F5FA <b>HTML-карта</b> — интерактивная карта всех ДТП"
+            f"\U0001F5FA <b>HTML-карта</b> — интерактивная карта всех ДТП\n\n"
+            f"Или /dtp для новой выгрузки."
         )
     else:
         text = (
-            f"\u2705 Выгрузка завершена: {len(current_cards)} ДТП.\n\n"
-            f"Хотите провести сравнительный анализ с аналогичным периодом {prev_year} года?\n\n"
+            f"\u2705 Данные: <b>{reg_name}</b> — {period.label}\n"
+            f"ДТП: {len(current_cards)}\n\n"
+            f"Выберите действие:\n\n"
             f"\U0001F4CA <b>Без ИИ</b> — математический анализ (таблицы, проценты)\n"
             f"\U0001F525 <b>Очаги ДТП</b> — места концентрации аварийности\n"
             f"\U0001F4CD <b>По точке</b> — статистика ДТП по координатам\n"
-            f"\U0001F5FA <b>HTML-карта</b> — интерактивная карта всех ДТП"
+            f"\U0001F5FA <b>HTML-карта</b> — интерактивная карта всех ДТП\n\n"
+            f"Или /dtp для новой выгрузки."
         )
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=keyboard,
-        parse_mode="HTML",
-    )
+    return text, keyboard
+
+
+async def _offer_analysis(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    reg_name: str,
+    reg_code: str,
+    period: ParsedPeriod,
+    current_cards: list[dict],
+) -> None:
+    """
+    После выгрузки предлагает кнопки для проведения анализа
+    (сравнение с аналогичным периодом прошлого года).
+    Два режима: без ИИ и с ИИ (нейросеть GLM).
+    """
+    # Сохраняем данные для аналитики в user_data
+    context.user_data["analytics_ready"] = True
+    context.user_data["analytics_reg_code"] = reg_code
+    context.user_data["analytics_reg_name"] = reg_name
+    context.user_data["analytics_period"] = period
+    context.user_data["analytics_cards"] = current_cards
+
+    text, keyboard = _build_menu_keyboard(context)
+    if text and keyboard:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
 
 
 async def _run_analysis(
@@ -1227,32 +1277,56 @@ async def _run_analysis(
 
     mode_label = "\U0001F916 AI-анализ" if use_llm else "\U0001F4CA Анализ"
 
-    status_msg = await _tg_retry(lambda: context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"{mode_label}: подготовка...\n\n"
-            f"Регион: {reg_name}\n"
-            f"Текущий период: {current_label}\n"
-            f"Сравнение: {prev_label}\n\n"
-            f"Загрузка данных за {prev_year} год..."
-        ),
-    ), "send_message (статус аналитики)")
+    # Проверяем, есть ли уже данные за прошлый год в кэше
+    cached_prev = context.user_data.get("analytics_prev_cards", [])
+    cached_prev_label = context.user_data.get("analytics_prev_label", "")
 
-    # Запрашиваем данные за прошлый год
-    async def progress(i, total, month_name, year):
-        bar = _make_progress_bar(i, total)
-        try:
-            await status_msg.edit_text(
-                f"{mode_label}: загрузка...\n\n"
-                f"{bar} {i}/{total}\n"
-                f"Запрос: {month_name} {year}..."
-            )
-        except Exception:
-            pass
+    if cached_prev and cached_prev_label == prev_label:
+        # Данные за прошлый год уже есть — не скачиваем повторно
+        prev_cards = cached_prev
+        errors = []
+        status_msg = await _tg_retry(lambda: context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"{mode_label}: подготовка...\n\n"
+                f"Регион: {reg_name}\n"
+                f"Текущий период: {current_label}\n"
+                f"Сравнение: {prev_label}\n\n"
+                f"Данные за прошлый год из кэша ({len(prev_cards)} ДТП)..."
+            ),
+        ), "send_message (статус аналитики)")
+    else:
+        # Скачиваем данные за прошлый год
+        status_msg = await _tg_retry(lambda: context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"{mode_label}: подготовка...\n\n"
+                f"Регион: {reg_name}\n"
+                f"Текущий период: {current_label}\n"
+                f"Сравнение: {prev_label}\n\n"
+                f"Загрузка данных за {prev_year} год..."
+            ),
+        ), "send_message (статус аналитики)")
 
-    prev_cards, errors = await _fetch_cards_for_period(
-        dat_list_prev, reg_code, "Аналитика", progress_callback=progress,
-    )
+        async def progress(i, total, month_name, year):
+            bar = _make_progress_bar(i, total)
+            try:
+                await status_msg.edit_text(
+                    f"{mode_label}: загрузка...\n\n"
+                    f"{bar} {i}/{total}\n"
+                    f"Запрос: {month_name} {year}..."
+                )
+            except Exception:
+                pass
+
+        prev_cards, errors = await _fetch_cards_for_period(
+            dat_list_prev, reg_code, "Аналитика", progress_callback=progress,
+        )
+
+        # Кэшируем для повторного использования
+        if prev_cards:
+            context.user_data["analytics_prev_cards"] = prev_cards
+            context.user_data["analytics_prev_label"] = prev_label
 
     if not prev_cards:
         error_text = "\n".join(f"- {e}" for e in errors) if errors else "Нет данных"
@@ -1442,6 +1516,10 @@ async def _run_analysis(
         context.user_data["qa_mode"] = True
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(
+                "\u21A9\uFE0F В меню",
+                callback_data="back_to_menu",
+            )],
+            [InlineKeyboardButton(
                 "\u274C Завершить",
                 callback_data="end_qa",
             )],
@@ -1460,8 +1538,15 @@ async def _run_analysis(
             reply_markup=keyboard,
         )
     else:
-        # Без ИИ — очищаем данные аналитики
-        _clear_analytics_data(context.user_data)
+        # Без ИИ — показываем кнопку возврата в меню
+        menu_text, menu_kb = _build_menu_keyboard(context)
+        if menu_text and menu_kb:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=menu_text,
+                reply_markup=menu_kb,
+                parse_mode="HTML",
+            )
 
     logger.info(
         f"Аналитика отправлена: {reg_name}, "
@@ -1537,11 +1622,21 @@ async def _run_concentration_points(
             pass
 
     try:
-        # --- Загрузка данных за прошлый год ---
+        # --- Загрузка данных за прошлый год (из кэша или с сервера) ---
         prev_cards = []
         errors = []
 
-        if reg_code:
+        # Проверяем кэш прошлого года
+        cached_prev = context.user_data.get("analytics_prev_cards", [])
+        cached_prev_label = context.user_data.get("analytics_prev_label", "")
+
+        if cached_prev and cached_prev_label == prev_label:
+            prev_cards = cached_prev
+            await progress_callback(
+                f"Данные за прошлый год из кэша ({len(prev_cards)} ДТП)\n"
+                f"Расчёт очагов..."
+            )
+        elif reg_code:
             async def fetch_progress(i, total, month_name, year):
                 await progress_callback(
                     f"Загрузка данных за прошлый год...\n"
@@ -1552,6 +1647,11 @@ async def _run_concentration_points(
                 dat_list_prev, reg_code, "Очаги-динамика",
                 progress_callback=fetch_progress,
             )
+
+            # Кэшируем для повторного использования
+            if prev_cards:
+                context.user_data["analytics_prev_cards"] = prev_cards
+                context.user_data["analytics_prev_label"] = prev_label
 
             if errors:
                 logger.warning(
@@ -1782,8 +1882,15 @@ async def _run_concentration_points(
         # Сохраняем очаги в сессию (для LLM и дальнейших вопросов)
         context.user_data["analytics_clusters"] = clusters
 
-        # Освобождаем память: прошлый год больше не нужен
-        context.user_data.pop("analytics_prev_cards", None)
+        # Показываем кнопку возврата в меню
+        menu_text, menu_kb = _build_menu_keyboard(context)
+        if menu_text and menu_kb:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=menu_text,
+                reply_markup=menu_kb,
+                parse_mode="HTML",
+            )
 
         logger.info(
             f"Очаги отправлены: {reg_name}, "
@@ -2383,6 +2490,12 @@ async def _process_point_stats(
             "\U0001F5FA HTML-карта",
             callback_data="ps_html_map",
         )])
+
+    # Кнопка возврата в меню
+    buttons.append([InlineKeyboardButton(
+        "\u21A9\uFE0F В меню",
+        callback_data="back_to_menu",
+    )])
 
     keyboard = InlineKeyboardMarkup(buttons)
 
