@@ -1660,11 +1660,12 @@ function drawClusterGroup(data, zoneLayer, dtpLayer, isPre) {{
         // Линии между точками ДТП очага
         if (pts.length >= 2) {{
             var lineCoords = pts.map(function(p) {{ return [p.lat, p.lon]; }});
-            L.polyline(lineCoords, {{
-                color: isPre ? '#9e9e9e' : color,
-                weight: 2, opacity: 0.4,
-                dashArray: isPre ? '4,4' : ''
-            }}).addTo(dtpLayer);
+            var lineOpts = {{
+                color: isPre ? '#757575' : color,
+                weight: 3, opacity: 0.7
+            }};
+            if (isPre) lineOpts.dashArray = '6,4';
+            L.polyline(lineCoords, lineOpts).addTo(zoneLayer);
         }}
 
         // Попап зоны
