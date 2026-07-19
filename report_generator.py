@@ -193,6 +193,24 @@ def _card_popup_html(card: dict) -> str:
     if empt_number:
         lines.append(f"📋 № {empt_number}")
 
+    # Координаты
+    lat_val = card.get("coord_w", "")
+    lon_val = card.get("coord_l", "")
+    if lat_val and lon_val:
+        lines.append(f"🌐 {lat_val}, {lon_val}")
+
+    # Погодные и дорожные условия
+    dor_usl = card.get("dor_usl") or {}
+    spog = dor_usl.get("spog", []) or []
+    if spog:
+        lines.append(f"🌤 Погода: {'; '.join(str(s) for s in spog)}")
+    s_pch = dor_usl.get("s_pch", "")
+    if s_pch:
+        lines.append(f"🛣 Покрытие: {s_pch}")
+    osv = dor_usl.get("osv", "")
+    if osv:
+        lines.append(f"💡 Освещение: {osv}")
+
     return "<br>".join(l for l in lines if l)
 
 
@@ -219,6 +237,10 @@ def _camera_popup_html(cam: dict) -> str:
         lines.append(f"🛣 Маршрут: {road}")
     if piket is not None:
         lines.append(f"📏 Пикетаж: {piket:.3f} км")
+    lat = cam.get("lat", 0)
+    lon = cam.get("lon", 0)
+    if lat and lon:
+        lines.append(f"🌐 {lat:.6f}, {lon:.6f}")
 
     return "<br>".join(lines)
 
@@ -434,11 +456,80 @@ body {
   margin-right: 4px;
   vertical-align: middle;
 }
+.filter-panel {
+  background: white;
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin-bottom: 12px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  font-size: 13px;
+}
+.filter-panel .filter-title {
+  font-weight: 600;
+  margin-right: 4px;
+  font-size: 14px;
+}
+.filter-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.filter-group label {
+  color: #616161;
+  white-space: nowrap;
+}
+.filter-group select,
+.filter-group input[type="date"] {
+  padding: 5px 8px;
+  border: 1px solid #bdbdbd;
+  border-radius: 4px;
+  font-size: 13px;
+  background: #fafafa;
+}
+.filter-group select:focus,
+.filter-group input[type="date"]:focus {
+  outline: none;
+  border-color: #1565c0;
+}
+.btn-filter {
+  padding: 5px 14px;
+  border: none;
+  border-radius: 4px;
+  font-size: 13px;
+  cursor: pointer;
+  font-weight: 500;
+}
+.btn-apply {
+  background: #1565c0;
+  color: white;
+}
+.btn-apply:hover { background: #0d47a1; }
+.btn-reset {
+  background: #e0e0e0;
+  color: #424242;
+}
+.btn-reset:hover { background: #bdbdbd; }
+.filter-count {
+  color: #757575;
+  font-size: 12px;
+  margin-left: 4px;
+}
+.filter-divider {
+  width: 1px;
+  height: 24px;
+  background: #e0e0e0;
+  margin: 0 4px;
+}
 @media print {
   body { background: white; }
   .container { max-width: 100%; padding: 0; }
   .map-container { box-shadow: none; border: 1px solid #ccc; }
   #map { height: 500px; }
+  .filter-panel { display: none; }
 }
 """
 
@@ -487,6 +578,21 @@ body {
         # Легенда
         legend_html = self._build_dtp_legend()
 
+        # Уникальные виды ДТП для фильтра
+        dtp_types = sorted(set(
+            c.get("dtpv", "") for c in cards_with_coords if c.get("dtpv")
+        ))
+        # Уникальные модели камер для фильтра
+        cam_models = sorted(set(
+            c.get("model", "") for c in (cameras or []) if c.get("model")
+        )) if cameras else []
+
+        # Панель фильтров
+        filter_html = self._build_filter_panel(
+            dtp_types, cam_models,
+            total_on_map=len(cards_with_coords),
+        )
+
         # Данные для карты
         dtp_geojson = self._build_dtp_geojson(cards_with_coords)
         camera_markers = self._build_camera_markers_js(cameras) if cameras else "[]"
@@ -494,11 +600,15 @@ body {
         zoom = self._calc_zoom(cards_with_coords)
 
         # JS-код карты
-        map_js = self._dtp_map_js(center, zoom, dtp_geojson, camera_markers, cameras is not None)
+        map_js = self._dtp_map_js(
+            center, zoom, dtp_geojson, camera_markers,
+            has_cameras=cameras is not None,
+        )
 
         body = f"""
 {summary_html}
 {legend_html}
+{filter_html}
 <div class="map-container">
   <div class="map-title">Карта ДТП — {self._esc(self.region_name)}</div>
   <div id="map"></div>
@@ -550,28 +660,60 @@ body {
     def _build_dtp_legend(self) -> str:
         return """
 <div class="legend">
-  <span class="legend-item"><span class="legend-dot" style="background:#d32f2f"></span> Погибло</span>
-  <span class="legend-item"><span class="legend-dot" style="background:#f57c00"></span> Ранено</span>
-  <span class="legend-item"><span class="legend-dot" style="background:#4caf50"></span> Материальный ущерб</span>
+  <div style="font-weight:600;margin-bottom:6px;">Условные обозначения</div>
+  <table style="border-collapse:collapse;font-size:13px;">
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#d32f2f"></span></td><td>ДТП с погибшими</td></tr>
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#f57c00"></span></td><td>ДТП с ранеными</td></tr>
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#4caf50"></span></td><td>ДТП — только материальный ущерб</td></tr>
+    <tr><td style="padding:2px 8px 2px 0;font-size:16px;">📷</td><td>Камера фотовидеофиксации</td></tr>
+  </table>
+  <div style="margin-top:6px;color:#757575;font-size:12px;">Нажмите на маркер для подробностей. Колёсико мыши / +/- — масштаб.</div>
 </div>"""
 
     def _build_dtp_geojson(self, cards: list[dict]) -> str:
-        """Строит GeoJSON FeatureCollection из карточек ДТП."""
+        """Строит GeoJSON FeatureCollection из карточек ДТП.
+        Каждая фича содержит свойства для фильтрации.
+        """
         features = []
         for card in cards:
             coords = _parse_coords(card)
             if coords is None:
                 continue
             popup = _card_popup_html(card)
+
+            # Тяжесть для фильтра
+            pog = int(card.get("pog", 0) or 0)
+            ran = int(card.get("ran", 0) or 0)
+            if pog > 0:
+                severity = "fatal"
+            elif ran > 0:
+                severity = "injured"
+            else:
+                severity = "material"
+
+            # Дата для фильтра (DD.MM.YYYY -> YYYYMMDD)
+            date_sort = ""
+            date_str = card.get("date_dtp", "")
+            if "." in date_str:
+                parts = date_str.split(".")
+                if len(parts) == 3:
+                    try:
+                        date_sort = f"{parts[2]}{parts[1]}{parts[0]}"
+                    except (ValueError, IndexError):
+                        pass
+
             features.append({
                 "type": "Feature",
                 "properties": {
                     "popup": popup,
                     "color": _severity_color(card),
+                    "dtpv": card.get("dtpv", ""),
+                    "severity": severity,
+                    "date_sort": date_sort,
                 },
                 "geometry": {
                     "type": "Point",
-                    "coordinates": [coords[1], coords[0]],  # lon, lat
+                    "coordinates": [coords[1], coords[0]],
                 },
             })
         return json.dumps({
@@ -592,8 +734,65 @@ body {
                 "lat": lat,
                 "lon": lon,
                 "popup": popup,
+                "model": cam.get("model", ""),
             })
         return json.dumps(markers, ensure_ascii=False)
+
+    def _build_filter_panel(
+        self,
+        dtp_types: list[str],
+        cam_models: list[str] | None = None,
+        total_on_map: int = 0,
+    ) -> str:
+        """Строит HTML-панель фильтров для карты ДТП."""
+        # Опции вида ДТП
+        type_opts = '<option value="">Все виды</option>'
+        for t in dtp_types:
+            type_opts += f'<option value="{self._esc(t)}">{self._esc(t)}</option>'
+
+        html = f"""
+<div class="filter-panel">
+  <span class="filter-title">🔍 Фильтр ДТП:</span>
+  <div class="filter-group">
+    <label>Вид:</label>
+    <select id="filter_type">{type_opts}</select>
+  </div>
+  <div class="filter-group">
+    <label>Тяжесть:</label>
+    <select id="filter_severity">
+      <option value="">Все</option>
+      <option value="fatal">С погибшими</option>
+      <option value="injured">С ранеными</option>
+      <option value="material">Материальный ущерб</option>
+    </select>
+  </div>
+  <div class="filter-group">
+    <label>С:</label>
+    <input type="date" id="filter_date_from">
+  </div>
+  <div class="filter-group">
+    <label>По:</label>
+    <input type="date" id="filter_date_to">
+  </div>
+  <button class="btn-filter btn-apply" id="filter_apply">Применить</button>
+  <button class="btn-filter btn-reset" id="filter_reset">Сбросить</button>
+  <span class="filter-count" id="filter_count">{total_on_map} ДТП</span>"""
+
+        # Фильтр камер по модели
+        if cam_models:
+            model_opts = '<option value="">Все модели</option>'
+            for m in cam_models:
+                model_opts += f'<option value="{self._esc(m)}">{self._esc(m)}</option>'
+            html += f"""
+  <span class="filter-divider"></span>
+  <span class="filter-title">📷 Камеры:</span>
+  <div class="filter-group">
+    <select id="filter_camera_model">{model_opts}</select>
+  </div>
+  <span class="filter-count" id="camera_filter_count"></span>"""
+
+        html += "\n</div>"
+        return html
 
     def _calc_center(
         self, cards: list[dict],
@@ -653,34 +852,78 @@ body {
         camera_markers_js: str,
         has_cameras: bool,
     ) -> str:
-        """JavaScript-код карты ДТП."""
+        """JavaScript-код карты ДТП с фильтрами."""
         return f"""
 var map = L.map('map').setView([{center[0]}, {center[1]}], {zoom});
 
-// Тайлы OpenStreetMap
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
     attribution: '&copy; OpenStreetMap contributors',
     maxZoom: 18,
 }}).addTo(map);
 
+// --- Данные ---
+var dtpData = {dtp_geojson};
+var cameraDataFull = {camera_markers_js};
+
 // --- Слой ДТП ---
 var dtpLayer = L.layerGroup().addTo(map);
-var dtpData = {dtp_geojson};
 
-L.geoJSON(dtpData, {{
-    pointToLayer: function(feature, latlng) {{
-        return L.circleMarker(latlng, {{
-            radius: 6,
-            fillColor: feature.properties.color,
-            color: '#333',
-            weight: 1,
-            fillOpacity: 0.8,
-        }});
-    }},
-    onEachFeature: function(feature, layer) {{
-        layer.bindPopup(feature.properties.popup, {{maxWidth: 320}});
-    }}
-}}).addTo(dtpLayer);
+function renderDtp(data) {{
+    dtpLayer.clearLayers();
+    L.geoJSON(data, {{
+        pointToLayer: function(feature, latlng) {{
+            return L.circleMarker(latlng, {{
+                radius: 6,
+                fillColor: feature.properties.color,
+                color: '#333',
+                weight: 1,
+                fillOpacity: 0.8,
+            }});
+        }},
+        onEachFeature: function(feature, layer) {{
+            layer.bindPopup(feature.properties.popup, {{maxWidth: 320}});
+        }}
+    }}).addTo(dtpLayer);
+}}
+
+// Первичная отрисовка всех ДТП
+renderDtp(dtpData);
+
+// --- Фильтр ДТП ---
+function applyDtpFilter() {{
+    var typeVal = document.getElementById('filter_type').value;
+    var sevVal  = document.getElementById('filter_severity').value;
+    var dFrom   = document.getElementById('filter_date_from').value;
+    var dTo     = document.getElementById('filter_date_to').value;
+
+    var from8 = dFrom ? dFrom.replace(/-/g, '') : '';
+    var to8   = dTo   ? dTo.replace(/-/g, '')   : '';
+
+    var filtered = {{
+        "type": "FeatureCollection",
+        "features": dtpData.features.filter(function(f) {{
+            if (typeVal && f.properties.dtpv !== typeVal) return false;
+            if (sevVal  && f.properties.severity !== sevVal) return false;
+            if (from8  && f.properties.date_sort < from8) return false;
+            if (to8    && f.properties.date_sort > to8)   return false;
+            return true;
+        }})
+    }};
+    renderDtp(filtered);
+    document.getElementById('filter_count').textContent =
+        filtered.features.length + ' ДТП';
+}}
+
+document.getElementById('filter_apply').addEventListener('click', applyDtpFilter);
+document.getElementById('filter_reset').addEventListener('click', function() {{
+    document.getElementById('filter_type').value = '';
+    document.getElementById('filter_severity').value = '';
+    document.getElementById('filter_date_from').value = '';
+    document.getElementById('filter_date_to').value = '';
+    renderDtp(dtpData);
+    document.getElementById('filter_count').textContent =
+        dtpData.features.length + ' ДТП';
+}});
 
 // --- Слой камер ---
 var cameraLayer = L.layerGroup();
@@ -691,21 +934,38 @@ var cameraIcon = L.divIcon({{
     className: ''
 }});
 
-var cameraData = {camera_markers_js};
-cameraData.forEach(function(c) {{
-    L.marker([c.lat, c.lon], {{icon: cameraIcon}})
-     .bindPopup(c.popup, {{maxWidth: 320}})
-     .addTo(cameraLayer);
-}});
+function renderCameras(data) {{
+    cameraLayer.clearLayers();
+    data.forEach(function(c) {{
+        L.marker([c.lat, c.lon], {{icon: cameraIcon}})
+         .bindPopup(c.popup, {{maxWidth: 320}})
+         .addTo(cameraLayer);
+    }});
+}}
+
+renderCameras(cameraDataFull);
+
+// --- Фильтр камер по модели ---
+var modelSelect = document.getElementById('filter_camera_model');
+if (modelSelect) {{
+    modelSelect.addEventListener('change', function() {{
+        var val = this.value;
+        var filtered = cameraDataFull.filter(function(c) {{
+            return !val || c.model === val;
+        }});
+        renderCameras(filtered);
+        var cntEl = document.getElementById('camera_filter_count');
+        if (cntEl) cntEl.textContent = filtered.length + ' из ' + cameraDataFull.length;
+    }});
+}}
 
 // --- Управление слоями ---
-var baseLayers = {{}};
 var overlayLayers = {{"ДТП": dtpLayer}};
 if ({str(has_cameras).lower()}) {{
     overlayLayers["Камеры"] = cameraLayer;
     cameraLayer.addTo(map);
 }}
-L.control.layers(baseLayers, overlayLayers, {{collapsed: false}}).addTo(map);
+L.control.layers({{}}, overlayLayers, {{collapsed: false}}).addTo(map);
 """
 
     # --------------------------------------------------
@@ -1065,8 +1325,12 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
             camera_markers, cameras is not None, has_pre,
         )
 
+        # Легенда для карты очагов
+        legend_html = self._build_cluster_legend(has_pre)
+
         body = f"""
 {summary_html}
+{legend_html}
 <div class="map-container">
   <div class="map-title">Карта очагов ДТП — {self._esc(self.region_name)}</div>
   <div id="map"></div>
@@ -1147,6 +1411,27 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
 
         return json.dumps(result, ensure_ascii=False)
 
+    def _build_cluster_legend(self, has_preclusters: bool) -> str:
+        """Легенда для карты очагов."""
+        pre_row = """
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#e0e0e0;border:2px dashed #9e9e9e;"></span></td><td>Зона предочага (пунктир)</td></tr>""" if has_preclusters else ""
+        return f"""
+<div class="legend">
+  <div style="font-weight:600;margin-bottom:6px;">Условные обозначения</div>
+  <table style="border-collapse:collapse;font-size:13px;">
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#d32f2f"></span></td><td>Очаг: 10+ ДТП</td></tr>
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#f57c00"></span></td><td>Очаг: 6–9 ДТП</td></tr>
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#fbc02d"></span></td><td>Очаг: 3–5 ДТП</td></tr>
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#4caf50"></span></td><td>Очаг: 1–2 ДТП</td></tr>
+{pre_row}
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#d32f2f"></span></td><td style="font-size:12px;">— точка ДТП с погибшими</td></tr>
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#f57c00"></span></td><td style="font-size:12px;">— точка ДТП с ранеными</td></tr>
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#4caf50"></span></td><td style="font-size:12px;">— точка ДТП, мат. ущерб</td></tr>
+    <tr><td style="padding:2px 8px 2px 0;font-size:16px;">📷</td><td>Камера фотовидеофиксации</td></tr>
+  </table>
+  <div style="margin-top:6px;color:#757575;font-size:12px;">Кликните на зону очага для подробностей. Включите слои через панель справа.</div>
+</div>"""
+
     def _cluster_map_js(
         self,
         center: tuple[float, float],
@@ -1157,7 +1442,9 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
         has_cameras: bool,
         has_preclusters: bool,
     ) -> str:
-        """JavaScript-код карты очагов."""
+        """JavaScript-код карты очагов.
+        ДТП очагов и предочагов разделены по слоям.
+        """
         return f"""
 var map = L.map('map').setView([{center[0]}, {center[1]}], {zoom});
 
@@ -1199,10 +1486,11 @@ function clusterColor(count) {{
     return '#4caf50';
 }}
 
-// --- Слои ---
-var dtpLayer = L.layerGroup();
-var clusterLayer = L.layerGroup();
-var preclusterLayer = L.layerGroup();
+// --- Слои: отдельные для ДТП очагов и предочагов ---
+var dtpClusterLayer = L.layerGroup();    // ДТП внутри очагов
+var dtpPreclusterLayer = L.layerGroup(); // ДТП внутри предочагов
+var clusterLayer = L.layerGroup();      // зоны и маркеры очагов
+var preclusterLayer = L.layerGroup();   // зоны и маркеры предочагов
 var cameraLayer = L.layerGroup();
 
 // --- Камеры ---
@@ -1218,7 +1506,7 @@ cameraData.forEach(function(c) {{
 }});
 
 // --- Функция отрисовки очага/предочага ---
-function drawClusterGroup(data, layer, isPre) {{
+function drawClusterGroup(data, zoneLayer, dtpLayer, isPre) {{
     data.forEach(function(cl) {{
         if (cl.points.length === 0) return;
         var pts = cl.points;
@@ -1234,10 +1522,10 @@ function drawClusterGroup(data, layer, isPre) {{
         }};
 
         if (hull.length >= 3) {{
-            L.polygon(hull, zoneStyle).addTo(layer);
+            L.polygon(hull, zoneStyle).addTo(zoneLayer);
         }}
 
-        // Точки ДТП внутри
+        // Точки ДТП — в соответствующий DTP-слой
         pts.forEach(function(p) {{
             L.circleMarker([p.lat, p.lon], {{
                 radius: 5, fillColor: p.color, color: '#333',
@@ -1245,7 +1533,7 @@ function drawClusterGroup(data, layer, isPre) {{
             }}).bindPopup(p.popup, {{maxWidth: 320}}).addTo(dtpLayer);
         }});
 
-        // Попап зоны (при клике на hull)
+        // Попап зоны
         var dynText = '';
         if (cl.dynamics) {{
             var statusMap = {{
@@ -1278,7 +1566,6 @@ function drawClusterGroup(data, layer, isPre) {{
                 (cl.injured ? ' | 🏥 ' + cl.injured : '') +
                 camText + dynText + preText;
 
-            // Топ типы ДТП
             var typeEntries = Object.entries(cl.types).sort(function(a,b) {{ return b[1]-a[1]; }});
             if (typeEntries.length > 0) {{
                 popupHtml += '<br><br><b>Типы ДТП:</b>';
@@ -1287,30 +1574,33 @@ function drawClusterGroup(data, layer, isPre) {{
                 }});
             }}
 
-            marker.bindPopup(popupHtml, {{maxWidth: 360}}).addTo(layer);
+            marker.bindPopup(popupHtml, {{maxWidth: 360}}).addTo(zoneLayer);
         }}
     }});
 }}
 
 // --- Отрисовка ---
 var clusterData = {clusters_js};
-drawClusterGroup(clusterData, clusterLayer, false);
+drawClusterGroup(clusterData, clusterLayer, dtpClusterLayer, false);
 
 var preclusterData = {preclusters_js};
 if (preclusterData.length > 0) {{
-    drawClusterGroup(preclusterData, preclusterLayer, true);
+    drawClusterGroup(preclusterData, preclusterLayer, dtpPreclusterLayer, true);
 }}
 
-// DTP слой добавляем
-dtpLayer.addTo(map);
+// Добавляем слои на карту
+dtpClusterLayer.addTo(map);
 clusterLayer.addTo(map);
 
 // --- Управление слоями ---
 var overlayLayers = {{
-    "Очаги": clusterLayer,
-    "ДТП (точки)": dtpLayer
+    "Очаги (зоны)": clusterLayer,
+    "ДТП в очагах": dtpClusterLayer
 }};
-if (preclusterData.length > 0) overlayLayers["Предочаги"] = preclusterLayer;
+if (preclusterData.length > 0) {{
+    overlayLayers["Предочаги (зоны)"] = preclusterLayer;
+    overlayLayers["ДТП в предочагах"] = dtpPreclusterLayer;
+}}
 if ({str(has_cameras).lower()}) overlayLayers["Камеры"] = cameraLayer;
 
 L.control.layers({{}}, overlayLayers, {{collapsed: false}}).addTo(map);
@@ -1389,6 +1679,26 @@ L.control.layers({{}}, overlayLayers, {{collapsed: false}}).addTo(map);
   </div>"""
         summary_html += "\n</div>"
 
+        # Легенда
+        legend_items = []
+        if prev_filtered:
+            legend_items.append("<tr><td style=\"padding:2px 8px 2px 0;\"><span class=\"legend-dot\" style=\"background:#1565c0;\"></span></td><td>Точка запроса</td></tr>")
+            legend_items.append("<tr><td style=\"padding:2px 8px 2px 0;\"><span class=\"legend-dot\" style=\"background:#1565c0;opacity:0.4;\"></span></td><td>ДТП прошлого периода (полупрозрачные)</td></tr>")
+        else:
+            legend_items.append("<tr><td style=\"padding:2px 8px 2px 0;\"><span class=\"legend-dot\" style=\"background:#1565c0;\"></span></td><td>Точка запроса + радиус</td></tr>")
+        legend_items.append("<tr><td style=\"padding:2px 8px 2px 0;\"><span class=\"legend-dot\" style=\"background:#d32f2f\"></span></td><td>ДТП с погибшими</td></tr>")
+        legend_items.append("<tr><td style=\"padding:2px 8px 2px 0;\"><span class=\"legend-dot\" style=\"background:#f57c00\"></span></td><td>ДТП с ранеными</td></tr>")
+        legend_items.append("<tr><td style=\"padding:2px 8px 2px 0;\"><span class=\"legend-dot\" style=\"background:#4caf50\"></span></td><td>Материальный ущерб</td></tr>")
+        if cam_in_radius:
+            legend_items.append("<tr><td style=\"padding:2px 8px 2px 0;font-size:16px;\">📷</td><td>Камера фотовидеофиксации</td></tr>")
+        legend_html = f"""
+<div class="legend">
+  <div style="font-weight:600;margin-bottom:6px;">Условные обозначения</div>
+  <table style="border-collapse:collapse;font-size:13px;">
+    {''.join(legend_items)}
+  </table>
+</div>"""
+
         # Данные карты
         dtp_geojson = self._build_dtp_geojson(current_filtered)
         prev_geojson = self._build_dtp_geojson(prev_filtered) if prev_filtered else "[]"
@@ -1403,6 +1713,7 @@ L.control.layers({{}}, overlayLayers, {{collapsed: false}}).addTo(map);
 
         body = f"""
 {summary_html}
+{legend_html}
 <div class="map-container">
   <div class="map-title">
     Статистика по точке — радиус {self._esc(radius_str)}
