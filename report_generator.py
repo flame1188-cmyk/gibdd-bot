@@ -271,17 +271,16 @@ class ReportGenerator:
         libs = self._libs_loaded()
 
         head_parts = []
-        body_bottom = []
 
         if use_map:
             leaflet_css = libs.get("leaflet.css", "")
             head_parts.append(f"<style>{leaflet_css}</style>")
             leaflet_js = libs.get("leaflet.js", "")
-            body_bottom.append(f"<script>{leaflet_js}</script>")
+            head_parts.append(f"<script>{leaflet_js}</script>")
 
         if use_echarts:
             echarts_js = libs.get("echarts.min.js", "")
-            body_bottom.append(f"<script>{echarts_js}</script>")
+            head_parts.append(f"<script>{echarts_js}</script>")
 
         now = datetime.now().strftime("%d.%m.%Y %H:%M")
         title = f"ДТП — {self.region_name} — {self.period_label}"
@@ -307,7 +306,6 @@ class ReportGenerator:
   </header>
   {body_content}
 </div>
-{"".join(body_bottom)}
 </body>
 </html>"""
 
