@@ -524,6 +524,62 @@ body {
   background: #e0e0e0;
   margin: 0 4px;
 }
+.multi-select {
+  position: relative;
+  display: inline-block;
+}
+.multi-select-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 8px;
+  border: 1px solid #bdbdbd;
+  border-radius: 4px;
+  font-size: 13px;
+  background: #fafafa;
+  cursor: pointer;
+  min-width: 180px;
+  user-select: none;
+}
+.multi-select-trigger:hover {
+  border-color: #1565c0;
+}
+.multi-select-arrow {
+  font-size: 10px;
+  margin-left: 8px;
+}
+.multi-select-dropdown {
+  display: none;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 1000;
+  background: white;
+  border: 1px solid #bdbdbd;
+  border-radius: 4px;
+  margin-top: 2px;
+  max-height: 220px;
+  overflow-y: auto;
+  min-width: 220px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+}
+.multi-select-dropdown.open {
+  display: block;
+}
+.multi-select-dropdown label {
+  display: flex;
+  align-items: center;
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.multi-select-dropdown label:hover {
+  background: #f5f5f5;
+}
+.multi-select-dropdown input[type="checkbox"] {
+  margin-right: 6px;
+}
 @media print {
   body { background: white; }
   .container { max-width: 100%; padding: 0; }
@@ -779,14 +835,20 @@ body {
 
         # Фильтр камер по модели
         if cam_models:
-            model_opts = '<option value="">Все модели</option>'
+            cb_items = ""
             for m in cam_models:
-                model_opts += f'<option value="{self._esc(m)}">{self._esc(m)}</option>'
+                cb_items += f'<label><input type="checkbox" value="{self._esc(m)}" onchange="applyDtpCameraFilter()"> {self._esc(m)}</label>\n    '
             html += f"""
   <span class="filter-divider"></span>
   <span class="filter-title">📷 Камеры:</span>
-  <div class="filter-group">
-    <select id="filter_camera_model">{model_opts}</select>
+  <div class="multi-select" id="camera_model_multi">
+    <div class="multi-select-trigger" onclick="toggleMultiSelect('camera_model_multi')">
+      <span class="multi-select-label">Все модели</span>
+      <span class="multi-select-arrow">▼</span>
+    </div>
+    <div class="multi-select-dropdown">
+    {cb_items}
+    </div>
   </div>
   <span class="filter-count" id="camera_filter_count"></span>"""
 
@@ -944,18 +1006,40 @@ function renderCameras(data) {{
 
 renderCameras(cameraDataFull);
 
-// --- Фильтр камер по модели ---
-var modelSelect = document.getElementById('filter_camera_model');
-if (modelSelect) {{
-    modelSelect.addEventListener('change', function() {{
-        var val = this.value;
-        var filtered = cameraDataFull.filter(function(c) {{
-            return !val || c.model === val;
+// --- Множественный выбор моделей камер ---
+function toggleMultiSelect(id) {{
+    var dd = document.querySelector('#' + id + ' .multi-select-dropdown');
+    dd.classList.toggle('open');
+}}
+document.addEventListener('click', function(e) {{
+    if (!e.target.closest('.multi-select')) {{
+        document.querySelectorAll('.multi-select-dropdown.open').forEach(function(d) {{
+            d.classList.remove('open');
         }});
-        renderCameras(filtered);
-        var cntEl = document.getElementById('camera_filter_count');
-        if (cntEl) cntEl.textContent = filtered.length + ' из ' + cameraDataFull.length;
+    }}
+}});
+function getSelectedModels(id) {{
+    var cbs = document.querySelectorAll('#' + id + ' .multi-select-dropdown input:checked');
+    return Array.from(cbs).map(function(cb) {{ return cb.value; }});
+}}
+function updateMultiSelectLabel(id) {{
+    var sel = getSelectedModels(id);
+    var lbl = document.querySelector('#' + id + ' .multi-select-label');
+    if (sel.length === 0) {{
+        lbl.textContent = 'Все модели';
+    }} else {{
+        lbl.textContent = sel.length + ' выбрано';
+    }}
+}}
+function applyDtpCameraFilter() {{
+    updateMultiSelectLabel('camera_model_multi');
+    var selected = getSelectedModels('camera_model_multi');
+    var filtered = cameraDataFull.filter(function(c) {{
+        return selected.length === 0 || selected.indexOf(c.model) !== -1;
     }});
+    renderCameras(filtered);
+    var cntEl = document.getElementById('camera_filter_count');
+    if (cntEl) cntEl.textContent = filtered.length + ' из ' + cameraDataFull.length;
 }}
 
 // --- Управление слоями ---
@@ -1453,15 +1537,21 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
 </div>"""
 
     def _build_camera_filter_panel(self, cam_models: list[str]) -> str:
-        """Панель фильтра камер по модели (для карт очагов/точки)."""
-        model_opts = '<option value="">Все модели</option>'
+        """Панель фильтра камер по модели (множественный выбор, для карт очагов/точки)."""
+        cb_items = ""
         for m in cam_models:
-            model_opts += f'<option value="{self._esc(m)}">{self._esc(m)}</option>'
+            cb_items += f'<label><input type="checkbox" value="{self._esc(m)}" onchange="applyClusterCameraFilter()"> {self._esc(m)}</label>\n    '
         return f"""
 <div class="filter-panel">
   <span class="filter-title">📷 Камеры:</span>
-  <div class="filter-group">
-    <select id="filter_camera_model">{model_opts}</select>
+  <div class="multi-select" id="camera_model_multi">
+    <div class="multi-select-trigger" onclick="toggleMultiSelect('camera_model_multi')">
+      <span class="multi-select-label">Все модели</span>
+      <span class="multi-select-arrow">▼</span>
+    </div>
+    <div class="multi-select-dropdown">
+    {cb_items}
+    </div>
   </div>
   <span class="filter-count" id="camera_filter_count"></span>
 </div>"""
@@ -1567,6 +1657,16 @@ function drawClusterGroup(data, zoneLayer, dtpLayer, isPre) {{
             }}).bindPopup(p.popup, {{maxWidth: 320}}).addTo(dtpLayer);
         }});
 
+        // Линии между точками ДТП очага
+        if (pts.length >= 2) {{
+            var lineCoords = pts.map(function(p) {{ return [p.lat, p.lon]; }});
+            L.polyline(lineCoords, {{
+                color: isPre ? '#9e9e9e' : color,
+                weight: 2, opacity: 0.4,
+                dashArray: isPre ? '4,4' : ''
+            }}).addTo(dtpLayer);
+        }}
+
         // Попап зоны
         var dynText = '';
         if (cl.dynamics) {{
@@ -1658,7 +1758,7 @@ if ({str(has_cameras).lower()}) overlayLayers["Камеры"] = cameraLayer;
 
 L.control.layers({{}}, overlayLayers, {{collapsed: false}}).addTo(map);
 
-// --- Фильтр камер по модели ---
+// --- Фильтр камер по модели (множественный выбор) ---
 function renderCameras(data) {{
     cameraLayer.clearLayers();
     data.forEach(function(c) {{
@@ -1667,17 +1767,39 @@ function renderCameras(data) {{
          .addTo(cameraLayer);
     }});
 }}
-var modelSelect = document.getElementById('filter_camera_model');
-if (modelSelect) {{
-    modelSelect.addEventListener('change', function() {{
-        var val = this.value;
-        var filtered = cameraDataFull.filter(function(c) {{
-            return !val || c.model === val;
+function toggleMultiSelect(id) {{
+    var dd = document.querySelector('#' + id + ' .multi-select-dropdown');
+    dd.classList.toggle('open');
+}}
+document.addEventListener('click', function(e) {{
+    if (!e.target.closest('.multi-select')) {{
+        document.querySelectorAll('.multi-select-dropdown.open').forEach(function(d) {{
+            d.classList.remove('open');
         }});
-        renderCameras(filtered);
-        var cntEl = document.getElementById('camera_filter_count');
-        if (cntEl) cntEl.textContent = filtered.length + ' из ' + cameraDataFull.length;
+    }}
+}});
+function getSelectedModels(id) {{
+    var cbs = document.querySelectorAll('#' + id + ' .multi-select-dropdown input:checked');
+    return Array.from(cbs).map(function(cb) {{ return cb.value; }});
+}}
+function updateMultiSelectLabel(id) {{
+    var sel = getSelectedModels(id);
+    var lbl = document.querySelector('#' + id + ' .multi-select-label');
+    if (sel.length === 0) {{
+        lbl.textContent = 'Все модели';
+    }} else {{
+        lbl.textContent = sel.length + ' выбрано';
+    }}
+}}
+function applyClusterCameraFilter() {{
+    updateMultiSelectLabel('camera_model_multi');
+    var selected = getSelectedModels('camera_model_multi');
+    var filtered = cameraDataFull.filter(function(c) {{
+        return selected.length === 0 || selected.indexOf(c.model) !== -1;
     }});
+    renderCameras(filtered);
+    var cntEl = document.getElementById('camera_filter_count');
+    if (cntEl) cntEl.textContent = filtered.length + ' из ' + cameraDataFull.length;
 }}
 """
 
