@@ -898,6 +898,29 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await _start_point_stats(update, context)
             return
 
+        # --- HTML-карта ДТП ---
+        if data == "do_html_map":
+            await _html_map_menu(update, context)
+            return
+
+        if data == "html_map_dtp_only":
+            await _generate_and_send_dtp_map(update, context, cameras=None)
+            return
+
+        if data == "html_map_ask_cameras":
+            context.user_data["waiting_camera_for_map"] = True
+            await query.edit_message_text(
+                "\U0001F5FA <b>Карта ДТП + камеры</b>\n\n"
+                "Отправьте Excel-файл с реестром камер\n"
+                "(gibddrf_cameras_change_*.xlsx)\n\n"
+                "Или нажмите \u274C чтобы пропустить.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("\u274C Без камер", callback_data="html_map_dtp_only"),
+                ]]),
+            )
+            return
+
         # --- Смена радиуса статистики по точке ---
         if data.startswith("ps_radius:"):
             radius_m = int(data.split(":")[1])
@@ -907,6 +930,11 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # --- Выгрузка ДТП по точке в Excel ---
         if data == "ps_excel":
             await _send_point_stats_excel(update, context)
+            return
+
+        # --- HTML-карта по точке ---
+        if data == "ps_html_map":
+            await _send_point_stats_html(update, context)
             return
 
         # --- Завершить режим вопросов ---
@@ -1011,28 +1039,6 @@ async def _start_fetching(
         except (TimedOut, NetworkError):
             logger.warning("Не удалось отправить сообщение об ошибках выгрузки")
         return
-
-    # Предупреждение о пропущенных месяцах (частичная выгрузка)
-    if errors:
-        skipped_text = "\n".join(f"- {e}" for e in errors)
-        warn_msg = (
-            f"⚠ Не удалось скачать данные за следующие месяцы:\n"
-            f"{skipped_text}\n\n"
-            f"Выгрузка неполная — сравнение периодов "
-            f"может быть некорректным.\n"
-            f"Рекомендуется повторить запрос позже."
-        )
-        try:
-            await _tg_retry(lambda: query.edit_message_text(
-                f"Выгрузка данных:\n\n"
-                f"Регион: {reg_name}\n"
-                f"Период: {period.label}\n\n"
-                f"{warn_msg}\n\n"
-                f"Найдено ДТП: {len(all_cards)}\n"
-                f"Генерация Excel-файлов..."
-            ), "edit_message_text (предупреждение о пропущенных)")
-        except (TimedOut, NetworkError):
-            logger.warning("Не удалось отправить предупреждение о пропущенных месяцах")
 
     # Обработка и генерация Excel
     try:
@@ -1154,6 +1160,10 @@ async def _offer_analysis(
         "\U0001F4CD Статистика по точке",
         callback_data="do_point_stats",
     )])
+    buttons.append([InlineKeyboardButton(
+        "\U0001F5FA HTML-карта ДТП",
+        callback_data="do_html_map",
+    )])
 
     keyboard = InlineKeyboardMarkup(buttons)
 
@@ -1164,14 +1174,17 @@ async def _offer_analysis(
             f"\U0001F4CA <b>Без ИИ</b> — математический анализ (таблицы, проценты)\n"
             f"\U0001F916 <b>С ИИ</b> — анализ + резюме от нейросети\n"
             f"\U0001F525 <b>Очаги ДТП</b> — места концентрации аварийности\n"
-            f"\U0001F4CD <b>По точке</b> — статистика ДТП по координатам"
+            f"\U0001F4CD <b>По точке</b> — статистика ДТП по координатам\n"
+            f"\U0001F5FA <b>HTML-карта</b> — интерактивная карта всех ДТП"
         )
     else:
         text = (
             f"\u2705 Выгрузка завершена: {len(current_cards)} ДТП.\n\n"
             f"Хотите провести сравнительный анализ с аналогичным периодом {prev_year} года?\n\n"
+            f"\U0001F4CA <b>Без ИИ</b> — математический анализ (таблицы, проценты)\n"
             f"\U0001F525 <b>Очаги ДТП</b> — места концентрации аварийности\n"
-            f"\U0001F4CD <b>По точке</b> — статистика ДТП по координатам"
+            f"\U0001F4CD <b>По точке</b> — статистика ДТП по координатам\n"
+            f"\U0001F5FA <b>HTML-карта</b> — интерактивная карта всех ДТП"
         )
 
     await context.bot.send_message(
@@ -1249,19 +1262,6 @@ async def _run_analysis(
             f"Возможно, данные за этот период ещё не опубликованы."
         )
         return
-
-    # Предупреждение о неполных данных за прошлый год
-    if errors:
-        err_text = "\n".join(f"- {e}" for e in errors)
-        try:
-            await status_msg.edit_text(
-                f"{mode_label}: данные за {prev_label} "
-                f"загружены неполностью.\n\n"
-                f"Не удалось скачать:\n{err_text}\n\n"
-                f"Сравнение может быть некорректным."
-            )
-        except Exception:
-            pass
 
     # Считаем метрики
     await status_msg.edit_text(f"{mode_label}: считаю метрики...")
@@ -1423,6 +1423,19 @@ async def _run_analysis(
             f"Текущий: {len(current_cards)} ДТП | Прошлый: {len(prev_cards)} ДТП"
         ),
     ), "send_document (аналитика)")
+
+    # Генерируем и отправляем HTML-отчёт с визуализациями
+    try:
+        await _send_analytics_html(
+            context, chat_id,
+            reg_name=reg_name,
+            current_label=current_label,
+            prev_label=prev_label,
+            current_cards=current_cards,
+            prev_cards=prev_cards,
+        )
+    except Exception as e:
+        logger.warning(f"Не удалось сгенерировать HTML-отчёт аналитики: {e}")
 
     # Предлагаем задать вопросы (если есть LLM-ключ)
     if LLM_API_KEY:
@@ -1753,6 +1766,19 @@ async def _run_concentration_points(
             ),
         )
 
+        # Генерируем и отправляем HTML-карту очагов
+        try:
+            await _send_clusters_html(
+                context, chat_id,
+                reg_name=reg_name,
+                current_label=current_label,
+                clusters=current_only_clusters,
+                preclusters=preclusters,
+                cameras=cameras,
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось сгенерировать HTML-карту очагов: {e}")
+
         # Сохраняем очаги в сессию (для LLM и дальнейших вопросов)
         context.user_data["analytics_clusters"] = clusters
 
@@ -1775,6 +1801,240 @@ async def _run_concentration_points(
             )
         except Exception:
             pass
+
+
+# ========================
+# HTML-карта ДТП
+# ========================
+
+async def _html_map_menu(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Показывает подменю для HTML-карты ДТП."""
+    query = update.callback_query
+
+    cards = context.user_data.get("analytics_cards", [])
+    if not cards:
+        await query.edit_message_text(
+            "Данные не найдены. Выполните выгрузку заново."
+        )
+        return
+
+    await query.edit_message_text(
+        "\U0001F5FA <b>HTML-карта ДТП</b>\n\n"
+        "Выберите вариант карты:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "\U0001F4CD Только ДТП",
+                callback_data="html_map_dtp_only",
+            )],
+            [InlineKeyboardButton(
+                "\U0001F4F7 Загрузить камеры + карта",
+                callback_data="html_map_ask_cameras",
+            )],
+        ]),
+    )
+
+
+async def _generate_and_send_dtp_map(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    cameras: list[dict] | None = None,
+) -> None:
+    """Генерирует и отправляет HTML-карту ДТП."""
+    chat_id = update.effective_chat.id
+    reg_name = context.user_data.get("analytics_reg_name", "")
+    period = context.user_data.get("analytics_period")
+    cards = context.user_data.get("analytics_cards", [])
+
+    if not cards or not period:
+        msg = await (update.callback_query.edit_message_text
+                     if update.callback_query
+                     else update.message.reply_text)(
+            "Данные не найдены. Выполните выгрузку заново."
+        )
+        return
+
+    # Прогресс
+    try:
+        if update.callback_query:
+            msg = await update.callback_query.edit_message_text(
+                "\U0001F5FA Генерация HTML-карты..."
+            )
+        else:
+            msg = await update.message.reply_text(
+                "\U0001F5FA Генерация HTML-карты..."
+            )
+    except Exception:
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text="\U0001F5FA Генерация HTML-карты...",
+        )
+
+    try:
+        from report_generator import ReportGenerator
+
+        gen = ReportGenerator(
+            region_name=reg_name,
+            period_label=period.label,
+        )
+        html_content = gen.generate_dtp_map(cards, cameras=cameras)
+
+        # Сохраняем во временный файл
+        import tempfile
+        import os as _os
+
+        safe_reg = reg_name.replace(" ", "_")[:30]
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"dtp_map_{safe_reg}_{period.label.replace(' ', '_')}_{timestamp}.html"
+
+        tmp_path = _os.path.join(
+            tempfile.gettempdir(), filename,
+        )
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+
+        size_kb = len(html_content.encode("utf-8")) / 1024
+
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=open(tmp_path, "rb"),
+            filename=filename,
+            caption=(
+                f"\U0001F5FA Карта ДТП\n"
+                f"{reg_name} | {period.label}\n"
+                f"Точек: {len(cards)}"
+                + (f" | Камер: {len(cameras)}" if cameras else "")
+                + f"\nРазмер: {size_kb:.0f} КБ"
+            ),
+        )
+
+        # Удаляем сообщение о прогрессе
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+        # Удаляем временный файл
+        try:
+            _os.remove(tmp_path)
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.error(f"Ошибка генерации HTML-карты: {e}", exc_info=True)
+        try:
+            await msg.edit_text(
+                f"\u26A0\uFE0F Ошибка генерации карты:\n\n<code>{e}</code>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
+async def _send_analytics_html(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    reg_name: str,
+    current_label: str,
+    prev_label: str,
+    current_cards: list[dict],
+    prev_cards: list[dict],
+) -> None:
+    """Генерирует и отправляет HTML-отчёт с графиками аналитики."""
+    import tempfile
+    import os as _os
+    from report_generator import ReportGenerator
+
+    gen = ReportGenerator(
+        region_name=reg_name,
+        period_label=f"{current_label} vs {prev_label}",
+    )
+    html_content = gen.generate_analytics_report(
+        current_cards=current_cards,
+        prev_cards=prev_cards,
+    )
+
+    safe_reg = reg_name.replace(" ", "_")[:30]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"analytics_{safe_reg}_{timestamp}.html"
+
+    tmp_path = _os.path.join(tempfile.gettempdir(), filename)
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    size_kb = len(html_content.encode("utf-8")) / 1024
+
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=open(tmp_path, "rb"),
+        filename=filename,
+        caption=(
+            f"\U0001F4CA Визуализация аналитики\n"
+            f"{reg_name} | {current_label} vs {prev_label}\n"
+            f"Размер: {size_kb:.0f} КБ"
+        ),
+    )
+
+    try:
+        _os.remove(tmp_path)
+    except Exception:
+        pass
+
+
+async def _send_clusters_html(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    reg_name: str,
+    current_label: str,
+    clusters: list[dict],
+    preclusters: list[dict] | None = None,
+    cameras: list[dict] | None = None,
+) -> None:
+    """Генерирует и отправляет HTML-карту очагов."""
+    import tempfile
+    import os as _os
+    from report_generator import ReportGenerator
+
+    gen = ReportGenerator(
+        region_name=reg_name,
+        period_label=current_label,
+    )
+    html_content = gen.generate_cluster_map(
+        clusters=clusters,
+        preclusters=preclusters,
+        cameras=cameras,
+    )
+
+    safe_reg = reg_name.replace(" ", "_")[:30]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"ochagi_{safe_reg}_{timestamp}.html"
+
+    tmp_path = _os.path.join(tempfile.gettempdir(), filename)
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    size_kb = len(html_content.encode("utf-8")) / 1024
+
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=open(tmp_path, "rb"),
+        filename=filename,
+        caption=(
+            f"\U0001F525 Карта очагов ДТП\n"
+            f"{reg_name} | {current_label}\n"
+            f"Очагов: {len(clusters)}"
+            + (f" | Предочагов: {len(preclusters)}" if preclusters else "")
+            + (f" | Камер: {len(cameras)}" if cameras else "")
+            + f"\nРазмер: {size_kb:.0f} КБ"
+        ),
+    )
+
+    try:
+        _os.remove(tmp_path)
+    except Exception:
+        pass
 
 
 # ========================
@@ -1827,23 +2087,10 @@ async def _start_point_stats(
                 f"{i}/{total} — {month_name} {year}"
             )
 
-        prev_cards, pt_errors = await _fetch_cards_for_period(
+        prev_cards, _ = await _fetch_cards_for_period(
             dat_list_prev, reg_code, "Точечная статистика",
             progress_callback=pt_progress,
         )
-
-        # Предупреждение о неполных данных
-        if pt_errors:
-            err_text = "\n".join(f"- {e}" for e in pt_errors)
-            try:
-                await status_msg.edit_text(
-                    f"\U0001F4CD Данные за {prev_label} "
-                    f"загружены неполностью.\n\n"
-                    f"Не удалось скачать:\n{err_text}\n\n"
-                    f"Сравнение может быть некорректным."
-                )
-            except Exception:
-                pass
 
         # Сохраняем для повторного использования
         if prev_cards:
@@ -1990,6 +2237,90 @@ async def _send_point_stats_excel(
     )
 
 
+async def _send_point_stats_html(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Генерирует и отправляет HTML-карту по точке."""
+    import tempfile
+    import os as _os
+
+    chat_id = update.effective_chat.id
+    await update.callback_query.answer("Генерирую HTML-карту...")
+
+    lat = context.user_data.get("point_stats_lat")
+    lon = context.user_data.get("point_stats_lon")
+    radius_m = context.user_data.get("point_stats_radius", 500)
+
+    if lat is None or lon is None:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Координаты потеряны. Отправьте заново.",
+        )
+        return
+
+    reg_name = context.user_data.get("analytics_reg_name", "")
+    current_cards = context.user_data.get("analytics_cards", [])
+    prev_cards = context.user_data.get("analytics_prev_cards", [])
+    period = context.user_data.get("analytics_period")
+    current_label = period.label if period else "Текущий период"
+    prev_label = context.user_data.get("analytics_prev_label", "")
+    cameras = context.user_data.get("cameras_data")
+
+    try:
+        from report_generator import ReportGenerator
+
+        gen = ReportGenerator(
+            region_name=reg_name,
+            period_label=current_label,
+        )
+        html_content = gen.generate_point_stats_map(
+            lat=lat,
+            lon=lon,
+            radius_m=radius_m,
+            current_cards=current_cards,
+            prev_cards=prev_cards if prev_cards else None,
+            cameras=cameras,
+            current_label=current_label,
+            prev_label=prev_label,
+        )
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"point_stats_{radius_m}m_{timestamp}.html"
+
+        tmp_path = _os.path.join(tempfile.gettempdir(), filename)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+
+        size_kb = len(html_content.encode("utf-8")) / 1024
+
+        radius_str = f"{radius_m} м" if radius_m < 1000 else f"{radius_m/1000:.0f} км"
+
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=open(tmp_path, "rb"),
+            filename=filename,
+            caption=(
+                f"\U0001F4CD Карта по точке\n"
+                f"Радиус: {radius_str}\n"
+                f"Координаты: {lat:.5f}, {lon:.5f}\n"
+                f"Размер: {size_kb:.0f} КБ"
+            ),
+        )
+
+        try:
+            _os.remove(tmp_path)
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.error(f"Ошибка генерации HTML-карты по точке: {e}", exc_info=True)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"\u26A0\uFE0F Ошибка генерации карты: {e}",
+        )
+
+
 async def _process_point_stats(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -2047,6 +2378,10 @@ async def _process_point_stats(
         buttons.append([InlineKeyboardButton(
             excel_label,
             callback_data="ps_excel",
+        )])
+        buttons.append([InlineKeyboardButton(
+            "\U0001F5FA HTML-карта",
+            callback_data="ps_html_map",
         )])
 
     keyboard = InlineKeyboardMarkup(buttons)
@@ -2215,6 +2550,59 @@ async def _handle_document(
     update: Update, context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """Обрабатывает загрузку файла (камеры фотовидеофиксации)."""
+
+    # --- Загрузка камер для HTML-карты ДТП ---
+    if context.user_data.get("waiting_camera_for_map"):
+        context.user_data.pop("waiting_camera_for_map", None)
+        document = update.message.document
+        if not document:
+            return
+        filename = document.file_name or ""
+        if not filename.startswith("gibddrf_cameras_change"):
+            await update.message.reply_text(
+                "\u26A0\uFE0F Неверный файл.\n\n"
+                "Ожидается: gibddrf_cameras_change_*.xls"
+            )
+            return
+        wait_msg = await update.message.reply_text(
+            "\U0001F4F7 Обработка файла камер..."
+        )
+        try:
+            file = await document.get_file()
+            import tempfile
+            import os as _os
+            from camera_loader import parse_camera_file
+
+            tmp_path = _os.path.join(
+                tempfile.gettempdir(), f"cam_{document.file_id}.xls"
+            )
+            try:
+                await file.download_to_drive(custom_path=tmp_path)
+                with open(tmp_path, "rb") as f:
+                    file_bytes = f.read()
+            finally:
+                if _os.path.exists(tmp_path):
+                    _os.remove(tmp_path)
+
+            cameras = parse_camera_file(file_bytes)
+            if not cameras:
+                await wait_msg.edit_text(
+                    "\u26A0\uFE0F В файле не найдено камер."
+                )
+                return
+
+            await wait_msg.edit_text(
+                f"\u2705 Загружено {len(cameras)} камер. "
+                f"Генерирую карту..."
+            )
+            await _generate_and_send_dtp_map(
+                update, context, cameras=cameras,
+            )
+        except Exception as e:
+            logger.error(f"Ошибка загрузки камер для карты: {e}")
+            await wait_msg.edit_text(f"\u26A0\uFE0F Ошибка: {e}")
+        return
+
     if not context.user_data.get("waiting_camera_file"):
         # Не ожидаем файл — игнорируем
         return
