@@ -2029,6 +2029,16 @@ async def _generate_and_send_dtp_map(
         except Exception:
             pass
 
+        # Показываем кнопку возврата в меню
+        menu_text, menu_kb = _build_menu_keyboard(context)
+        if menu_text and menu_kb:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=menu_text,
+                reply_markup=menu_kb,
+                parse_mode="HTML",
+            )
+
     except Exception as e:
         logger.error(f"Ошибка генерации HTML-карты: {e}", exc_info=True)
         try:
