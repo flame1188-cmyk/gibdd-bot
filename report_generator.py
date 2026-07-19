@@ -664,7 +664,6 @@ body {
   <table style="border-collapse:collapse;font-size:13px;">
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#d32f2f"></span></td><td>ДТП с погибшими</td></tr>
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#f57c00"></span></td><td>ДТП с ранеными</td></tr>
-    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#4caf50"></span></td><td>ДТП — только материальный ущерб</td></tr>
     <tr><td style="padding:2px 8px 2px 0;font-size:16px;">📷</td><td>Камера фотовидеофиксации</td></tr>
   </table>
   <div style="margin-top:6px;color:#757575;font-size:12px;">Нажмите на маркер для подробностей. Колёсико мыши / +/- — масштаб.</div>
@@ -1328,9 +1327,18 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
         # Легенда для карты очагов
         legend_html = self._build_cluster_legend(has_pre)
 
+        # Фильтр камер по модели (если есть камеры)
+        cam_models = sorted(set(
+            c.get("model", "") for c in (cameras or []) if c.get("model")
+        )) if cameras else []
+        filter_html = ""
+        if cam_models:
+            filter_html = self._build_camera_filter_panel(cam_models)
+
         body = f"""
 {summary_html}
 {legend_html}
+{filter_html}
 <div class="map-container">
   <div class="map-title">Карта очагов ДТП — {self._esc(self.region_name)}</div>
   <div id="map"></div>
@@ -1368,16 +1376,28 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
             types = cl.get("type_counter", {})
             center = cl.get("center")
 
-            # Камера
-            cam_match = cl.get("camera_match")
+            # Камера — все три состояния
+            cam_match = cl.get("camera_match") or {}
             cam_info = None
-            if cam_match and cam_match.get("status") == "закрыт":
-                cam = cam_match.get("camera", {})
+            cam_status = cam_match.get("status", "открыт")
+            if cam_status == "закрыт":
+                cam = cam_match.get("in_cluster")
                 cam_info = {
                     "status": "закрыт",
-                    "distance": cam_match.get("distance_m"),
                     "popup": _camera_popup_html(cam) if cam else None,
                 }
+            else:
+                # Отдельно проверяем ближайшую камеру
+                nearest = cam_match.get("nearest")
+                near_dist = cam_match.get("nearest_dist_m")
+                if nearest:
+                    cam_info = {
+                        "status": "открыт_ближайшая",
+                        "nearest_dist": near_dist,
+                        "popup": _camera_popup_html(nearest),
+                    }
+                else:
+                    cam_info = {"status": "открыт"}
 
             # Динамика
             dynamics = cl.get("dynamics")
@@ -1403,6 +1423,8 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
                 "pre_criterion": pre_criterion,
                 "camera": cam_info,
                 "dynamics": dyn_info,
+                "piket_min": cl.get("dtp_pk_min"),
+                "piket_max": cl.get("dtp_pk_max"),
             }
             if center:
                 entry["center"] = list(center)
@@ -1422,14 +1444,26 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#d32f2f"></span></td><td>Очаг: 10+ ДТП</td></tr>
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#f57c00"></span></td><td>Очаг: 6–9 ДТП</td></tr>
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#fbc02d"></span></td><td>Очаг: 3–5 ДТП</td></tr>
-    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#4caf50"></span></td><td>Очаг: 1–2 ДТП</td></tr>
 {pre_row}
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#d32f2f"></span></td><td style="font-size:12px;">— точка ДТП с погибшими</td></tr>
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#f57c00"></span></td><td style="font-size:12px;">— точка ДТП с ранеными</td></tr>
-    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#4caf50"></span></td><td style="font-size:12px;">— точка ДТП, мат. ущерб</td></tr>
     <tr><td style="padding:2px 8px 2px 0;font-size:16px;">📷</td><td>Камера фотовидеофиксации</td></tr>
   </table>
   <div style="margin-top:6px;color:#757575;font-size:12px;">Кликните на зону очага для подробностей. Включите слои через панель справа.</div>
+</div>"""
+
+    def _build_camera_filter_panel(self, cam_models: list[str]) -> str:
+        """Панель фильтра камер по модели (для карт очагов/точки)."""
+        model_opts = '<option value="">Все модели</option>'
+        for m in cam_models:
+            model_opts += f'<option value="{self._esc(m)}">{self._esc(m)}</option>'
+        return f"""
+<div class="filter-panel">
+  <span class="filter-title">📷 Камеры:</span>
+  <div class="filter-group">
+    <select id="filter_camera_model">{model_opts}</select>
+  </div>
+  <span class="filter-count" id="camera_filter_count"></span>
 </div>"""
 
     def _cluster_map_js(
@@ -1498,8 +1532,8 @@ var cameraIcon = L.divIcon({{
     html: '<div style="font-size:18px;text-align:center;line-height:1;">📷</div>',
     iconSize: [24, 24], iconAnchor: [12, 12], className: ''
 }});
-var cameraData = {camera_markers_js};
-cameraData.forEach(function(c) {{
+var cameraDataFull = {camera_markers_js};
+cameraDataFull.forEach(function(c) {{
     L.marker([c.lat, c.lon], {{icon: cameraIcon}})
      .bindPopup(c.popup, {{maxWidth: 320}})
      .addTo(cameraLayer);
@@ -1548,9 +1582,23 @@ function drawClusterGroup(data, zoneLayer, dtpLayer, isPre) {{
         }}
         var preText = isPre ? '<br><i>' + cl.pre_criterion + '</i>' : '';
         var camText = '';
-        if (cl.camera && cl.camera.status === 'закрыт') {{
-            camText = '<br>📷 <b>Закрыт камерой</b>' +
-                (cl.camera.distance ? ' (' + Math.round(cl.camera.distance) + ' м)' : '');
+        if (cl.camera) {{
+            if (cl.camera.status === 'закрыт') {{
+                camText = '<br>📷 <b>Закрыт камерой</b>';
+            }} else if (cl.camera.status === 'открыт_ближайшая') {{
+                var d = cl.camera.nearest_dist ? Math.round(cl.camera.nearest_dist) + ' м' : '';
+                camText = '<br>📷 Не закрыт, ближайшая: ' + d;
+            }} else {{
+                camText = '<br>📷 Не закрыт камерой';
+            }}
+        }}
+
+        // Пикетаж очага
+        var piketText = '';
+        if (cl.piket_min != null && cl.piket_max != null) {{
+            piketText = '<br>📏 Пикетаж: ' + cl.piket_min.toFixed(3) + ' — ' + cl.piket_max.toFixed(3) + ' км';
+        }} else if (cl.piket_min != null) {{
+            piketText = '<br>📏 Пикетаж: ' + cl.piket_min.toFixed(3) + ' км';
         }}
 
         // Маркер центра с попапом очага
@@ -1564,7 +1612,7 @@ function drawClusterGroup(data, zoneLayer, dtpLayer, isPre) {{
                 '<br>ДТП: ' + cl.count +
                 (cl.deaths ? ' | 💀 ' + cl.deaths : '') +
                 (cl.injured ? ' | 🏥 ' + cl.injured : '') +
-                camText + dynText + preText;
+                camText + dynText + preText + piketText;
 
             var typeEntries = Object.entries(cl.types).sort(function(a,b) {{ return b[1]-a[1]; }});
             if (typeEntries.length > 0) {{
@@ -1572,6 +1620,11 @@ function drawClusterGroup(data, zoneLayer, dtpLayer, isPre) {{
                 typeEntries.slice(0, 5).forEach(function(e) {{
                     popupHtml += '<br>&bull; ' + e[0] + ' — ' + e[1];
                 }});
+            }}
+
+            // Информация о камере
+            if (cl.camera && cl.camera.popup) {{
+                popupHtml += '<br><br><b>Камера:</b><br>' + cl.camera.popup;
             }}
 
             marker.bindPopup(popupHtml, {{maxWidth: 360}}).addTo(zoneLayer);
@@ -1604,6 +1657,28 @@ if (preclusterData.length > 0) {{
 if ({str(has_cameras).lower()}) overlayLayers["Камеры"] = cameraLayer;
 
 L.control.layers({{}}, overlayLayers, {{collapsed: false}}).addTo(map);
+
+// --- Фильтр камер по модели ---
+function renderCameras(data) {{
+    cameraLayer.clearLayers();
+    data.forEach(function(c) {{
+        L.marker([c.lat, c.lon], {{icon: cameraIcon}})
+         .bindPopup(c.popup, {{maxWidth: 320}})
+         .addTo(cameraLayer);
+    }});
+}}
+var modelSelect = document.getElementById('filter_camera_model');
+if (modelSelect) {{
+    modelSelect.addEventListener('change', function() {{
+        var val = this.value;
+        var filtered = cameraDataFull.filter(function(c) {{
+            return !val || c.model === val;
+        }});
+        renderCameras(filtered);
+        var cntEl = document.getElementById('camera_filter_count');
+        if (cntEl) cntEl.textContent = filtered.length + ' из ' + cameraDataFull.length;
+    }});
+}}
 """
 
     # --------------------------------------------------
