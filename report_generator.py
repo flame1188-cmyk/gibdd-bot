@@ -588,6 +588,56 @@ body {
 .multi-select-dropdown input[type="checkbox"] {
   margin-right: 6px;
 }
+/* --- Панель поиска по координатам --- */
+.coord-search {
+  background: white;
+  border-radius: 8px;
+  padding: 10px 16px;
+  margin-bottom: 12px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  flex-wrap: wrap;
+}
+.coord-search .cs-label {
+  font-weight: 600;
+  font-size: 14px;
+  white-space: nowrap;
+}
+.coord-search input {
+  padding: 5px 8px;
+  border: 1px solid #bdbdbd;
+  border-radius: 4px;
+  font-size: 13px;
+  width: 140px;
+  background: #fafafa;
+}
+.coord-search input:focus {
+  outline: none;
+  border-color: #1565c0;
+}
+.coord-search .btn-cs {
+  padding: 5px 14px;
+  border: none;
+  border-radius: 4px;
+  font-size: 13px;
+  cursor: pointer;
+  font-weight: 500;
+  background: #1565c0;
+  color: white;
+}
+.coord-search .btn-cs:hover { background: #0d47a1; }
+.coord-search .btn-cs-clear {
+  background: #e0e0e0;
+  color: #424242;
+}
+.coord-search .btn-cs-clear:hover { background: #bdbdbd; }
+.coord-search .cs-hint {
+  color: #9e9e9e;
+  font-size: 11px;
+}
 @media print {
   body { background: white; }
   .container { max-width: 100%; padding: 0; }
@@ -673,6 +723,7 @@ body {
 {summary_html}
 {legend_html}
 {filter_html}
+{self._build_coord_search_html()}
 <div class="map-container">
   <div class="map-title">Карта ДТП — {self._esc(self.region_name)}</div>
   <div id="map"></div>
@@ -862,6 +913,82 @@ body {
 
         html += "\n</div>"
         return html
+
+    @staticmethod
+    def _build_coord_search_html() -> str:
+        """Панель поиска по координатам (HTML + JS)."""
+        return """
+<div class="coord-search">
+  <span class="cs-label">📍 Координаты:</span>
+  <input type="text" id="cs_lat" placeholder="Широта (59.1234)">
+  <input type="text" id="cs_lon" placeholder="Долгота (39.5678)">
+  <button class="btn-cs" onclick="goToCoords()">Перейти</button>
+  <button class="btn-cs btn-cs-clear" onclick="clearCoordSearch()">Сбросить вид</button>
+  <span class="cs-hint">Формат: 59.1234, 39.5678 — Enter для быстрого поиска</span>
+</div>
+<script>
+(function() {
+  // Поддержка ввода "lat, lon" в первое поле
+  var latInput = document.getElementById('cs_lat');
+  var lonInput = document.getElementById('cs_lon');
+
+  latInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      // Если введено "lat, lon" — разбиваем
+      var val = latInput.value.trim();
+      if (val.indexOf(',') !== -1 && !lonInput.value.trim()) {
+        var parts = val.split(',');
+        if (parts.length === 2) {
+          latInput.value = parts[0].trim();
+          lonInput.value = parts[1].trim();
+        }
+      }
+      goToCoords();
+    }
+  });
+  lonInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      goToCoords();
+    }
+  });
+})();
+
+function goToCoords() {
+  var lat = parseFloat(document.getElementById('cs_lat').value);
+  var lon = parseFloat(document.getElementById('cs_lon').value);
+  if (isNaN(lat) || isNaN(lon)) {
+    document.getElementById('cs_lat').style.borderColor = '#d32f2f';
+    document.getElementById('cs_lon').style.borderColor = '#d32f2f';
+    setTimeout(function() {
+      document.getElementById('cs_lat').style.borderColor = '';
+      document.getElementById('cs_lon').style.borderColor = '';
+    }, 1500);
+    return;
+  }
+  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+    return;
+  }
+  // Ставим маркер и летим
+  if (window._searchMarker) map.removeLayer(window._searchMarker);
+  window._searchMarker = L.circleMarker([lat, lon], {
+    radius: 10, fillColor: '#e91e63', color: '#880e4f',
+    weight: 3, fillOpacity: 0.9
+  }).bindPopup('<b>Поиск:</b><br>' + lat.toFixed(5) + ', ' + lon.toFixed(5)).addTo(map);
+  map.setView([lat, lon], 16);
+}
+
+function clearCoordSearch() {
+  if (window._searchMarker) {
+    map.removeLayer(window._searchMarker);
+    window._searchMarker = null;
+  }
+  document.getElementById('cs_lat').value = '';
+  document.getElementById('cs_lon').value = '';
+}
+</script>
+"""
 
     def _calc_center(
         self, cards: list[dict],
@@ -1431,6 +1558,7 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
 {summary_html}
 {legend_html}
 {filter_html}
+{self._build_coord_search_html()}
 <div class="map-container">
   <div class="map-title">Карта очагов ДТП — {self._esc(self.region_name)}</div>
   <div id="map"></div>
@@ -1920,6 +2048,7 @@ function applyClusterCameraFilter() {{
         body = f"""
 {summary_html}
 {legend_html}
+{self._build_coord_search_html()}
 <div class="map-container">
   <div class="map-title">
     Статистика по точке — радиус {self._esc(radius_str)}
