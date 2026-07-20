@@ -207,6 +207,21 @@ class _DataCache:
 
 data_cache = _DataCache(maxsize=50, ttl=3600.0)
 
+# ========================
+# Защита от гонок при concurrent_updates=True (БАГ 5)
+# ========================
+# Один asyncio.Lock на пользователя — предотвращает параллельную
+# коррупцию user_data при быстрых двойных нажатиях кнопок.
+_user_locks: dict[int, asyncio.Lock] = {}
+
+
+def _get_user_lock(user_id: int) -> asyncio.Lock:
+    """Возвращает (или создаёт) Lock для данного пользователя."""
+    if user_id not in _user_locks:
+        _user_locks[user_id] = asyncio.Lock()
+    return _user_locks[user_id]
+
+
 # Лимит символов в одном сообщении Telegram
 TG_MSG_LIMIT = 4096
 
@@ -711,366 +726,406 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     data = query.data
 
-    try:
-        # --- Навигация по страницам регионов ---
-        if data.startswith("rp:"):
-            parts = data.split(":")
-            if parts[1] != "noop":
-                page = int(parts[1])
+    # Блокировка по пользователю — предотвращает гонку user_data
+    # при concurrent_updates=True (быстрые двойные нажатия кнопок)
+    lock = _get_user_lock(user_id)
+    if lock.locked():
+        # Другой callback уже обрабатывается — игнорируем
+        logger.debug(f"Callback от user_id={user_id} пропущен (locked): {data}")
+        return
+
+    async with lock:
+        try:
+            # --- Навигация по страницам регионов ---
+            if data.startswith("rp:"):
+                parts = data.split(":")
+                if parts[1] != "noop":
+                    try:
+                        page = int(parts[1])
+                    except (ValueError, IndexError):
+                        return
+                    regions = _get_regions(context)
+                    keyboard = build_region_keyboard(regions, page)
+                    await query.edit_message_text(
+                        "Выберите регион:", reply_markup=keyboard,
+                    )
+                return
+
+            # --- Выбор региона ---
+            if data.startswith("r:"):
+                reg_code = data[2:]
                 regions = _get_regions(context)
-                keyboard = build_region_keyboard(regions, page)
-                await query.edit_message_text(
-                    "Выберите регион:", reply_markup=keyboard,
-                )
-            return
+                reg_name = "Регион " + reg_code
+                for r in regions:
+                    if r["code"] == reg_code:
+                        reg_name = r["name"]
+                        break
 
-        # --- Выбор региона ---
-        if data.startswith("r:"):
-            reg_code = data[2:]
-            regions = _get_regions(context)
-            reg_name = "Регион " + reg_code
-            for r in regions:
-                if r["code"] == reg_code:
-                    reg_name = r["name"]
-                    break
+                context.user_data["reg_code"] = reg_code
+                context.user_data["reg_name"] = reg_name
 
-            context.user_data["reg_code"] = reg_code
-            context.user_data["reg_name"] = reg_name
+                # Показываем клавиатуру выбора периода
+                current_year = datetime.now().year
+                context.user_data["sel_year"] = current_year
+                keyboard = build_period_keyboard(current_year)
 
-            # Показываем клавиатуру выбора периода
-            current_year = datetime.now().year
-            context.user_data["sel_year"] = current_year
-            keyboard = build_period_keyboard(current_year)
-
-            await query.edit_message_text(
-                f"Регион: {reg_name}\n\n"
-                f"Выберите период:",
-                reply_markup=keyboard,
-            )
-            return
-
-        # --- Выбор периода: Весь год ---
-        if data.startswith("py:"):
-            year = int(data[3:])
-            period = ParsedPeriod(
-                months=list(range(1, 13)),
-                year=year,
-                label=f"Весь {year} год",
-            )
-            await _start_fetching(query, context, period)
-            return
-
-        # --- Выбор периода: Квартал ---
-        if data.startswith("pq:"):
-            parts = data.split(":")
-            q = int(parts[1])
-            year = int(parts[2])
-            start = (q - 1) * 3 + 1
-            end = start + 2
-            period = ParsedPeriod(
-                months=list(range(start, end + 1)),
-                year=year,
-                label=f"{['I','II','III','IV'][q-1]} квартал {year} "
-                      f"({MONTH_SHORT[start]}-{MONTH_SHORT[end]})",
-            )
-            await _start_fetching(query, context, period)
-            return
-
-        # --- Выбор периода: Полугодие ---
-        if data.startswith("ph:"):
-            parts = data.split(":")
-            half = int(parts[1])
-            year = int(parts[2])
-            if half == 1:
-                months = list(range(1, 7))
-                label = f"Полугодие 1 {year} (Янв-Июн)"
-            else:
-                months = list(range(7, 13))
-                label = f"Полугодие 2 {year} (Июл-Дек)"
-            period = ParsedPeriod(months=months, year=year, label=label)
-            await _start_fetching(query, context, period)
-            return
-
-        # --- Выбор периода: 9 месяцев ---
-        if data.startswith("p9:"):
-            year = int(data[3:])
-            period = ParsedPeriod(
-                months=list(range(1, 10)),
-                year=year,
-                label=f"9 месяцев {year} (Янв-Сен)",
-            )
-            await _start_fetching(query, context, period)
-            return
-
-        # --- Выбор периода: Произвольное количество месяцев ---
-        if data.startswith("pn:"):
-            parts = data.split(":")
-            n = int(parts[1])
-            year = int(parts[2])
-            months = list(range(1, n + 1))
-            label = f"За {n} мес. {year} ({MONTH_SHORT[1]}-{MONTH_SHORT[n]})"
-            period = ParsedPeriod(months=months, year=year, label=label)
-            await _start_fetching(query, context, period)
-            return
-
-        # --- Выбор периода: Конкретный месяц ---
-        if data.startswith("pm:"):
-            parts = data.split(":")
-            month = int(parts[1])
-            year = int(parts[2])
-            period = ParsedPeriod(
-                months=[month],
-                year=year,
-                label=f"{MONTH_FULL.get(month, '')} {year}",
-            )
-            await _start_fetching(query, context, period)
-            return
-
-        # --- Навигация по годам ---
-        if data.startswith("yy:"):
-            parts = data.split(":")
-            if parts[1] != "noop":
-                year = int(parts[1])
-                context.user_data["sel_year"] = year
-                keyboard = build_period_keyboard(year)
-                reg_name = context.user_data.get("reg_name", "")
                 await query.edit_message_text(
                     f"Регион: {reg_name}\n\n"
                     f"Выберите период:",
                     reply_markup=keyboard,
                 )
-            return
+                return
 
-        # --- Назад к регионам ---
-        if data == "back":
-            context.user_data.pop("reg_code", None)
-            context.user_data.pop("reg_name", None)
-            regions = _get_regions(context)
-            keyboard = build_region_keyboard(regions, page=0)
-            await query.edit_message_text(
-                "Выберите регион:", reply_markup=keyboard,
-            )
-            return
-
-        # --- Запрос аналитики (без ИИ) ---
-        if data == "do_analytics":
-            await _run_analysis(update, context, use_llm=False)
-            return
-
-        # --- Запрос аналитики (с ИИ) ---
-        if data == "do_analytics_ai":
-            await _run_analysis(update, context, use_llm=True)
-            return
-
-        # --- Расчёт очагов ДТП ---
-        if data == "do_concentration":
-            # Проверяем, есть ли камеры в кэше для этого региона
-            reg_code = (
-                context.user_data.get("concentration_reg_code", "")
-                or context.user_data.get("reg_code", "")
-                or context.user_data.get("analytics_reg_code", "")
-            )
-            # Запоминаем код региона для последующей загрузки файла камер
-            if reg_code:
-                context.user_data["concentration_reg_code"] = reg_code
-            from camera_cache import has_cached_cameras, load_cameras_from_cache
-
-            cached_cameras = None
-            if reg_code and has_cached_cameras(reg_code):
-                cached_cameras = load_cameras_from_cache(reg_code)
-
-            if cached_cameras:
-                # Камеры в кэше — предлагаем использовать их или загрузить новые
-                with_pk = sum(1 for c in cached_cameras if c["has_piket"])
-                keyboard = InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton(
-                            f"\U0001F4F7 Использовать сохранённые ({len(cached_cameras)} камер)",
-                            callback_data="cam_use_cached",
-                        ),
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "\U0001F4E4 Загрузить новый файл",
-                            callback_data="cam_ask_upload",
-                        ),
-                        InlineKeyboardButton(
-                            "\u27A1 Без камер",
-                            callback_data="cam_skip",
-                        ),
-                    ],
-                ])
-                await query.edit_message_text(
-                    "\U0001F525 <b>Очаги ДТП</b>\n\n"
-                    f"Для региона <b>{reg_code}</b> найден сохранённый файл камер:\n"
-                    f"  \u2022 Всего: {len(cached_cameras)}\n"
-                    f"  \u2022 С пикетажем: {with_pk}\n\n"
-                    "Использовать его или загрузить новый?",
-                    reply_markup=keyboard,
-                    parse_mode="HTML",
+            # --- Выбор периода: Весь год ---
+            if data.startswith("py:"):
+                year = int(data[3:])
+                period = ParsedPeriod(
+                    months=list(range(1, 13)),
+                    year=year,
+                    label=f"Весь {year} год",
                 )
-            else:
-                # Камер в кэше нет — просим загрузить
-                keyboard = InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton(
-                            "\U0001F4F7 Загрузить камеры",
-                            callback_data="cam_ask_upload",
-                        ),
-                        InlineKeyboardButton(
-                            "\u27A1 Без камер",
-                            callback_data="cam_skip",
-                        ),
-                    ],
-                ])
-                await query.edit_message_text(
-                    "\U0001F525 <b>Очаги ДТП</b>\n\n"
-                    "Загрузите файл с камерами фотовидеофиксации\n"
-                    "(gibddrf_cameras_change_*.xls)\n"
-                    "или продолжите без камер.",
-                    reply_markup=keyboard,
-                    parse_mode="HTML",
+                await _start_fetching(query, context, period)
+                return
+
+            # --- Выбор периода: Квартал ---
+            if data.startswith("pq:"):
+                parts = data.split(":")
+                try:
+                    q = int(parts[1])
+                    year = int(parts[2])
+                except (ValueError, IndexError):
+                    return
+                start = (q - 1) * 3 + 1
+                end = start + 2
+                period = ParsedPeriod(
+                    months=list(range(start, end + 1)),
+                    year=year,
+                    label=f"{['I','II','III','IV'][q-1]} квартал {year} "
+                          f"({MONTH_SHORT[start]}-{MONTH_SHORT[end]})",
                 )
-            return
+                await _start_fetching(query, context, period)
+                return
 
-        # --- Камеры: пропустить ---
-        if data == "cam_skip":
-            context.user_data.pop("cameras_data", None)
-            await query.edit_message_text(
-                "\U0001F525 Запуск расчёта очагов (без камер)..."
-            )
-            await _run_concentration_points(update, context)
-            return
+            # --- Выбор периода: Полугодие ---
+            if data.startswith("ph:"):
+                parts = data.split(":")
+                try:
+                    half = int(parts[1])
+                    year = int(parts[2])
+                except (ValueError, IndexError):
+                    return
+                if half == 1:
+                    months = list(range(1, 7))
+                    label = f"Полугодие 1 {year} (Янв-Июн)"
+                else:
+                    months = list(range(7, 13))
+                    label = f"Полугодие 2 {year} (Июл-Дек)"
+                period = ParsedPeriod(months=months, year=year, label=label)
+                await _start_fetching(query, context, period)
+                return
 
-        # --- Камеры: использовать сохранённые из кэша ---
-        if data == "cam_use_cached":
-            from camera_cache import load_cameras_from_cache
-            reg_code = (
-                context.user_data.get("concentration_reg_code", "")
-                or context.user_data.get("reg_code", "")
-                or context.user_data.get("analytics_reg_code", "")
-            )
-            cameras = load_cameras_from_cache(reg_code) if reg_code else None
-            if cameras:
-                context.user_data["cameras_data"] = cameras
+            # --- Выбор периода: 9 месяцев ---
+            if data.startswith("p9:"):
+                year = int(data[3:])
+                period = ParsedPeriod(
+                    months=list(range(1, 10)),
+                    year=year,
+                    label=f"9 месяцев {year} (Янв-Сен)",
+                )
+                await _start_fetching(query, context, period)
+                return
+
+            # --- Выбор периода: Произвольное количество месяцев ---
+            if data.startswith("pn:"):
+                parts = data.split(":")
+                try:
+                    n = int(parts[1])
+                    year = int(parts[2])
+                except (ValueError, IndexError):
+                    return
+                months = list(range(1, n + 1))
+                label = f"За {n} мес. {year} ({MONTH_SHORT[1]}-{MONTH_SHORT[n]})"
+                period = ParsedPeriod(months=months, year=year, label=label)
+                await _start_fetching(query, context, period)
+                return
+
+            # --- Выбор периода: Конкретный месяц ---
+            if data.startswith("pm:"):
+                parts = data.split(":")
+                try:
+                    month = int(parts[1])
+                    year = int(parts[2])
+                except (ValueError, IndexError):
+                    return
+                period = ParsedPeriod(
+                    months=[month],
+                    year=year,
+                    label=f"{MONTH_FULL.get(month, '')} {year}",
+                )
+                await _start_fetching(query, context, period)
+                return
+
+            # --- Навигация по годам ---
+            if data.startswith("yy:"):
+                parts = data.split(":")
+                if parts[1] != "noop":
+                    try:
+                        year = int(parts[1])
+                    except (ValueError, IndexError):
+                        return
+                    context.user_data["sel_year"] = year
+                    keyboard = build_period_keyboard(year)
+                    reg_name = context.user_data.get("reg_name", "")
+                    await query.edit_message_text(
+                        f"Регион: {reg_name}\n\n"
+                        f"Выберите период:",
+                        reply_markup=keyboard,
+                    )
+                return
+
+            # --- Назад к регионам ---
+            if data == "back":
+                context.user_data.pop("reg_code", None)
+                context.user_data.pop("reg_name", None)
+                regions = _get_regions(context)
+                keyboard = build_region_keyboard(regions, page=0)
                 await query.edit_message_text(
-                    f"\U0001F525 Запуск расчёта очагов "
-                    f"(с сохранёнными камерами: {len(cameras)})..."
+                    "Выберите регион:", reply_markup=keyboard,
+                )
+                return
+
+            # --- Запрос аналитики (без ИИ) ---
+            if data == "do_analytics":
+                await _run_analysis(update, context, use_llm=False)
+                return
+
+            # --- Запрос аналитики (с ИИ) ---
+            if data == "do_analytics_ai":
+                await _run_analysis(update, context, use_llm=True)
+                return
+
+            # --- Расчёт очагов ДТП ---
+            if data == "do_concentration":
+                # Проверяем, есть ли камеры в кэше для этого региона
+                reg_code = (
+                    context.user_data.get("concentration_reg_code", "")
+                    or context.user_data.get("reg_code", "")
+                    or context.user_data.get("analytics_reg_code", "")
+                )
+                # Запоминаем код региона для последующей загрузки файла камер
+                if reg_code:
+                    context.user_data["concentration_reg_code"] = reg_code
+                from camera_cache import has_cached_cameras, load_cameras_from_cache
+
+                cached_cameras = None
+                if reg_code and has_cached_cameras(reg_code):
+                    cached_cameras = load_cameras_from_cache(reg_code)
+
+                if cached_cameras:
+                    # Камеры в кэше — предлагаем использовать их или загрузить новые
+                    with_pk = sum(1 for c in cached_cameras if c["has_piket"])
+                    keyboard = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton(
+                                f"\U0001F4F7 Использовать сохранённые ({len(cached_cameras)} камер)",
+                                callback_data="cam_use_cached",
+                            ),
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                "\U0001F4E4 Загрузить новый файл",
+                                callback_data="cam_ask_upload",
+                            ),
+                            InlineKeyboardButton(
+                                "\u27A1 Без камер",
+                                callback_data="cam_skip",
+                            ),
+                        ],
+                    ])
+                    await query.edit_message_text(
+                        "\U0001F525 <b>Очаги ДТП</b>\n\n"
+                        f"Для региона <b>{reg_code}</b> найден сохранённый файл камер:\n"
+                        f"  \u2022 Всего: {len(cached_cameras)}\n"
+                        f"  \u2022 С пикетажем: {with_pk}\n\n"
+                        "Использовать его или загрузить новый?",
+                        reply_markup=keyboard,
+                        parse_mode="HTML",
+                    )
+                else:
+                    # Камер в кэше нет — просим загрузить
+                    keyboard = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton(
+                                "\U0001F4F7 Загрузить камеры",
+                                callback_data="cam_ask_upload",
+                            ),
+                            InlineKeyboardButton(
+                                "\u27A1 Без камер",
+                                callback_data="cam_skip",
+                            ),
+                        ],
+                    ])
+                    await query.edit_message_text(
+                        "\U0001F525 <b>Очаги ДТП</b>\n\n"
+                        "Загрузите файл с камерами фотовидеофиксации\n"
+                        "(gibddrf_cameras_change_*.xls)\n"
+                        "или продолжите без камер.",
+                        reply_markup=keyboard,
+                        parse_mode="HTML",
+                    )
+                return
+
+            # --- Камеры: пропустить ---
+            if data == "cam_skip":
+                context.user_data.pop("cameras_data", None)
+                await query.edit_message_text(
+                    "\U0001F525 Запуск расчёта очагов (без камер)..."
                 )
                 await _run_concentration_points(update, context)
-            else:
-                await query.edit_message_text(
-                    "\u26A0\uFE0F Файл камер не найден. Загрузите заново."
+                return
+
+            # --- Камеры: использовать сохранённые из кэша ---
+            if data == "cam_use_cached":
+                from camera_cache import load_cameras_from_cache
+                reg_code = (
+                    context.user_data.get("concentration_reg_code", "")
+                    or context.user_data.get("reg_code", "")
+                    or context.user_data.get("analytics_reg_code", "")
                 )
-            return
-
-        # --- Камеры: запрос загрузки ---
-        if data == "cam_ask_upload":
-            context.user_data["waiting_camera_file"] = True
-            await query.edit_message_text(
-                "\U0001F4F7 <b>Загрузка камер</b>\n\n"
-                "Отправьте Excel-файл с камерами\n"
-                "(gibddrf_cameras_change_*.xlsx)\n\n"
-                "Или нажмите \u274C чтобы пропустить.",
-                parse_mode="HTML",
-            )
-            return
-
-        # --- Статистика по точке ---
-        if data == "do_point_stats":
-            await _start_point_stats(update, context)
-            return
-
-        # --- HTML-карта ДТП ---
-        if data == "do_html_map":
-            await _html_map_menu(update, context)
-            return
-
-        if data == "html_map_dtp_only":
-            await _generate_and_send_dtp_map(update, context, cameras=None)
-            return
-
-        if data == "html_map_ask_cameras":
-            context.user_data["waiting_camera_for_map"] = True
-            await query.edit_message_text(
-                "\U0001F5FA <b>Карта ДТП + камеры</b>\n\n"
-                "Отправьте Excel-файл с реестром камер\n"
-                "(gibddrf_cameras_change_*.xlsx)\n\n"
-                "Или нажмите \u274C чтобы пропустить.",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("\u274C Без камер", callback_data="html_map_dtp_only"),
-                ]]),
-            )
-            return
-
-        # --- Смена радиуса статистики по точке ---
-        if data.startswith("ps_radius:"):
-            radius_m = int(data.split(":")[1])
-            await _handle_point_stats_radius(update, context, radius_m)
-            return
-
-        # --- Выгрузка ДТП по точке в Excel ---
-        if data == "ps_excel":
-            await _send_point_stats_excel(update, context)
-            return
-
-        # --- HTML-карта по точке ---
-        if data == "ps_html_map":
-            await _send_point_stats_html(update, context)
-            return
-
-        # --- Возврат в главное меню ---
-        if data == "back_to_menu":
-            # Сбрасываем временные флаги режимов, но НЕ удаляем данные
-            for key in [
-                "qa_mode", "point_stats_mode",
-                "waiting_camera_file", "waiting_camera_for_map",
-            ]:
-                context.user_data.pop(key, None)
-
-            menu_text, menu_kb = _build_menu_keyboard(context)
-            if menu_text and menu_kb:
-                try:
+                cameras = load_cameras_from_cache(reg_code) if reg_code else None
+                if cameras:
+                    context.user_data["cameras_data"] = cameras
                     await query.edit_message_text(
-                        menu_text, reply_markup=menu_kb, parse_mode="HTML",
+                        f"\U0001F525 Запуск расчёта очагов "
+                        f"(с сохранёнными камерами: {len(cameras)})..."
                     )
-                except Exception:
-                    # Если не удалось отредактировать — отправляем новым сообщением
-                    await context.bot.send_message(
-                        chat_id=query.from_user.id,
-                        text=menu_text, reply_markup=menu_kb, parse_mode="HTML",
+                    await _run_concentration_points(update, context)
+                else:
+                    await query.edit_message_text(
+                        "\u26A0\uFE0F Файл камер не найден. Загрузите заново."
                     )
-            else:
+                return
+
+            # --- Камеры: запрос загрузки ---
+            if data == "cam_ask_upload":
+                context.user_data["waiting_camera_file"] = True
                 await query.edit_message_text(
-                    "Данные не найдены. Отправьте /dtp для новой выгрузки."
+                    "\U0001F4F7 <b>Загрузка камер</b>\n\n"
+                    "Отправьте Excel-файл с камерами\n"
+                    "(gibddrf_cameras_change_*.xlsx)\n\n"
+                    "Или нажмите \u274C чтобы пропустить.",
+                    parse_mode="HTML",
+                )
+                return
+
+            # --- Статистика по точке ---
+            if data == "do_point_stats":
+                await _start_point_stats(update, context)
+                return
+
+            # --- HTML-карта ДТП ---
+            if data == "do_html_map":
+                await _html_map_menu(update, context)
+                return
+
+            if data == "html_map_dtp_only":
+                await _generate_and_send_dtp_map(update, context, cameras=None)
+                return
+
+            if data == "html_map_ask_cameras":
+                context.user_data["waiting_camera_for_map"] = True
+                await query.edit_message_text(
+                    "\U0001F5FA <b>Карта ДТП + камеры</b>\n\n"
+                    "Отправьте Excel-файл с реестром камер\n"
+                    "(gibddrf_cameras_change_*.xlsx)\n\n"
+                    "Или нажмите \u274C чтобы пропустить.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("\u274C Без камер", callback_data="html_map_dtp_only"),
+                    ]]),
+                )
+                return
+
+            # --- Смена радиуса статистики по точке ---
+            if data.startswith("ps_radius:"):
+                try:
+                    radius_m = int(data.split(":")[1])
+                except (ValueError, IndexError):
+                    return
+                await _handle_point_stats_radius(update, context, radius_m)
+                return
+
+            # --- Выгрузка ДТП по точке в Excel ---
+            if data == "ps_excel":
+                await _send_point_stats_excel(update, context)
+                return
+
+            # --- HTML-карта по точке ---
+            if data == "ps_html_map":
+                await _send_point_stats_html(update, context)
+                return
+
+            # --- Сменить данные (очистка + /dtp) ---
+            if data == "change_data":
+                _clear_analytics_data(context.user_data)
+                regions = _get_regions(context)
+                keyboard = build_region_keyboard(regions, page=0)
+                await query.edit_message_text(
+                    "Выберите регион:", reply_markup=keyboard,
+                )
+                return
+
+            # --- Возврат в главное меню ---
+            if data == "back_to_menu":
+                # Сбрасываем временные флаги режимов, но НЕ удаляем данные
+                for key in [
+                    "qa_mode", "point_stats_mode",
+                    "waiting_camera_file", "waiting_camera_for_map",
+                ]:
+                    context.user_data.pop(key, None)
+
+                menu_text, menu_kb = _build_menu_keyboard(context)
+                if menu_text and menu_kb:
+                    try:
+                        await query.edit_message_text(
+                            menu_text, reply_markup=menu_kb, parse_mode="HTML",
+                        )
+                    except Exception:
+                        # Если не удалось отредактировать — отправляем новым сообщением
+                        await context.bot.send_message(
+                            chat_id=query.from_user.id,
+                            text=menu_text, reply_markup=menu_kb, parse_mode="HTML",
+                        )
+                else:
+                    await query.edit_message_text(
+                        "Данные не найдены. Отправьте /dtp для новой выгрузки."
+                    )
+                return
+
+            # --- Завершить режим вопросов ---
+            if data == "end_qa":
+                _clear_analytics_data(context.user_data)
+                await query.edit_message_text(
+                    "Режим вопросов завершён.\n\nОтправьте /dtp для новой выгрузки."
+                )
+                return
+
+            # --- Отмена ---
+            if data == "cancel":
+                context.user_data.clear()
+                await query.edit_message_text(
+                    "Отменено. Отправьте /dtp чтобы начать заново."
                 )
             return
 
-        # --- Завершить режим вопросов ---
-        if data == "end_qa":
-            _clear_analytics_data(context.user_data)
-            await query.edit_message_text(
-                "Режим вопросов завершён.\n\nОтправьте /dtp для новой выгрузки."
-            )
-            return
-
-        # --- Отмена ---
-        if data == "cancel":
-            context.user_data.clear()
-            await query.edit_message_text(
-                "Отменено. Отправьте /dtp чтобы начать заново."
-            )
-            return
-
-    except Exception as e:
-        logger.exception(f"Ошибка в callback handler: {e}")
-        try:
-            await query.edit_message_text(
-                "Произошла ошибка при обработке запроса.\n\n"
-            )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.exception(f"Ошибка в callback handler: {e}")
+            try:
+                await query.edit_message_text(
+                    "Произошла ошибка при обработке запроса.\n\n"
+                )
+            except Exception:
+                pass
 
 
 # ========================
@@ -1268,6 +1323,10 @@ def _build_menu_keyboard(
         "\U0001F5FA HTML-карта ДТП",
         callback_data="do_html_map",
     )])
+    buttons.append([InlineKeyboardButton(
+        "\U0001F504 Сменить данные",
+        callback_data="change_data",
+    )])
 
     keyboard = InlineKeyboardMarkup(buttons)
 
@@ -1280,7 +1339,8 @@ def _build_menu_keyboard(
             f"\U0001F916 <b>С ИИ</b> — анализ + резюме от нейросети\n"
             f"\U0001F525 <b>Очаги ДТП</b> — места концентрации аварийности\n"
             f"\U0001F4CD <b>По точке</b> — статистика ДТП по координатам\n"
-            f"\U0001F5FA <b>HTML-карта</b> — интерактивная карта всех ДТП\n\n"
+            f"\U0001F5FA <b>HTML-карта</b> — интерактивная карта всех ДТП\n"
+            f"\U0001F504 <b>Сменить данные</b> — новая выгрузка\n\n"
             f"Или /dtp для новой выгрузки."
         )
     else:
@@ -1291,7 +1351,8 @@ def _build_menu_keyboard(
             f"\U0001F4CA <b>Без ИИ</b> — математический анализ (таблицы, проценты)\n"
             f"\U0001F525 <b>Очаги ДТП</b> — места концентрации аварийности\n"
             f"\U0001F4CD <b>По точке</b> — статистика ДТП по координатам\n"
-            f"\U0001F5FA <b>HTML-карта</b> — интерактивная карта всех ДТП\n\n"
+            f"\U0001F5FA <b>HTML-карта</b> — интерактивная карта всех ДТП\n"
+            f"\U0001F504 <b>Сменить данные</b> — новая выгрузка\n\n"
             f"Или /dtp для новой выгрузки."
         )
 
@@ -1746,8 +1807,13 @@ async def _run_concentration_points(
             f"Регион: {reg_name}\n"
             f"Период: {current_label}\n"
             f"ДТП: {len(current_cards)}\n\n"
-            f"\u26A0\uFE0F Расчёт может занять 2-5 минут\n"
-            f"(загрузка данных за прошлый год + OSM + 2 расчёта очагов)"
+            f"Этапы:\n"
+            f"1. Загрузка данных за прошлый год\n"
+            f"2. Загрузка границ НП из OSM\n"
+            f"3. Расчёт очагов текущего периода\n"
+            f"4. Расчёт очагов + динамика\n"
+            f"5. Генерация результата\n\n"
+            f"\u23F3 Начинаю..."
         ),
     )
 
@@ -1784,13 +1850,12 @@ async def _run_concentration_points(
             context.user_data["analytics_prev_cards"] = prev_cards
             context.user_data["analytics_prev_label"] = prev_label
             await progress_callback(
-                f"Данные за прошлый год из кэша ({len(prev_cards)} ДТП)\n"
-                f"Расчёт очагов..."
+                f"\u2705 [1/5] Данные за прошлый год: из кэша ({len(prev_cards)} ДТП)"
             )
         elif reg_code:
             async def fetch_progress(i, total, month_name, year):
                 await progress_callback(
-                    f"Загрузка данных за прошлый год...\n"
+                    f"\u23F3 [1/5] Загрузка данных за прошлый год...\n"
                     f"{i}/{total} — {month_name} {year}"
                 )
 
@@ -1821,10 +1886,27 @@ async def _run_concentration_points(
                     pass
 
         # --- Расчёт очагов с динамикой ---
+        # Обёртка для progress_callback: добавляет нумерацию этапов [2/5]-[4/5]
+        _step_map = {
+            "границ": "[2/5] Загрузка границ НП из OpenStreetMap...",
+            "текущего": "[3/5] Расчёт очагов текущего периода...",
+            "прошлого": "[4/5] Расчёт очагов за прошлый год...",
+            "Сопоставление": "[4/5] Сопоставление очагов между периодами...",
+        }
+
+        async def staged_progress(text: str) -> None:
+            # Подставляем шаг на основе ключевых слов в text
+            for key, step_text in _step_map.items():
+                if key in text:
+                    await progress_callback(f"\u23F3 {step_text}\n{text}")
+                    return
+            # Fallback — передаём как есть
+            await progress_callback(f"\u23F3 {text}")
+
         clusters = await calculate_concentration_dynamics(
             current_cards,
             prev_cards,
-            progress_callback,
+            progress_callback=staged_progress,
         )
 
         if not clusters:
@@ -1850,7 +1932,7 @@ async def _run_concentration_points(
         cameras = context.user_data.get("cameras_data")
         if cameras:
             await progress_callback(
-                f"Сопоставление с камерами фотовидеофиксации...\n"
+                f"\u23F3 [5/5] Сопоставление с камерами фотовидеофиксации...\n"
                 f"Камер: {len(cameras)}"
             )
             enrich_clusters_with_cameras(current_only_clusters, cameras)
@@ -1859,6 +1941,8 @@ async def _run_concentration_points(
             ]
             if lost_clusters:
                 enrich_clusters_with_cameras(lost_clusters, cameras)
+        else:
+            await progress_callback("\u23F3 [5/5] Генерация Excel-файла...")
 
         # --- Генерируем Excel с 4 листами ---
         # Лист 1: очаги запрашиваемого года (стандартный формат)
@@ -2767,14 +2851,23 @@ async def _handle_analytics_question(
             pass
 
         # Отправляем ответ (экранируем и вопрос, и ответ LLM)
-        await _send_long_message(
-            context.bot, chat_id,
-            text=(
-                f"\U0001F916 <b>Вопрос:</b> {html_mod.escape(question)}\n\n"
-                f"{html_mod.escape(answer)}"
-            ),
-            parse_mode="HTML",
-        )
+        # Fallback: если HTML-парсинг ломается — отправляем без форматирования
+        try:
+            await _send_long_message(
+                context.bot, chat_id,
+                text=(
+                    f"\U0001F916 <b>Вопрос:</b> {html_mod.escape(question)}\n\n"
+                    f"{html_mod.escape(answer)}"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            # HTML-парсер Telegram не смог обработать — отправляем plain text
+            await _send_long_message(
+                context.bot, chat_id,
+                text=f"\U0001F916 Вопрос: {question}\n\n{answer}",
+                parse_mode=None,
+            )
 
     except Exception as e:
         logger.error(f"Ошибка при ответе на вопрос: {e}")
@@ -3001,8 +3094,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 context, update.effective_chat.id, lat, lon, radius_m,
             )
             return
-        # Если координаты не распознаны — выходим из режима и падаем ниже
-        context.user_data.pop("point_stats_mode", None)
+        # Если координаты не распознаны — подсказываем, НЕ выходим из режима
+        await update.message.reply_text(
+            "\u26A0\uFE0F Не удалось распознать координаты.\n\n"
+            "Отправьте координаты в формате:\n"
+            "  59.1234, 39.5678\n\n"
+            "Или нажмите \u21A9\uFE0F \u00abВ меню\u00bb."
+        )
+        return
 
     if not is_user_allowed(user.id):
         await update.message.reply_text("У вас нет доступа к этому боту.")
@@ -3140,7 +3239,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         if now - _conflict_last_log >= _CONFLICT_LOG_INTERVAL:
             _conflict_last_log = now
             logger.warning(
-                "Conflict: другой экземпляр бота (deploу). "
+                "Conflict: другой экземпляр бота (deploy). "
                 "Автоматически разрешится. Следующее сообщение через 60с."
             )
         return
