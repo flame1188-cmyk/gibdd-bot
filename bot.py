@@ -138,6 +138,75 @@ logger = logging.getLogger(__name__)
 _conflict_last_log: float = 0.0
 _CONFLICT_LOG_INTERVAL = 60.0
 
+# ========================
+# Глобальный кэш данных выгрузки (Идея 1)
+# ========================
+# Кэш хранит (cards, errors) по ключу (reg_code, tuple(dat_list)).
+# TTL = 1 час, LRU-лимит = 50 записей.
+# Один экземпляр на весь процесс — все пользователи делят кэш.
+
+import time as _time
+
+
+class _DataCache:
+    """Глобальный LRU-кэш загруженных данных ДТП с TTL."""
+
+    def __init__(self, maxsize: int = 50, ttl: float = 3600.0):
+        self._cache: dict[tuple[str, tuple[str, ...]], tuple[float, list[dict], list[str]]] = {}
+        self._maxsize = maxsize
+        self._ttl = ttl
+        # Счётчики попаданий/промахов для диагностики
+        self.hits = 0
+        self.misses = 0
+
+    def _make_key(self, reg_code: str, dat_list: list[str]) -> tuple[str, tuple[str, ...]]:
+        return (reg_code, tuple(dat_list))
+
+    def get(self, reg_code: str, dat_list: list[str]) -> tuple[list[dict], list[str]] | None:
+        """Возвращает (cards, errors) из кэша или None при промахе/TTL."""
+        key = self._make_key(reg_code, dat_list)
+        entry = self._cache.get(key)
+        if entry is None:
+            self.misses += 1
+            return None
+        ts, cards, errors = entry
+        if _time.monotonic() - ts > self._ttl:
+            # TTL истёк — удаляем и считаем промахом
+            del self._cache[key]
+            self.misses += 1
+            return None
+        # LRU: перемещаем в конец (при следующей вставке старые удалятся)
+        del self._cache[key]
+        self._cache[key] = entry
+        self.hits += 1
+        return (cards, errors)
+
+    def put(self, reg_code: str, dat_list: list[str], cards: list[dict], errors: list[str]) -> None:
+        """Кладёт (cards, errors) в кэш. Evict-ит старые записи при переполнении."""
+        key = self._make_key(reg_code, dat_list)
+        # Если ключ уже есть — обновляем TTL
+        if key in self._cache:
+            del self._cache[key]
+        # Evict: удаляем самые старые (первые) записи
+        while len(self._cache) >= self._maxsize:
+            oldest_key = next(iter(self._cache))
+            logger.debug(f"_DataCache: evict {oldest_key}")
+            del self._cache[oldest_key]
+        self._cache[key] = (_time.monotonic(), cards, errors)
+        logger.info(
+            f"_DataCache: put reg={reg_code}, months={len(dat_list)}, "
+            f"cards={len(cards)}, cache_size={len(self._cache)}"
+        )
+
+    def stats(self) -> str:
+        return (
+            f"_DataCache: {len(self._cache)}/{self._maxsize} записей, "
+            f"hits={self.hits}, misses={self.misses}"
+        )
+
+
+data_cache = _DataCache(maxsize=50, ttl=3600.0)
+
 # Лимит символов в одном сообщении Telegram
 TG_MSG_LIMIT = 4096
 
@@ -265,6 +334,16 @@ async def _fetch_cards_for_period(
     """
     import httpx as _httpx
 
+    # --- Глобальный кэш: проверяем перед скачиванием ---
+    cached = data_cache.get(reg_code, dat_list)
+    if cached is not None:
+        cards, errors = cached
+        logger.info(
+            f"  {log_prefix}: из глобального кэша "
+            f"({len(cards)} ДТП) [{data_cache.stats()}]"
+        )
+        return cards, errors
+
     cards: list[dict] = []
     errors: list[str] = []
     use_web_fallback = False  # переключаемся после первой 5xx
@@ -352,6 +431,10 @@ async def _fetch_cards_for_period(
                     f"  {log_prefix}: {dat} -> ОШИБКА "
                     f"[{type(e).__name__}] {error_brief(e)}"
                 )
+
+    # --- Глобальный кэш: сохраняем результат ---
+    if cards:
+        data_cache.put(reg_code, dat_list, cards, errors)
 
     return cards, errors
 
@@ -1215,6 +1298,50 @@ def _build_menu_keyboard(
     return text, keyboard
 
 
+async def _preload_prev_year(
+    reg_code: str,
+    period: ParsedPeriod,
+) -> None:
+    """
+    Фоновая задача: загружает данные за аналогичный период прошлого года
+    в глобальный кэш. Вызывается через asyncio.create_task() после
+    успешной выгрузки текущего периода — пользователь уже видит меню
+    и может работать, а данные за прошлый год подгружаются незаметно.
+
+    Ошибки логируются, но не влияют на работу бота.
+    """
+    prev_year = period.year - 1
+    dat_list_prev = [f"{m}.{prev_year}" for m in period.months]
+
+    # Не скачиваем, если уже в кэше
+    if data_cache.get(reg_code, dat_list_prev) is not None:
+        logger.info(
+            f"Preload: данные за прошлый год уже в кэше "
+            f"(reg={reg_code}, {len(dat_list_prev)} мес)"
+        )
+        return
+
+    logger.info(
+        f"Preload: старт фоновой загрузки за прошлый год "
+        f"(reg={reg_code}, {len(dat_list_prev)} мес)"
+    )
+    try:
+        cards, errors = await _fetch_cards_for_period(
+            dat_list_prev, reg_code, "Preload",
+        )
+        if cards:
+            logger.info(
+                f"Preload: загружено {len(cards)} ДТП за прошлый год "
+                f"[{data_cache.stats()}]"
+            )
+        elif errors:
+            logger.warning(f"Preload: ошибки при загрузке: {errors}")
+        else:
+            logger.info("Preload: нет данных за прошлый год (пустой ответ)")
+    except Exception as e:
+        logger.error(f"Preload: ошибка фоновой загрузки: {e}", exc_info=True)
+
+
 async def _offer_analysis(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -1227,6 +1354,8 @@ async def _offer_analysis(
     После выгрузки предлагает кнопки для проведения анализа
     (сравнение с аналогичным периодом прошлого года).
     Два режима: без ИИ и с ИИ (нейросеть GLM).
+
+    Также запускает фоновую preload-задачу для данных за прошлый год.
     """
     # Сохраняем данные для аналитики в user_data
     context.user_data["analytics_ready"] = True
@@ -1234,6 +1363,9 @@ async def _offer_analysis(
     context.user_data["analytics_reg_name"] = reg_name
     context.user_data["analytics_period"] = period
     context.user_data["analytics_cards"] = current_cards
+
+    # --- Идея 2: фоновый preload данных за прошлый год ---
+    asyncio.create_task(_preload_prev_year(reg_code, period))
 
     text, keyboard = _build_menu_keyboard(context)
     if text and keyboard:
@@ -1277,14 +1409,24 @@ async def _run_analysis(
 
     mode_label = "\U0001F916 AI-анализ" if use_llm else "\U0001F4CA Анализ"
 
-    # Проверяем, есть ли уже данные за прошлый год в кэше
+    # Проверяем, есть ли уже данные за прошлый год (per-user или глобальный кэш)
     cached_prev = context.user_data.get("analytics_prev_cards", [])
     cached_prev_label = context.user_data.get("analytics_prev_label", "")
+
+    # Также проверяем глобальный кэш (может заполнен preload-задачей)
+    if (not cached_prev or cached_prev_label != prev_label):
+        global_cached = data_cache.get(reg_code, dat_list_prev)
+        if global_cached is not None:
+            cached_prev, _ = global_cached
+            cached_prev_label = prev_label
 
     if cached_prev and cached_prev_label == prev_label:
         # Данные за прошлый год уже есть — не скачиваем повторно
         prev_cards = cached_prev
         errors = []
+        # Обновляем per-user кэш
+        context.user_data["analytics_prev_cards"] = prev_cards
+        context.user_data["analytics_prev_label"] = prev_label
         status_msg = await _tg_retry(lambda: context.bot.send_message(
             chat_id=chat_id,
             text=(
@@ -1565,7 +1707,7 @@ def _clear_analytics_data(user_data: dict) -> None:
         "analytics_prev_cards", "analytics_clusters",
         "analytics_news_context", "qa_mode",
         "point_stats_mode", "point_stats_lat", "point_stats_lon", "point_stats_radius",
-        "cameras_data", "waiting_camera_file",
+        "cameras_data", "waiting_camera_file", "waiting_camera_for_map",
     ]:
         user_data.pop(key, None)
 
@@ -1626,12 +1768,21 @@ async def _run_concentration_points(
         prev_cards = []
         errors = []
 
-        # Проверяем кэш прошлого года
+        # Проверяем per-user кэш и глобальный кэш (может заполнен preload-задачей)
         cached_prev = context.user_data.get("analytics_prev_cards", [])
         cached_prev_label = context.user_data.get("analytics_prev_label", "")
 
+        if (not cached_prev or cached_prev_label != prev_label):
+            global_cached = data_cache.get(reg_code, dat_list_prev)
+            if global_cached is not None:
+                cached_prev, _ = global_cached
+                cached_prev_label = prev_label
+
         if cached_prev and cached_prev_label == prev_label:
             prev_cards = cached_prev
+            # Обновляем per-user кэш
+            context.user_data["analytics_prev_cards"] = prev_cards
+            context.user_data["analytics_prev_label"] = prev_label
             await progress_callback(
                 f"Данные за прошлый год из кэша ({len(prev_cards)} ДТП)\n"
                 f"Расчёт очагов..."
@@ -2004,18 +2155,19 @@ async def _generate_and_send_dtp_map(
 
         size_kb = len(html_content.encode("utf-8")) / 1024
 
-        await context.bot.send_document(
-            chat_id=chat_id,
-            document=open(tmp_path, "rb"),
-            filename=filename,
-            caption=(
-                f"\U0001F5FA Карта ДТП\n"
-                f"{reg_name} | {period.label}\n"
-                f"Точек: {len(cards)}"
-                + (f" | Камер: {len(cameras)}" if cameras else "")
-                + f"\nРазмер: {size_kb:.0f} КБ"
-            ),
-        )
+        with open(tmp_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=f,
+                filename=filename,
+                caption=(
+                    f"\U0001F5FA Карта ДТП\n"
+                    f"{reg_name} | {period.label}\n"
+                    f"Точек: {len(cards)}"
+                    + (f" | Камер: {len(cameras)}" if cameras else "")
+                    + f"\nРазмер: {size_kb:.0f} КБ"
+                ),
+            )
 
         # Удаляем сообщение о прогрессе
         try:
@@ -2083,16 +2235,17 @@ async def _send_analytics_html(
 
     size_kb = len(html_content.encode("utf-8")) / 1024
 
-    await context.bot.send_document(
-        chat_id=chat_id,
-        document=open(tmp_path, "rb"),
-        filename=filename,
-        caption=(
-            f"\U0001F4CA Визуализация аналитики\n"
-            f"{reg_name} | {current_label} vs {prev_label}\n"
-            f"Размер: {size_kb:.0f} КБ"
-        ),
-    )
+    with open(tmp_path, "rb") as f:
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=f,
+            filename=filename,
+            caption=(
+                f"\U0001F4CA Визуализация аналитики\n"
+                f"{reg_name} | {current_label} vs {prev_label}\n"
+                f"Размер: {size_kb:.0f} КБ"
+            ),
+        )
 
     try:
         _os.remove(tmp_path)
@@ -2134,19 +2287,20 @@ async def _send_clusters_html(
 
     size_kb = len(html_content.encode("utf-8")) / 1024
 
-    await context.bot.send_document(
-        chat_id=chat_id,
-        document=open(tmp_path, "rb"),
-        filename=filename,
-        caption=(
-            f"\U0001F525 Карта очагов ДТП\n"
-            f"{reg_name} | {current_label}\n"
-            f"Очагов: {len(clusters)}"
-            + (f" | Предочагов: {len(preclusters)}" if preclusters else "")
-            + (f" | Камер: {len(cameras)}" if cameras else "")
-            + f"\nРазмер: {size_kb:.0f} КБ"
-        ),
-    )
+    with open(tmp_path, "rb") as f:
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=f,
+            filename=filename,
+            caption=(
+                f"\U0001F525 Карта очагов ДТП\n"
+                f"{reg_name} | {current_label}\n"
+                f"Очагов: {len(clusters)}"
+                + (f" | Предочагов: {len(preclusters)}" if preclusters else "")
+                + (f" | Камер: {len(cameras)}" if cameras else "")
+                + f"\nРазмер: {size_kb:.0f} КБ"
+            ),
+        )
 
     try:
         _os.remove(tmp_path)
@@ -2286,11 +2440,7 @@ async def _send_point_stats_excel(
     prev_label = context.user_data.get("analytics_prev_label", "")
 
     # Фильтруем карточки по радиусу
-    from point_statistics import (
-        filter_cards_by_radius,
-        build_point_stats_excel_data,
-        get_point_stats_column_names,
-    )
+    from point_statistics import filter_cards_by_radius
 
     current_filtered = filter_cards_by_radius(current_cards, lat, lon, radius_m)
     prev_filtered = filter_cards_by_radius(prev_cards, lat, lon, radius_m) if prev_cards else []
@@ -2413,22 +2563,33 @@ async def _send_point_stats_html(
 
         radius_str = f"{radius_m} м" if radius_m < 1000 else f"{radius_m/1000:.0f} км"
 
-        await context.bot.send_document(
-            chat_id=chat_id,
-            document=open(tmp_path, "rb"),
-            filename=filename,
-            caption=(
-                f"\U0001F4CD Карта по точке\n"
-                f"Радиус: {radius_str}\n"
-                f"Координаты: {lat:.5f}, {lon:.5f}\n"
-                f"Размер: {size_kb:.0f} КБ"
-            ),
-        )
+        with open(tmp_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=f,
+                filename=filename,
+                caption=(
+                    f"\U0001F4CD Карта по точке\n"
+                    f"Радиус: {radius_str}\n"
+                    f"Координаты: {lat:.5f}, {lon:.5f}\n"
+                    f"Размер: {size_kb:.0f} КБ"
+                ),
+            )
 
         try:
             _os.remove(tmp_path)
         except Exception:
             pass
+
+        # Показываем кнопку возврата в меню
+        menu_text, menu_kb = _build_menu_keyboard(context)
+        if menu_text and menu_kb:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=menu_text,
+                reply_markup=menu_kb,
+                parse_mode="HTML",
+            )
 
     except Exception as e:
         logger.error(f"Ошибка генерации HTML-карты по точке: {e}", exc_info=True)
@@ -2549,34 +2710,6 @@ async def _handle_location_message(
     lat = location.latitude
     lon = location.longitude
     radius_m = context.user_data.get("point_stats_radius", 500)
-
-    await _process_point_stats(
-        context, update.effective_chat.id, lat, lon, radius_m,
-    )
-
-
-async def _handle_coordinate_text(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    text: str,
-) -> None:
-    """Обрабатывает текстовое сообщение с координатами."""
-    if not context.user_data.get("point_stats_mode"):
-        return
-
-    coords = parse_coordinates(text)
-    if coords is None:
-        # Возможно, это вопрос для LLM — не обрабатываем здесь
-        return
-
-    lat, lon = coords
-    radius_m = context.user_data.get("point_stats_radius", 500)
-
-    # Удаляем сообщение с координатами (чистота чата)
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
 
     await _process_point_stats(
         context, update.effective_chat.id, lat, lon, radius_m,

@@ -56,6 +56,10 @@ def _ensure_lib(name: str, url: str) -> str:
     """
     Скачивает библиотеку с CDN при первом запуске,
     кэширует в _LIB_DIR. Возвращает содержимое как строку.
+
+    Примечание: используется синхронный httpx.get, т.к. метод вызывается
+    из синхронного кода генератора. На практике библиотеки кэшируются
+    после первого вызова и повторные скачивания не нужны.
     """
     os.makedirs(_LIB_DIR, exist_ok=True)
     path = os.path.join(_LIB_DIR, name)
@@ -67,7 +71,11 @@ def _ensure_lib(name: str, url: str) -> str:
 
     logger.info(f"report_generator: скачивание {name}...")
     try:
-        resp = httpx.get(url, follow_redirects=True, timeout=60)
+        # Используем синхронный клиент с ограниченным таймаутом.
+        # Потокоблокировка допустима: это происходит один раз при
+        # первом запросе, далее — чтение из дискового кэша.
+        with httpx.Client(follow_redirects=True, timeout=30) as client:
+            resp = client.get(url)
         resp.raise_for_status()
         content = resp.text
         with open(path, "w", encoding="utf-8") as f:
