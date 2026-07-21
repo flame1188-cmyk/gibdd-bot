@@ -162,6 +162,19 @@ def _get_user_lock(user_id: int) -> asyncio.Lock:
 TG_MSG_LIMIT = 4096
 
 
+def _sanitize_error(e: Exception) -> str:
+    """Возвращает безопасное для пользователя описание ошибки."""
+    name = type(e).__name__
+    if isinstance(e, (TimedOut, NetworkError)):
+        return f"{name}: Telegram API недоступен, попробуйте позже"
+    if isinstance(e, ConnectionError):
+        inner = e.__cause__
+        if inner and "timed out" in str(inner).lower():
+            return "Таймаут подключения к серверу ГИБДД"
+        return "Сервер ГИБДД недоступен, попробуйте позже"
+    return name  # только имя класса, без деталей
+
+
 async def _send_long_message(
     bot,
     chat_id: int,
@@ -1161,8 +1174,12 @@ async def _start_fetching(
         filename1 = f"dtp_cards_{safe_reg}_{period.year}_{timestamp}.xlsx"
         filename2 = f"dtp_uch_{safe_reg}_{period.year}_{timestamp}.xlsx"
 
-        await _tg_retry(lambda: query.edit_message_text("Готово! Отправляю файлы..."),
-                                 "edit_message_text (готово)")
+        # Статусное сообщение — не критично, не должно прерывать отправку файлов
+        try:
+            await _tg_retry(lambda: query.edit_message_text("Готово! Отправляю файлы..."),
+                                     "edit_message_text (готово)")
+        except (TimedOut, NetworkError):
+            logger.warning("Не удалось обновить статус 'Готово' — отправляю файлы как есть")
 
         chat_id = query.message.chat_id
 
@@ -1204,8 +1221,13 @@ async def _start_fetching(
 
     except Exception as e:
         logger.exception(f"Ошибка генерации/отправки файлов: {e}")
+        user_msg = _sanitize_error(e)
         try:
-            await query.edit_message_text(f"Ошибка при генерации файлов: {e}")
+            await _tg_retry(lambda: query.edit_message_text(
+                f"\u26A0\uFE0F Ошибка при генерации файлов: {user_msg}"
+            ), "edit_message_text (ошибка)")
+        except (TimedOut, NetworkError):
+            logger.warning("Не удалось отправить сообщение об ошибке пользователю")
         except Exception:
             pass
 
@@ -1552,7 +1574,7 @@ async def _run_analysis(
             llm_summary_text = None
             await status_msg.edit_text(
                 f"\u26A0\uFE0F Не удалось получить ответ от нейросети.\n\n"
-                f"Ошибка: {e}\n\n"
+                f"Ошибка: {_sanitize_error(e)}\n\n"
                 f"Отправляю математический анализ без ИИ.\n"
                 f"Попробуйте нажать кнопку ещё раз — обычно работает со 2-й попытки."
             )
@@ -2074,7 +2096,7 @@ async def _run_concentration_points(
         logger.exception(f"Ошибка расчёта очагов (динамика): {e}")
         try:
             await status_msg.edit_text(
-                f"\u26A0\uFE0F Ошибка при расчёте очагов ДТП:\n\n{e}\n\n"
+                f"\u26A0\uFE0F Ошибка при расчёте очагов ДТП:\n\n{_sanitize_error(e)}\n\n"
                 f"Попробуйте позже или выберите другой период."
             )
         except Exception:
@@ -2215,7 +2237,7 @@ async def _generate_and_send_dtp_map(
         logger.error(f"Ошибка генерации HTML-карты: {e}", exc_info=True)
         try:
             await msg.edit_text(
-                f"\u26A0\uFE0F Ошибка генерации карты:\n\n<code>{e}</code>",
+                f"\u26A0\uFE0F Ошибка генерации карты:\n\n{_sanitize_error(e)}",
                 parse_mode="HTML",
             )
         except Exception:
@@ -2615,7 +2637,7 @@ async def _send_point_stats_html(
         logger.error(f"Ошибка генерации HTML-карты по точке: {e}", exc_info=True)
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"\u26A0\uFE0F Ошибка генерации карты: {e}",
+            text=f"\u26A0\uFE0F Ошибка генерации карты: {_sanitize_error(e)}",
         )
 
 
@@ -2810,7 +2832,7 @@ async def _handle_analytics_question(
         try:
             await wait_msg.edit_text(
                 f"\u26A0\uFE0F Не удалось получить ответ от нейросети.\n\n"
-                f"Ошибка: {e}\n\n"
+                f"Ошибка: {_sanitize_error(e)}\n\n"
                 f"Попробуйте переформулировать вопрос или нажмите кнопку ниже."
             )
         except Exception:
@@ -2885,7 +2907,7 @@ async def _handle_document(
             )
         except Exception as e:
             logger.error(f"Ошибка загрузки камер для карты: {e}")
-            await wait_msg.edit_text(f"\u26A0\uFE0F Ошибка: {e}")
+            await wait_msg.edit_text(f"\u26A0\uFE0F Ошибка: {_sanitize_error(e)}")
         return
 
     if not context.user_data.get("waiting_camera_file"):
@@ -2997,7 +3019,7 @@ async def _handle_document(
     except Exception as e:
         logger.error(f"Ошибка обработки файла камер: {e}")
         await wait_msg.edit_text(
-            f"\u26A0\uFE0F Ошибка обработки файла:\n\n<code>{e}</code>\n\n"
+            f"\u26A0\uFE0F Ошибка обработки файла:\n\n{_sanitize_error(e)}\n\n"
             f"Попробуйте ещё раз или нажмите 'Без камер'.",
             parse_mode="HTML",
         )
