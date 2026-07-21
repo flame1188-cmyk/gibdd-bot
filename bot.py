@@ -3244,6 +3244,35 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # Точка входа
 # ========================
 
+async def _post_init(app) -> None:
+    """Проверка доступности Telegram API при запуске с ретраем.
+
+    Запускается ВНУТРИ event loop, который создаёт run_polling(),
+    поэтому не вызывает «Event loop is closed» при ретраях.
+    """
+    _RETRIES = 5
+    _DELAYS = [5, 10, 15, 30, 60]
+    for attempt in range(1, _RETRIES + 1):
+        try:
+            await app.bot.get_me()
+            logger.info(f"Telegram API доступен (попытка {attempt})")
+            return
+        except (TimedOut, NetworkError) as e:
+            if attempt < _RETRIES:
+                delay = _DELAYS[attempt - 1]
+                logger.warning(
+                    f"Telegram API недоступен при запуске ({type(e).__name__}). "
+                    f"Попытка {attempt}/{_RETRIES}, повтор через {delay}с..."
+                )
+                await asyncio.sleep(delay)
+            else:
+                logger.error(
+                    f"Telegram API недоступен после {_RETRIES} попыток. "
+                    f"Бот остановится."
+                )
+                raise
+
+
 async def _post_shutdown(app) -> None:
     """Корректно закрывает все HTTP-клиенты при остановке бота."""
     await close_client()
@@ -3264,7 +3293,7 @@ def main() -> None:
 
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
-    app = Application.builder().token(token).concurrent_updates(True).post_shutdown(_post_shutdown).build()
+    app = Application.builder().token(token).concurrent_updates(True).post_init(_post_init).post_shutdown(_post_shutdown).build()
 
     # Команды
     app.add_handler(CommandHandler("start", cmd_start))
@@ -3294,31 +3323,10 @@ def main() -> None:
     print("  Текст — 'Вологодская область за 2025 год'")
     print("  Нажмите Ctrl+C для остановки.\n")
 
-    # Ретрай при запуске: Telegram API может быть временно недоступен
-    # с хостинга (ConnectTimeout на get_me). Без ретрая бот крашится
-    # и Amvera перезапускает его, создавая Conflict с ещё живым экземпляром.
-    _STARTUP_RETRIES = 5
-    _STARTUP_DELAYS = [5, 10, 15, 30, 60]
-
-    for attempt in range(1, _STARTUP_RETRIES + 1):
-        try:
-            app.run_polling(allowed_updates=Update.ALL_TYPES)
-            return  # нормальный выход (Ctrl+C или shutdown)
-        except (TimedOut, NetworkError) as e:
-            if attempt < _STARTUP_RETRIES:
-                delay = _STARTUP_DELAYS[attempt - 1]
-                logger.warning(
-                    f"Telegram API недоступен при запуске ({type(e).__name__}). "
-                    f"Попытка {attempt}/{_STARTUP_RETRIES}, повтор через {delay}с..."
-                )
-                import time as _time
-                _time.sleep(delay)
-            else:
-                logger.error(
-                    f"Telegram API недоступен после {_STARTUP_RETRIES} попыток. "
-                    f"Останавливаюсь."
-                )
-                raise
+    # Стартап-ретрай перенесён в _post_init — он выполняется
+    # внутри event loop run_polling(), что исключает
+    # «RuntimeError: Event loop is closed» при повторных попытках.
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
