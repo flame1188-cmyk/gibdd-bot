@@ -34,7 +34,7 @@ GIBDD_BASE_URL = "http://xn--80a7adb.xn--90adear.xn--p1ai"
 # Настройки ретраев
 # ========================
 MAX_RETRIES = 3              # для справочников (маленькие запросы, быстрые)
-MAX_RETRIES_LARGE = 3        # для kartdtp (большой payload, таймауты на Amvera МСК_0)
+MAX_RETRIES_LARGE = 1        # для kartdtp: 1 попытка, при 5xx bot.py уходит на web_fallback
 RETRY_BACKOFF_BASE = 5       # секунды между ретрайами для справочников (5, 10, 20...)
 RETRY_BACKOFF_BASE_LARGE = 10 # секунды между ретрайами для kartdtp (10, 20, 40...)
 

@@ -3036,7 +3036,19 @@ async def _handle_document(
         return
 
     if not context.user_data.get("waiting_camera_file"):
-        # Не ожидаем файл — игнорируем
+        # Не ожидаем файл — уведомляем пользователя
+        logger.info("Получен документ, но бот не ожидает файл камер")
+        try:
+            await update.message.reply_text(
+                "\u26A0\uFE0F Бот не ожидает файл.\n\n"
+                "Чтобы загрузить камеры фотовидеофиксации:\n"
+                "1. Выберите регион (/dtp)\n"
+                "2. Выгрузите данные за период\n"
+                "3. Нажмите кнопку \u2B50 Очаги ДТП\n"
+                "4. Затем отправьте файл камер"
+            )
+        except Exception:
+            pass
         return
 
     context.user_data.pop("waiting_camera_file", None)
@@ -3349,7 +3361,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             pass  # Само уведомление тоже может упасть — игнорируем
         return
 
-    logger.error(f"Ошибка: {error}", exc_info=error)
+    logger.error(f"Ошибка: {_sanitize_error(error)}", exc_info=error)
 
 
 # ========================
