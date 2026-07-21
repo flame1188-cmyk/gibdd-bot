@@ -606,15 +606,15 @@ body {
   font-size: 14px;
   white-space: nowrap;
 }
-.coord-search input {
-  padding: 5px 8px;
+.coord-search .cs-input {
+  padding: 5px 10px;
   border: 1px solid #bdbdbd;
   border-radius: 4px;
   font-size: 13px;
-  width: 140px;
+  width: 260px;
   background: #fafafa;
 }
-.coord-search input:focus {
+.coord-search .cs-input:focus {
   outline: none;
   border-color: #1565c0;
 }
@@ -916,38 +916,18 @@ body {
 
     @staticmethod
     def _build_coord_search_html() -> str:
-        """Панель поиска по координатам (HTML + JS)."""
+        """Панель поиска по координатам (HTML + JS). Одна строка ввода."""
         return """
 <div class="coord-search">
   <span class="cs-label">📍 Координаты:</span>
-  <input type="text" id="cs_lat" placeholder="Широта (59.1234)">
-  <input type="text" id="cs_lon" placeholder="Долгота (39.5678)">
+  <input type="text" id="cs_input" class="cs-input" placeholder="59.1234, 39.5678">
   <button class="btn-cs" onclick="goToCoords()">Перейти</button>
   <button class="btn-cs btn-cs-clear" onclick="clearCoordSearch()">Сбросить вид</button>
-  <span class="cs-hint">Формат: 59.1234, 39.5678 — Enter для быстрого поиска</span>
+  <span class="cs-hint">Вставьте: широта, долгота — Enter для поиска</span>
 </div>
 <script>
 (function() {
-  // Поддержка ввода "lat, lon" в первое поле
-  var latInput = document.getElementById('cs_lat');
-  var lonInput = document.getElementById('cs_lon');
-
-  latInput.addEventListener('keydown', function(e) {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      // Если введено "lat, lon" — разбиваем
-      var val = latInput.value.trim();
-      if (val.indexOf(',') !== -1 && !lonInput.value.trim()) {
-        var parts = val.split(',');
-        if (parts.length === 2) {
-          latInput.value = parts[0].trim();
-          lonInput.value = parts[1].trim();
-        }
-      }
-      goToCoords();
-    }
-  });
-  lonInput.addEventListener('keydown', function(e) {
+  document.getElementById('cs_input').addEventListener('keydown', function(e) {
     if (e.key === 'Enter') {
       e.preventDefault();
       goToCoords();
@@ -955,22 +935,30 @@ body {
   });
 })();
 
+function parseCoordInput(val) {
+  // Поддерживаем разделители: запятая, пробел, табуляция, точка с запятой
+  // Также обрабатываем копирование из Excel (часто табуляция между ячейками)
+  var parts = val.trim().split(/[,\\s;]+/);
+  if (parts.length >= 2) {
+    return { lat: parseFloat(parts[0]), lon: parseFloat(parts[1]) };
+  }
+  return null;
+}
+
 function goToCoords() {
-  var lat = parseFloat(document.getElementById('cs_lat').value);
-  var lon = parseFloat(document.getElementById('cs_lon').value);
-  if (isNaN(lat) || isNaN(lon)) {
-    document.getElementById('cs_lat').style.borderColor = '#d32f2f';
-    document.getElementById('cs_lon').style.borderColor = '#d32f2f';
-    setTimeout(function() {
-      document.getElementById('cs_lat').style.borderColor = '';
-      document.getElementById('cs_lon').style.borderColor = '';
-    }, 1500);
+  var input = document.getElementById('cs_input');
+  var parsed = parseCoordInput(input.value);
+  if (!parsed || isNaN(parsed.lat) || isNaN(parsed.lon)) {
+    input.style.borderColor = '#d32f2f';
+    setTimeout(function() { input.style.borderColor = ''; }, 1500);
     return;
   }
+  var lat = parsed.lat, lon = parsed.lon;
   if (lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+    input.style.borderColor = '#d32f2f';
+    setTimeout(function() { input.style.borderColor = ''; }, 1500);
     return;
   }
-  // Ставим маркер и летим
   if (window._searchMarker) map.removeLayer(window._searchMarker);
   window._searchMarker = L.circleMarker([lat, lon], {
     radius: 10, fillColor: '#e91e63', color: '#880e4f',
@@ -984,8 +972,7 @@ function clearCoordSearch() {
     map.removeLayer(window._searchMarker);
     window._searchMarker = null;
   }
-  document.getElementById('cs_lat').value = '';
-  document.getElementById('cs_lon').value = '';
+  document.getElementById('cs_input').value = '';
 }
 </script>
 """
