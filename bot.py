@@ -139,73 +139,9 @@ _conflict_last_log: float = 0.0
 _CONFLICT_LOG_INTERVAL = 60.0
 
 # ========================
-# Глобальный кэш данных выгрузки (Идея 1)
+# Глобальный кэш данных выгрузки (модуль data_cache.py)
 # ========================
-# Кэш хранит (cards, errors) по ключу (reg_code, tuple(dat_list)).
-# TTL = 1 час, LRU-лимит = 50 записей.
-# Один экземпляр на весь процесс — все пользователи делят кэш.
-
-import time as _time
-
-
-class _DataCache:
-    """Глобальный LRU-кэш загруженных данных ДТП с TTL."""
-
-    def __init__(self, maxsize: int = 50, ttl: float = 3600.0):
-        self._cache: dict[tuple[str, tuple[str, ...]], tuple[float, list[dict], list[str]]] = {}
-        self._maxsize = maxsize
-        self._ttl = ttl
-        # Счётчики попаданий/промахов для диагностики
-        self.hits = 0
-        self.misses = 0
-
-    def _make_key(self, reg_code: str, dat_list: list[str]) -> tuple[str, tuple[str, ...]]:
-        return (reg_code, tuple(dat_list))
-
-    def get(self, reg_code: str, dat_list: list[str]) -> tuple[list[dict], list[str]] | None:
-        """Возвращает (cards, errors) из кэша или None при промахе/TTL."""
-        key = self._make_key(reg_code, dat_list)
-        entry = self._cache.get(key)
-        if entry is None:
-            self.misses += 1
-            return None
-        ts, cards, errors = entry
-        if _time.monotonic() - ts > self._ttl:
-            # TTL истёк — удаляем и считаем промахом
-            del self._cache[key]
-            self.misses += 1
-            return None
-        # LRU: перемещаем в конец (при следующей вставке старые удалятся)
-        del self._cache[key]
-        self._cache[key] = entry
-        self.hits += 1
-        return (cards, errors)
-
-    def put(self, reg_code: str, dat_list: list[str], cards: list[dict], errors: list[str]) -> None:
-        """Кладёт (cards, errors) в кэш. Evict-ит старые записи при переполнении."""
-        key = self._make_key(reg_code, dat_list)
-        # Если ключ уже есть — обновляем TTL
-        if key in self._cache:
-            del self._cache[key]
-        # Evict: удаляем самые старые (первые) записи
-        while len(self._cache) >= self._maxsize:
-            oldest_key = next(iter(self._cache))
-            logger.debug(f"_DataCache: evict {oldest_key}")
-            del self._cache[oldest_key]
-        self._cache[key] = (_time.monotonic(), cards, errors)
-        logger.info(
-            f"_DataCache: put reg={reg_code}, months={len(dat_list)}, "
-            f"cards={len(cards)}, cache_size={len(self._cache)}"
-        )
-
-    def stats(self) -> str:
-        return (
-            f"_DataCache: {len(self._cache)}/{self._maxsize} записей, "
-            f"hits={self.hits}, misses={self.misses}"
-        )
-
-
-data_cache = _DataCache(maxsize=50, ttl=3600.0)
+from data_cache import data_cache  # noqa: E402
 
 # ========================
 # Защита от гонок при concurrent_updates=True (БАГ 5)

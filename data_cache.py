@@ -37,6 +37,9 @@ class _DataCache:
         self._lock = threading.Lock()
         self._max_entries = max_entries
         self._ttl = ttl
+        # Счётчики попаданий/промахов для диагностики
+        self.hits = 0
+        self.misses = 0
 
     @staticmethod
     def _make_key(reg_code: str, dat_list: list[str]) -> str:
@@ -52,16 +55,19 @@ class _DataCache:
         with self._lock:
             entry = self._cache.get(key)
             if entry is None:
+                self.misses += 1
                 return None
 
             if time.monotonic() - entry["ts"] > self._ttl:
                 # Просрочена — удаляем
                 del self._cache[key]
+                self.misses += 1
                 logger.debug(f"Кэш: запись {key} просрочена, удалена")
                 return None
 
             # Перемещаем в конец (LRU)
             self._cache.move_to_end(key)
+            self.hits += 1
             logger.debug(
                 f"Кэш: HIT {key} "
                 f"({len(entry['cards'])} ДТП, возраст {time.monotonic() - entry['ts']:.0f}с)"
@@ -109,8 +115,8 @@ class _DataCache:
             self._cache.clear()
             logger.info("Кэш: полностью очищен")
 
-    def stats(self) -> dict[str, int]:
-        """Статистика кэша для диагностики."""
+    def stats_dict(self) -> dict[str, int]:
+        """Статистика кэша для программного доступа."""
         with self._lock:
             now = time.monotonic()
             valid = sum(
@@ -123,6 +129,14 @@ class _DataCache:
                 "valid": valid,
                 "total_cards_cached": total_cards,
             }
+
+    def stats(self) -> str:
+        """Статистика кэша в виде строки для логирования."""
+        s = self.stats_dict()
+        return (
+            f"cache: {s['entries']}/{self._max_entries} записей, "
+            f"hits={self.hits}, misses={self.misses}"
+        )
 
 
 # Глобальный экземпляр
