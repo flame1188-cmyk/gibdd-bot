@@ -3415,23 +3415,27 @@ def main() -> None:
         try:
             global _clean_shutdown
             _clean_shutdown = False
+            # PTB __run() использует asyncio.get_event_loop() для setup
+            # signal handlers. Если loop от предыдущего деплоя закрыт —
+            # падает RuntimeError. Принудительно создаём свежий loop.
+            asyncio.set_event_loop(asyncio.new_event_loop())
             app = _build_app(token)
             app.run_polling(allowed_updates=Update.ALL_TYPES)
             # Если мы здесь — bot остановлен штатно (Ctrl+C / SIGTERM)
             _clean_shutdown = True
             break
-        except (TimedOut, NetworkError) as e:
+        except (TimedOut, NetworkError, RuntimeError) as e:
             if attempt < _STARTUP_RETRIES:
                 delay = _STARTUP_DELAYS[attempt - 1]
                 logger.warning(
-                    f"Telegram API недоступен при запуске ({type(e).__name__}). "
+                    f"Ошибка запуска ({type(e).__name__}: {e}). "
                     f"Попытка {attempt}/{_STARTUP_RETRIES}, повтор через {delay}с..."
                 )
                 time.sleep(delay)
             else:
                 logger.error(
-                    f"Telegram API недоступен после {_STARTUP_RETRIES} попыток. "
-                    f"Бот останавливается."
+                    f"Не удалось запустить бота после {_STARTUP_RETRIES} попыток. "
+                    f"Последняя ошибка: {type(e).__name__}: {e}"
                 )
                 raise
 
