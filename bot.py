@@ -3359,6 +3359,34 @@ async def _post_shutdown(app) -> None:
     logger.info("Все HTTP-клиенты закрыты (post_shutdown)")
 
 
+def _build_app(token: str) -> "Application":
+    """Создаёт и настраивает Application. Вызывается заново для каждого retry."""
+    app = (
+        Application.builder()
+        .token(token)
+        .concurrent_updates(True)
+        .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
+    # Команды
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("dtp", cmd_dtp))
+    app.add_handler(CommandHandler("regions", cmd_regions))
+    # Callback-кнопки
+    app.add_handler(CallbackQueryHandler(on_callback_query))
+    # Текстовые сообщения
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Сообщения с локацией (для статистики по точке)
+    app.add_handler(MessageHandler(filters.LOCATION, _handle_location_message))
+    # Документы (загрузка камер фотовидеофиксации)
+    app.add_handler(MessageHandler(_IsDocument(), _handle_document))
+    # Глобальный обработчик ошибок
+    app.add_error_handler(error_handler)
+    return app
+
+
 def main() -> None:
     logger.info("=== GIBDD Telegram Bot запускается ===")
 
@@ -3372,46 +3400,22 @@ def main() -> None:
 
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
-    app = Application.builder().token(token).concurrent_updates(True).post_init(_post_init).post_shutdown(_post_shutdown).build()
-
-    # Команды
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("dtp", cmd_dtp))
-    app.add_handler(CommandHandler("regions", cmd_regions))
-
-    # Callback-кнопки
-    app.add_handler(CallbackQueryHandler(on_callback_query))
-
-    # Текстовые сообщения
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Сообщения с локацией (для статистики по точке)
-    app.add_handler(MessageHandler(filters.LOCATION, _handle_location_message))
-
-    # Документы (загрузка камер фотовидеофиксации)
-    app.add_handler(MessageHandler(_IsDocument(), _handle_document))
-
-    # Глобальный обработчик ошибок
-    app.add_error_handler(error_handler)
-
-    logger.info("Бот запущен. Нажмите Ctrl+C для остановки.")
-    print("\nGIBDD-бот запущен!")
+    print("\nGIBDD-бот запускается...")
     print("  /dtp — выгрузка через кнопки")
     print("  /help — справка")
     print("  Текст — 'Вологодская область за 2025 год'")
     print("  Нажмите Ctrl+C для остановки.\n")
 
-    # Стартап-ретрай: run_polling() использует asyncio.run() внутри,
-    # при TimedOut в initialize() loop закрывается. Следующий вызов
-    # создаёт новый loop — это безопасно, т.к. HTTP-клиенты
-    # не закрываются в _post_shutdown при _clean_shutdown=False.
+    # Стартап-ретрай: Application создаётся заново для каждой попытки,
+    # т.к. после TimedOut внутренний event loop закрывается и объект
+    # становится непригодным для повторного run_polling().
     _STARTUP_RETRIES = 5
     _STARTUP_DELAYS = [5, 10, 15, 30, 60]
     for attempt in range(1, _STARTUP_RETRIES + 1):
         try:
             global _clean_shutdown
             _clean_shutdown = False
+            app = _build_app(token)
             app.run_polling(allowed_updates=Update.ALL_TYPES)
             # Если мы здесь — bot остановлен штатно (Ctrl+C / SIGTERM)
             _clean_shutdown = True
