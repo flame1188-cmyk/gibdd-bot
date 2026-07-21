@@ -19,6 +19,12 @@ logger = logging.getLogger(__name__)
 
 # Таймаут для запросов к новостным источникам
 _NEWS_TIMEOUT = 15
+# Быстрый таймаут для соединения (Google News заблокирован с Amvera)
+_NEWS_CONNECT_TIMEOUT = 5
+
+# Флаги: источник недоступен, не пробовать до перезапуска бота
+_google_down = False
+_ddg_down = False
 
 
 def _build_search_query(reg_name: str, current_label: str, prev_label: str) -> str:
@@ -57,6 +63,10 @@ async def _fetch_google_news_rss(query: str, max_results: int = 10) -> list[dict
     Returns:
         Список словарей с полями: title, source, date, url, snippet
     """
+    global _google_down
+    if _google_down:
+        return []
+
     url = (
         f"https://news.google.com/rss/search?"
         f"q={quote(query)}&hl=ru&gl=RU&ceid=RU:ru"
@@ -65,7 +75,10 @@ async def _fetch_google_news_rss(query: str, max_results: int = 10) -> list[dict
     logger.info(f"Google News RSS запрос: {query}")
 
     try:
-        async with httpx.AsyncClient(timeout=_NEWS_TIMEOUT, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(_NEWS_TIMEOUT, connect=_NEWS_CONNECT_TIMEOUT),
+            follow_redirects=True,
+        ) as client:
             response = await client.get(url)
 
         if response.status_code != 200:
@@ -136,6 +149,10 @@ async def _fetch_google_news_rss(query: str, max_results: int = 10) -> list[dict
     except httpx.TimeoutException:
         logger.warning("Google News: таймаут запроса")
         return []
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        logger.warning(f"Google News: подключение недоступно: {e}")
+        _google_down = True  # не пробовать до перезапуска
+        return []
     except Exception as e:
         logger.warning(f"Google News: ошибка {type(e).__name__}: {e}")
         return []
@@ -150,16 +167,29 @@ async def _fetch_duckduckgo_html(query: str, max_results: int = 10) -> list[dict
     Returns:
         Список словарей с полями: title, source, snippet
     """
+    global _ddg_down
+    if _ddg_down:
+        return []
+
     url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
 
     logger.info(f"DuckDuckGo запрос: {query}")
 
     try:
-        async with httpx.AsyncClient(timeout=_NEWS_TIMEOUT, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(_NEWS_TIMEOUT, connect=_NEWS_CONNECT_TIMEOUT),
+            follow_redirects=True,
+        ) as client:
             response = await client.get(
                 url,
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
             )
+
+        if response.status_code == 202:
+            # Bot detection — не пробовать до перезапуска
+            logger.warning("DuckDuckGo: HTTP 202 (bot detection), отключаем источник")
+            _ddg_down = True
+            return []
 
         if response.status_code != 200:
             logger.warning(f"DuckDuckGo вернул {response.status_code}")
@@ -213,6 +243,10 @@ async def _fetch_duckduckgo_html(query: str, max_results: int = 10) -> list[dict
 
     except httpx.TimeoutException:
         logger.warning("DuckDuckGo: таймаут запроса")
+        return []
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        logger.warning(f"DuckDuckGo: подключение недоступно: {e}")
+        _ddg_down = True
         return []
     except Exception as e:
         logger.warning(f"DuckDuckGo: ошибка {type(e).__name__}: {e}")

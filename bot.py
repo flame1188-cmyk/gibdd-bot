@@ -138,6 +138,21 @@ logger = logging.getLogger(__name__)
 _conflict_last_log: float = 0.0
 _CONFLICT_LOG_INTERVAL = 60.0
 
+# Флаг: API ГИБДД вернул 5xx → все последующие запросы сразу на web_fallback
+# Сбрасывается при каждом новом пользовательском запросе (в _fetch_cards_for_period)
+_api_down: bool = False
+_api_down_lock: Any = None  # инициализируется в async-контексте
+
+
+def _mark_api_down():
+    """Помечает API ГИБДД как недоступный (на время текущей сессии)."""
+    global _api_down
+    _api_down = True
+
+
+def _is_api_down() -> bool:
+    return _api_down
+
 # ========================
 # Глобальный кэш данных выгрузки (модуль data_cache.py)
 # ========================
@@ -330,36 +345,89 @@ async def _fetch_cards_for_period(
 
     cards: list[dict] = []
     errors: list[str] = []
-    use_web_fallback = False  # переключаемся после первой 5xx
 
-    for i, dat in enumerate(dat_list, start=1):
-        month_num = int(dat.split(".")[0])
-        month_name = MONTH_FULL.get(month_num, dat)
-        year = dat.split(".")[1]
+    # Если API уже помечен как недоступный — сразу на web_fallback
+    if _is_api_down():
+        logger.info(
+            f"  {log_prefix}: API ГИБДД помечен как недоступный, "
+            f"сразу на сайт ({len(dat_list)} мес)"
+        )
+        from web_fallback import fetch_dtp_via_web_period
+        fb_cards, fb_errors = await fetch_dtp_via_web_period(
+            dat_list, reg_code,
+            log_prefix=f"{log_prefix} [сайт]",
+            progress_callback=progress_callback,
+        )
+        cards.extend(fb_cards)
+        errors.extend(fb_errors)
+    else:
+        import httpx as _httpx
+        use_web_fallback = False
 
-        if progress_callback:
-            await progress_callback(i, len(dat_list), month_name, year)
+        for i, dat in enumerate(dat_list, start=1):
+            month_num = int(dat.split(".")[0])
+            month_name = MONTH_FULL.get(month_num, dat)
+            year = dat.split(".")[1]
 
-        if not use_web_fallback:
-            # --- Основной метод: API ГИБДД ---
-            try:
-                api_response = await fetch_dtp_data(dat=dat, reg=reg_code, pok="1")
-                extracted = extract_accident_cards(api_response)
-                cards.extend(extracted)
-                logger.info(f"  {log_prefix}: {dat} -> {len(extracted)} ДТП")
-            except _httpx.HTTPStatusError as e:
-                status = e.response.status_code
-                if status >= 500:
+            if progress_callback:
+                await progress_callback(i, len(dat_list), month_name, year)
+
+            if not use_web_fallback:
+                # --- Основной метод: API ГИБДД ---
+                try:
+                    api_response = await fetch_dtp_data(dat=dat, reg=reg_code, pok="1")
+                    extracted = extract_accident_cards(api_response)
+                    cards.extend(extracted)
+                    logger.info(f"  {log_prefix}: {dat} -> {len(extracted)} ДТП")
+                except _httpx.HTTPStatusError as e:
+                    status = e.response.status_code
+                    if status >= 500:
+                        _mark_api_down()  # запоминаем на всю сессию
+                        use_web_fallback = True
+                        logger.warning(
+                            f"  {log_prefix}: {dat} -> HTTP {status}, "
+                            f"переключаюсь на запасной метод (сайт ГИБДД)"
+                        )
+                        if notify_callback:
+                            try:
+                                await notify_callback(
+                                    "\u26A0\uFE0F API ГИБДД недоступен (HTTP "
+                                    f"{status}).\n"
+                                    "Переключаюсь на запасной метод (сайт)..."
+                                )
+                            except Exception:
+                                pass
+                        remaining_dats = [dat] + dat_list[i:]
+                        from web_fallback import fetch_dtp_via_web_period
+                        fb_cards, fb_errors = await fetch_dtp_via_web_period(
+                            remaining_dats, reg_code,
+                            log_prefix=f"{log_prefix} [сайт]",
+                            progress_callback=progress_callback,
+                        )
+                        cards.extend(fb_cards)
+                        errors.extend(fb_errors)
+                        break  # fallback обработал все оставшиеся месяцы
+                    else:
+                        # Клиентская ошибка — не ретраим
+                        err_msg = f"{month_name} {year}: {error_brief(e)}"
+                        errors.append(err_msg)
+                        logger.error(
+                            f"  {log_prefix}: {dat} -> ОШИБКА "
+                            f"[{type(e).__name__}] {error_brief(e)}"
+                        )
+                except ConnectionError as e:
+                    # Сетевая ошибка / таймаут — переключаемся на fallback
+                    _mark_api_down()
                     use_web_fallback = True
                     logger.warning(
-                        f"  {log_prefix}: {dat} -> HTTP {status}, "
+                        f"  {log_prefix}: {dat} -> {error_brief(e)}, "
                         f"переключаюсь на запасной метод (сайт ГИБДД)"
                     )
                     if notify_callback:
                         try:
                             await notify_callback(
-                                "\u26A0\uFE0F API ГИБДД недоступен (HTTP "
-                                f"{status}).\n"
+                                "\u26A0\uFE0F API ГИБДД недоступен "
+                                f"({error_brief(e)}).\n"
                                 "Переключаюсь на запасной метод (сайт)..."
                             )
                         except Exception:
@@ -374,47 +442,13 @@ async def _fetch_cards_for_period(
                     cards.extend(fb_cards)
                     errors.extend(fb_errors)
                     break  # fallback обработал все оставшиеся месяцы
-                else:
-                    # Клиентская ошибка — не ретраим
+                except Exception as e:
                     err_msg = f"{month_name} {year}: {error_brief(e)}"
                     errors.append(err_msg)
                     logger.error(
                         f"  {log_prefix}: {dat} -> ОШИБКА "
                         f"[{type(e).__name__}] {error_brief(e)}"
                     )
-            except ConnectionError as e:
-                # Сетевая ошибка / таймаут — переключаемся на fallback
-                use_web_fallback = True
-                logger.warning(
-                    f"  {log_prefix}: {dat} -> {error_brief(e)}, "
-                    f"переключаюсь на запасной метод (сайт ГИБДД)"
-                )
-                if notify_callback:
-                    try:
-                        await notify_callback(
-                            "\u26A0\uFE0F API ГИБДД недоступен "
-                            f"({error_brief(e)}).\n"
-                            "Переключаюсь на запасной метод (сайт)..."
-                        )
-                    except Exception:
-                        pass
-                remaining_dats = [dat] + dat_list[i:]
-                from web_fallback import fetch_dtp_via_web_period
-                fb_cards, fb_errors = await fetch_dtp_via_web_period(
-                    remaining_dats, reg_code,
-                    log_prefix=f"{log_prefix} [сайт]",
-                    progress_callback=progress_callback,
-                )
-                cards.extend(fb_cards)
-                errors.extend(fb_errors)
-                break  # fallback обработал все оставшиеся месяцы
-            except Exception as e:
-                err_msg = f"{month_name} {year}: {error_brief(e)}"
-                errors.append(err_msg)
-                logger.error(
-                    f"  {log_prefix}: {dat} -> ОШИБКА "
-                    f"[{type(e).__name__}] {error_brief(e)}"
-                )
 
     # --- Глобальный кэш: сохраняем результат ---
     if cards:
@@ -1113,6 +1147,10 @@ async def _start_fetching(
     dat_list = period.get_dat_list()
     total_months = len(dat_list)
 
+    # Сбрасываем флаг недоступности API при новом запросе пользователя
+    global _api_down
+    _api_down = False
+
     try:
         await _tg_retry(lambda: query.edit_message_text(
             f"Выгрузка данных:\n\n"
@@ -1401,7 +1439,8 @@ async def _offer_analysis(
     context.user_data["analytics_cards"] = current_cards
 
     # --- Идея 2: фоновый preload данных за прошлый год ---
-    asyncio.create_task(_preload_prev_year(reg_code, period))
+    preload_task = asyncio.create_task(_preload_prev_year(reg_code, period))
+    context.user_data["_preload_task"] = preload_task
 
     text, keyboard = _build_menu_keyboard(context)
     if text and keyboard:
@@ -1446,6 +1485,17 @@ async def _run_analysis(
     mode_label = "\U0001F916 AI-анализ" if use_llm else "\U0001F4CA Анализ"
 
     # Проверяем, есть ли уже данные за прошлый год (per-user или глобальный кэш)
+    # Если Preload ещё выполняется — ждём его завершения
+    preload_task = context.user_data.get("_preload_task")
+    if preload_task and not preload_task.done():
+        logger.info(f"{mode_label}: ждём завершения фоновой загрузки за прошлый год...")
+        try:
+            await asyncio.wait_for(preload_task, timeout=300)
+        except asyncio.TimeoutError:
+            logger.warning(f"{mode_label}: preload не завершился за 5 мин, скачиваем самостоятельно")
+        except Exception:
+            pass  # preload упал — продолжим самостоятельно
+
     cached_prev = context.user_data.get("analytics_prev_cards", [])
     cached_prev_label = context.user_data.get("analytics_prev_label", "")
 
@@ -1810,6 +1860,17 @@ async def _run_concentration_points(
         errors = []
 
         # Проверяем per-user кэш и глобальный кэш (может заполнен preload-задачей)
+        # Если Preload ещё выполняется — ждём его завершения
+        preload_task = context.user_data.get("_preload_task")
+        if preload_task and not preload_task.done():
+            logger.info("Аналитика: ждём завершения фоновой загрузки за прошлый год...")
+            try:
+                await asyncio.wait_for(preload_task, timeout=300)
+            except asyncio.TimeoutError:
+                logger.warning("Аналитика: preload не завершился за 5 мин, скачиваем самостоятельно")
+            except Exception:
+                pass  # preload упал — продолжим самостоятельно
+
         cached_prev = context.user_data.get("analytics_prev_cards", [])
         cached_prev_label = context.user_data.get("analytics_prev_label", "")
 
@@ -3220,16 +3281,20 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if isinstance(error, NetworkError):
-        logger.warning(f"Сетевая ошибка (временная): {error}")
-        # Уведомляем пользователя, если знаем куда
+        label = _sanitize_error(error)
+        logger.warning(f"Сетевая ошибка (временная): {label}")
+        # Уведомляем пользователя только если есть конкретное сообщение
+        # (при таймауте get_updates update=None — уведомлять некого)
         try:
             if isinstance(update, Update) and update.callback_query and update.callback_query.message:
-                await update.callback_query.message.reply_text(
+                await _tg_retry(
+                    update.callback_query.message.reply_text,
                     "⚠️ Временная проблема с подключением к Telegram.\n"
                     "Попробуйте нажать кнопку ещё раз.",
                 )
             elif isinstance(update, Update) and update.message:
-                await update.message.reply_text(
+                await _tg_retry(
+                    update.message.reply_text,
                     "⚠️ Временная проблема с подключением к Telegram.\n"
                     "Попробуйте отправить запрос ещё раз.",
                 )
