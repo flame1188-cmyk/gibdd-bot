@@ -1486,10 +1486,26 @@ async def _run_analysis(
 
     mode_label = "\U0001F916 AI-анализ" if use_llm else "\U0001F4CA Анализ"
 
+    # Немедленно отвечаем пользователю, чтобы он видел реакцию на кнопку
+    try:
+        await update.callback_query.answer()
+    except Exception:
+        pass
+
     # Проверяем, есть ли уже данные за прошлый год (per-user или глобальный кэш)
-    # Если Preload ещё выполняется — ждём его завершения
     preload_task = context.user_data.get("_preload_task")
     if preload_task and not preload_task.done():
+        # Фоновая загрузка ещё идёт — показываем пользователю статус
+        status_msg = await _tg_retry(lambda: context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"{mode_label}: подготовка...\n\n"
+                f"Регион: {reg_name}\n"
+                f"Текущий период: {current_label}\n"
+                f"Сравнение: {prev_label}\n\n"
+                f"\u23F3 Ждём завершения фоновой загрузки данных за прошлый год..."
+            ),
+        ), "send_message (статус аналитики)")
         logger.info(f"{mode_label}: ждём завершения фоновой загрузки за прошлый год...")
         try:
             await asyncio.wait_for(preload_task, timeout=300)
@@ -1497,6 +1513,8 @@ async def _run_analysis(
             logger.warning(f"{mode_label}: preload не завершился за 5 мин, скачиваем самостоятельно")
         except Exception:
             pass  # preload упал — продолжим самостоятельно
+    else:
+        status_msg = None
 
     cached_prev = context.user_data.get("analytics_prev_cards", [])
     cached_prev_label = context.user_data.get("analytics_prev_label", "")
@@ -1515,28 +1533,46 @@ async def _run_analysis(
         # Обновляем per-user кэш
         context.user_data["analytics_prev_cards"] = prev_cards
         context.user_data["analytics_prev_label"] = prev_label
-        status_msg = await _tg_retry(lambda: context.bot.send_message(
-            chat_id=chat_id,
-            text=(
+        if status_msg is None:
+            status_msg = await _tg_retry(lambda: context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"{mode_label}: подготовка...\n\n"
+                    f"Регион: {reg_name}\n"
+                    f"Текущий период: {current_label}\n"
+                    f"Сравнение: {prev_label}\n\n"
+                    f"Данные за прошлый год из кэша ({len(prev_cards)} ДТП)..."
+                ),
+            ), "send_message (статус аналитики)")
+        else:
+            await status_msg.edit_text(
                 f"{mode_label}: подготовка...\n\n"
                 f"Регион: {reg_name}\n"
                 f"Текущий период: {current_label}\n"
                 f"Сравнение: {prev_label}\n\n"
                 f"Данные за прошлый год из кэша ({len(prev_cards)} ДТП)..."
-            ),
-        ), "send_message (статус аналитики)")
+            )
     else:
         # Скачиваем данные за прошлый год
-        status_msg = await _tg_retry(lambda: context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"{mode_label}: подготовка...\n\n"
+        if status_msg is None:
+            status_msg = await _tg_retry(lambda: context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"{mode_label}: подготовка...\n\n"
+                    f"Регион: {reg_name}\n"
+                    f"Текущий период: {current_label}\n"
+                    f"Сравнение: {prev_label}\n\n"
+                    f"Загрузка данных за {prev_year} год..."
+                ),
+            ), "send_message (статус аналитики)")
+        else:
+            await status_msg.edit_text(
+                f"{mode_label}: загрузка...\n\n"
                 f"Регион: {reg_name}\n"
                 f"Текущий период: {current_label}\n"
                 f"Сравнение: {prev_label}\n\n"
-                f"Загрузка данных за {prev_year} год..."
-            ),
-        ), "send_message (статус аналитики)")
+                f"\u23F3 Загрузка данных за {prev_year} год..."
+            )
 
         async def progress(i, total, month_name, year):
             bar = _make_progress_bar(i, total)
@@ -1865,11 +1901,20 @@ async def _run_concentration_points(
         # Если Preload ещё выполняется — ждём его завершения
         preload_task = context.user_data.get("_preload_task")
         if preload_task and not preload_task.done():
-            logger.info("Аналитика: ждём завершения фоновой загрузки за прошлый год...")
+            logger.info("Очаги-динамика: ждём завершения фоновой загрузки за прошлый год...")
+            try:
+                await status_msg.edit_text(
+                    f"\U0001F525 Очаги ДТП (динамика)\n\n"
+                    f"Регион: {reg_name}\n"
+                    f"{current_label} vs {prev_label}\n\n"
+                    f"\u23F3 [1/5] Ждём завершения фоновой загрузки данных за прошлый год..."
+                )
+            except Exception:
+                pass
             try:
                 await asyncio.wait_for(preload_task, timeout=300)
             except asyncio.TimeoutError:
-                logger.warning("Аналитика: preload не завершился за 5 мин, скачиваем самостоятельно")
+                logger.warning("Очаги-динамика: preload не завершился за 5 мин, скачиваем самостоятельно")
             except Exception:
                 pass  # preload упал — продолжим самостоятельно
 
@@ -3360,11 +3405,16 @@ async def _post_shutdown(app) -> None:
 
 
 def _build_app(token: str) -> "Application":
-    """Создаёт и настраивает Application. Вызывается заново для каждого retry."""
+    """Создаёт и настраиваем Application. Вызывается заново для каждого retry."""
     app = (
         Application.builder()
         .token(token)
         .concurrent_updates(True)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .get_updates_connection_timeout(30.0)
+        .get_updates_read_timeout(60.0)
         .post_init(_post_init)
         .post_shutdown(_post_shutdown)
         .build()
