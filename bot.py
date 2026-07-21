@@ -16,6 +16,7 @@ import html as html_mod
 import logging
 import os
 import sys
+import time
 from datetime import datetime
 from typing import Any
 
@@ -3339,8 +3340,20 @@ async def _post_init(app) -> None:
                 raise
 
 
+# Флаг: run_polling() завершился штатно (Ctrl+C), а не по таймауту при старте.
+# Если False — _post_shutdown НЕ закрывает HTTP-клиенты, чтобы не сломать
+# следующую попытку в retry-цикле main().
+_clean_shutdown: bool = False
+
+
 async def _post_shutdown(app) -> None:
     """Корректно закрывает все HTTP-клиенты при остановке бота."""
+    global _clean_shutdown
+    if not _clean_shutdown:
+        # retry при старте — не закрываем клиенты, они привязаны
+        # к уже закрытому event loop следующей попытки создаст свои.
+        logger.info("post_shutdown: нештатный выход (startup-retry), клиенты не закрываем")
+        return
     await close_client()
     await close_llm_client()
     logger.info("Все HTTP-клиенты закрыты (post_shutdown)")
@@ -3389,10 +3402,34 @@ def main() -> None:
     print("  Текст — 'Вологодская область за 2025 год'")
     print("  Нажмите Ctrl+C для остановки.\n")
 
-    # Стартап-ретрай перенесён в _post_init — он выполняется
-    # внутри event loop run_polling(), что исключает
-    # «RuntimeError: Event loop is closed» при повторных попытках.
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Стартап-ретрай: run_polling() использует asyncio.run() внутри,
+    # при TimedOut в initialize() loop закрывается. Следующий вызов
+    # создаёт новый loop — это безопасно, т.к. HTTP-клиенты
+    # не закрываются в _post_shutdown при _clean_shutdown=False.
+    _STARTUP_RETRIES = 5
+    _STARTUP_DELAYS = [5, 10, 15, 30, 60]
+    for attempt in range(1, _STARTUP_RETRIES + 1):
+        try:
+            global _clean_shutdown
+            _clean_shutdown = False
+            app.run_polling(allowed_updates=Update.ALL_TYPES)
+            # Если мы здесь — bot остановлен штатно (Ctrl+C / SIGTERM)
+            _clean_shutdown = True
+            break
+        except (TimedOut, NetworkError) as e:
+            if attempt < _STARTUP_RETRIES:
+                delay = _STARTUP_DELAYS[attempt - 1]
+                logger.warning(
+                    f"Telegram API недоступен при запуске ({type(e).__name__}). "
+                    f"Попытка {attempt}/{_STARTUP_RETRIES}, повтор через {delay}с..."
+                )
+                time.sleep(delay)
+            else:
+                logger.error(
+                    f"Telegram API недоступен после {_STARTUP_RETRIES} попыток. "
+                    f"Бот останавливается."
+                )
+                raise
 
 
 if __name__ == "__main__":
