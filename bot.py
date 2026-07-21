@@ -3413,7 +3413,7 @@ def _build_app(token: str) -> "Application":
         .connect_timeout(30.0)
         .read_timeout(30.0)
         .write_timeout(30.0)
-        .get_updates_connection_timeout(30.0)
+        .get_updates_connect_timeout(30.0)
         .get_updates_read_timeout(60.0)
         .post_init(_post_init)
         .post_shutdown(_post_shutdown)
