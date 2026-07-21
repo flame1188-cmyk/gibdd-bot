@@ -175,6 +175,26 @@ def _sanitize_error(e: Exception) -> str:
     return name  # только имя класса, без деталей
 
 
+async def _safe_edit(
+    query,
+    text: str,
+    reply_markup=None,
+    parse_mode: str | None = None,
+    description: str = "edit_message",
+) -> None:
+    """Безопасное редактирование сообщения с ретраем при TimedOut/NetworkError.
+
+    Оборачивает query.edit_message_text в _tg_retry, чтобы временные
+    проблемы с Telegram API не прерывали обработку callback.
+    """
+    await _tg_retry(
+        lambda: query.edit_message_text(
+            text=text, reply_markup=reply_markup, parse_mode=parse_mode,
+        ),
+        description,
+    )
+
+
 async def _send_long_message(
     bot,
     chat_id: int,
@@ -695,9 +715,8 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                         return
                     regions = _get_regions(context)
                     keyboard = build_region_keyboard(regions, page)
-                    await query.edit_message_text(
-                        "Выберите регион:", reply_markup=keyboard,
-                    )
+                    await _safe_edit(query, "Выберите регион:", reply_markup=keyboard,
+                                     description="регионы (страница)")
                 return
 
             # --- Выбор региона ---
@@ -718,11 +737,11 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 context.user_data["sel_year"] = current_year
                 keyboard = build_period_keyboard(current_year)
 
-                await query.edit_message_text(
+                await _safe_edit(query,
                     f"Регион: {reg_name}\n\n"
                     f"Выберите период:",
                     reply_markup=keyboard,
-                )
+                    description="период (выбор региона)")
                 return
 
             # --- Выбор периода: Весь год ---
@@ -825,11 +844,11 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     context.user_data["sel_year"] = year
                     keyboard = build_period_keyboard(year)
                     reg_name = context.user_data.get("reg_name", "")
-                    await query.edit_message_text(
+                    await _safe_edit(query,
                         f"Регион: {reg_name}\n\n"
                         f"Выберите период:",
                         reply_markup=keyboard,
-                    )
+                        description="период (навигация по годам)")
                 return
 
             # --- Назад к регионам ---
@@ -838,9 +857,8 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 context.user_data.pop("reg_name", None)
                 regions = _get_regions(context)
                 keyboard = build_region_keyboard(regions, page=0)
-                await query.edit_message_text(
-                    "Выберите регион:", reply_markup=keyboard,
-                )
+                await _safe_edit(query, "Выберите регион:",
+                                 reply_markup=keyboard, description="назад к регионам)")
                 return
 
             # --- Запрос аналитики (без ИИ) ---
@@ -891,7 +909,7 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                             ),
                         ],
                     ])
-                    await query.edit_message_text(
+                    await _safe_edit(query,
                         "\U0001F525 <b>Очаги ДТП</b>\n\n"
                         f"Для региона <b>{reg_code}</b> найден сохранённый файл камер:\n"
                         f"  \u2022 Всего: {len(cached_cameras)}\n"
@@ -899,7 +917,7 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                         "Использовать его или загрузить новый?",
                         reply_markup=keyboard,
                         parse_mode="HTML",
-                    )
+                        description="очаги (камеры в кэше)")
                 else:
                     # Камер в кэше нет — просим загрузить
                     keyboard = InlineKeyboardMarkup([
@@ -914,22 +932,22 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                             ),
                         ],
                     ])
-                    await query.edit_message_text(
+                    await _safe_edit(query,
                         "\U0001F525 <b>Очаги ДТП</b>\n\n"
                         "Загрузите файл с камерами фотовидеофиксации\n"
                         "(gibddrf_cameras_change_*.xls)\n"
                         "или продолжите без камер.",
                         reply_markup=keyboard,
                         parse_mode="HTML",
-                    )
+                        description="очаги (без камер)")
                 return
 
             # --- Камеры: пропустить ---
             if data == "cam_skip":
                 context.user_data.pop("cameras_data", None)
-                await query.edit_message_text(
-                    "\U0001F525 Запуск расчёта очагов (без камер)..."
-                )
+                await _safe_edit(query,
+                    "\U0001F525 Запуск расчёта очагов (без камер)...",
+                    description="очаги (старт без камер)")
                 await _run_concentration_points(update, context)
                 return
 
@@ -944,27 +962,27 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 cameras = load_cameras_from_cache(reg_code) if reg_code else None
                 if cameras:
                     context.user_data["cameras_data"] = cameras
-                    await query.edit_message_text(
+                    await _safe_edit(query,
                         f"\U0001F525 Запуск расчёта очагов "
-                        f"(с сохранёнными камерами: {len(cameras)})..."
-                    )
+                        f"(с сохранёнными камерами: {len(cameras)})...",
+                        description="очаги (старт с камерами)")
                     await _run_concentration_points(update, context)
                 else:
-                    await query.edit_message_text(
-                        "\u26A0\uFE0F Файл камер не найден. Загрузите заново."
-                    )
+                    await _safe_edit(query,
+                        "\u26A0\uFE0F Файл камер не найден. Загрузите заново.",
+                        description="очаги (камеры не найдены)")
                 return
 
             # --- Камеры: запрос загрузки ---
             if data == "cam_ask_upload":
                 context.user_data["waiting_camera_file"] = True
-                await query.edit_message_text(
+                await _safe_edit(query,
                     "\U0001F4F7 <b>Загрузка камер</b>\n\n"
                     "Отправьте Excel-файл с камерами\n"
                     "(gibddrf_cameras_change_*.xlsx)\n\n"
                     "Или нажмите \u274C чтобы пропустить.",
                     parse_mode="HTML",
-                )
+                    description="камеры (просьба загрузить)")
                 return
 
             # --- Статистика по точке ---
@@ -983,7 +1001,7 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
             if data == "html_map_ask_cameras":
                 context.user_data["waiting_camera_for_map"] = True
-                await query.edit_message_text(
+                await _safe_edit(query,
                     "\U0001F5FA <b>Карта ДТП + камеры</b>\n\n"
                     "Отправьте Excel-файл с реестром камер\n"
                     "(gibddrf_cameras_change_*.xlsx)\n\n"
@@ -992,7 +1010,7 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     reply_markup=InlineKeyboardMarkup([[
                         InlineKeyboardButton("\u274C Без камер", callback_data="html_map_dtp_only"),
                     ]]),
-                )
+                    description="карта (просьба загрузить камеры)")
                 return
 
             # --- Смена радиуса статистики по точке ---
@@ -1019,9 +1037,8 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 _clear_analytics_data(context.user_data)
                 regions = _get_regions(context)
                 keyboard = build_region_keyboard(regions, page=0)
-                await query.edit_message_text(
-                    "Выберите регион:", reply_markup=keyboard,
-                )
+                await _safe_edit(query, "Выберите регион:",
+                                 reply_markup=keyboard, description="смена данных)")
                 return
 
             # --- Возврат в главное меню ---
@@ -1036,9 +1053,9 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 menu_text, menu_kb = _build_menu_keyboard(context)
                 if menu_text and menu_kb:
                     try:
-                        await query.edit_message_text(
-                            menu_text, reply_markup=menu_kb, parse_mode="HTML",
-                        )
+                        await _safe_edit(query, menu_text,
+                                     reply_markup=menu_kb, parse_mode="HTML",
+                                     description="главное меню)")
                     except Exception:
                         # Если не удалось отредактировать — отправляем новым сообщением
                         await context.bot.send_message(
@@ -1046,33 +1063,33 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                             text=menu_text, reply_markup=menu_kb, parse_mode="HTML",
                         )
                 else:
-                    await query.edit_message_text(
-                        "Данные не найдены. Отправьте /dtp для новой выгрузки."
-                    )
+                    await _safe_edit(query,
+                        "Данные не найдены. Отправьте /dtp для новой выгрузки.",
+                        description="меню (нет данных)")
                 return
 
             # --- Завершить режим вопросов ---
             if data == "end_qa":
                 _clear_analytics_data(context.user_data)
-                await query.edit_message_text(
-                    "Режим вопросов завершён.\n\nОтправьте /dtp для новой выгрузки."
-                )
+                await _safe_edit(query,
+                    "Режим вопросов завершён.\n\nОтправьте /dtp для новой выгрузки.",
+                    description="завершение QA)")
                 return
 
             # --- Отмена ---
             if data == "cancel":
                 context.user_data.clear()
-                await query.edit_message_text(
-                    "Отменено. Отправьте /dtp чтобы начать заново."
-                )
+                await _safe_edit(query,
+                    "Отменено. Отправьте /dtp чтобы начать заново.",
+                    description="отмена)")
             return
 
         except Exception as e:
             logger.exception(f"Ошибка в callback handler: {e}")
             try:
-                await query.edit_message_text(
-                    "Произошла ошибка при обработке запроса.\n\n"
-                )
+                await _safe_edit(query,
+                    f"\u26A0\uFE0F Ошибка: {_sanitize_error(e)}",
+                    description="callback ошибка)")
             except Exception:
                 pass
 
@@ -3204,6 +3221,20 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if isinstance(error, NetworkError):
         logger.warning(f"Сетевая ошибка (временная): {error}")
+        # Уведомляем пользователя, если знаем куда
+        try:
+            if isinstance(update, Update) and update.callback_query and update.callback_query.message:
+                await update.callback_query.message.reply_text(
+                    "⚠️ Временная проблема с подключением к Telegram.\n"
+                    "Попробуйте нажать кнопку ещё раз.",
+                )
+            elif isinstance(update, Update) and update.message:
+                await update.message.reply_text(
+                    "⚠️ Временная проблема с подключением к Telegram.\n"
+                    "Попробуйте отправить запрос ещё раз.",
+                )
+        except Exception:
+            pass  # Само уведомление тоже может упасть — игнорируем
         return
 
     logger.error(f"Ошибка: {error}", exc_info=error)
