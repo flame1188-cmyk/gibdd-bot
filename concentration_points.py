@@ -47,6 +47,7 @@ import httpx
 from shapely.geometry import Polygon, MultiPolygon, Point, LineString
 from shapely.ops import linemerge, polygonize, unary_union
 from shapely.prepared import prep
+from shapely.strtree import STRtree
 
 from analytics import _safe_int
 
@@ -558,6 +559,23 @@ def _parse_overpass_elements(
                 poly = _relation_to_polygon(element)
                 if poly is not None:
                     polygons.append(poly)
+
+        # Упрощаем полигоны для экономии памяти.
+        # Для задачи «точка в НП / вне НП» точность 22 м избыточна.
+        if len(polygons) > UNARY_UNION_MAX_POLYGONS:
+            simplified = []
+            for p in polygons:
+                try:
+                    s = p.simplify(POLYGON_SIMPLIFY_TOLERANCE, preserve_topology=True)
+                    if not s.is_empty and s.area > 1e-10:
+                        simplified.append(s)
+                except Exception:
+                    simplified.append(p)
+            before = len(polygons)
+            polygons = simplified
+            logger.info(
+                f"Полигоны упрощены: {before} → {len(polygons)} "
+                f"(допуск {POLYGON_SIMPLIFY_TOLERANCE}°)")
 
     if polygons:
         logger.info(
@@ -1087,6 +1105,17 @@ def _point_in_any_polygon(
     return False
 
 
+# Порог числа полигонов, при котором unary_union заменяется на STRtree.
+# unary_union(8008 полигонов) создаёт GEOS-геометрию ~300-500 МБ,
+# что вызывает OOM Kill на серверах с 2 ГБ RAM.
+UNARY_UNION_MAX_POLYGONS = 2000
+
+# Допуск упрощения полигонов OSM (градусы).
+# 0.0002° ≈ 22 м — достаточно для определения «ДТП в НП / вне НП».
+# Сокращает число вершин в 3-5 раз, экономя ~50-70% памяти на полигонах.
+POLYGON_SIMPLIFY_TOLERANCE = 0.0002
+
+
 def classify_cards(
     cards: list[dict],
     settlement_polygons: list[Polygon | MultiPolygon],
@@ -1094,8 +1123,12 @@ def classify_cards(
     """
     Разделяет карточки на две группы: НП и вне НП.
 
-    Использует Shapely unary_union + prepared geometry
-    для быстрой проверки O(1) на точку после инициализации.
+    При малом числе полигонов (<= UNARY_UNION_MAX_POLYGONS) —
+    unary_union + prepared geometry для O(1) на точку.
+
+    При большом числе полигонов — STRtree (пространственный индекс)
+    для фильтрации по bounding box перед точной проверкой,
+    чтобы избежать OOM от unary_union.
 
     Args:
         cards: Карточки ДТП с координатами
@@ -1110,44 +1143,99 @@ def classify_cards(
     settlement_cards = []
     non_settlement_cards = []
 
-    # Объединяем все полигоны в одну геометрию и подготавливаем
-    # для O(1) проверки contains на каждую точку
-    try:
-        merged = unary_union(settlement_polygons)
-        prepared = prep(merged)
-        use_prepared = True
-    except Exception as e:
-        logger.warning(
-            f"Не удалось создать prepared geometry: {e}. "
-            f"Используется поцикличная проверка."
+    use_strtree = len(settlement_polygons) > UNARY_UNION_MAX_POLYGONS
+
+    if use_strtree:
+        # STRtree: пространственный индекс по bounding box полигонов.
+        # Позволяет быстро отфильтровать полигоны, чей bbox
+        # содержит точку — вместо unary_union всей коллекции.
+        logger.info(
+            f"Классификация: {len(settlement_polygons)} полигонов — "
+            f"используется STRtree (вместо unary_union для экономии памяти)"
         )
-        prepared = None
-        use_prepared = False
-
-    for card in cards:
-        coords = _parse_coords(card)
-        if coords is None:
-            non_settlement_cards.append(card)
-            continue
-
-        # Shapely: (x, y) = (lon, lat)
-        point = Point(coords[1], coords[0])
-        in_settlement = False
-
         try:
-            if use_prepared and prepared is not None:
-                in_settlement = prepared.contains(point)
-            else:
-                in_settlement = _point_in_any_polygon(
-                    coords[0], coords[1], settlement_polygons,
-                )
-        except Exception:
-            pass
+            tree = STRtree(settlement_polygons)
+            for card in cards:
+                coords = _parse_coords(card)
+                if coords is None:
+                    non_settlement_cards.append(card)
+                    continue
+                point = Point(coords[1], coords[0])
+                try:
+                    candidate_indices = list(tree.query(point))
+                    in_settlement = False
+                    for idx in candidate_indices:
+                        try:
+                            if settlement_polygons[idx].contains(point):
+                                in_settlement = True
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    in_settlement = False
+                if in_settlement:
+                    settlement_cards.append(card)
+                else:
+                    non_settlement_cards.append(card)
+            # Освобождаем дерево
+            del tree
+            gc.collect()
+        except Exception as e:
+            logger.warning(
+                f"STRtree не удалось: {e}, падаем на поцикличную проверку"
+            )
+            # Fallback: поцикличная проверка
+            for card in cards:
+                coords = _parse_coords(card)
+                if coords is None:
+                    non_settlement_cards.append(card)
+                    continue
+                if _point_in_any_polygon(coords[0], coords[1], settlement_polygons):
+                    settlement_cards.append(card)
+                else:
+                    non_settlement_cards.append(card)
+    else:
+        # Мало полигонов — unary_union + prepared geometry (быстро и мало памяти)
+        try:
+            merged = unary_union(settlement_polygons)
+            prepared = prep(merged)
+            use_prepared = True
+        except Exception as e:
+            logger.warning(
+                f"Не удалось создать prepared geometry: {e}. "
+                f"Используется поцикличная проверка."
+            )
+            prepared = None
+            use_prepared = False
 
-        if in_settlement:
-            settlement_cards.append(card)
-        else:
-            non_settlement_cards.append(card)
+        for card in cards:
+            coords = _parse_coords(card)
+            if coords is None:
+                non_settlement_cards.append(card)
+                continue
+
+            point = Point(coords[1], coords[0])
+            in_settlement = False
+
+            try:
+                if use_prepared and prepared is not None:
+                    in_settlement = prepared.contains(point)
+                else:
+                    in_settlement = _point_in_any_polygon(
+                        coords[0], coords[1], settlement_polygons,
+                    )
+            except Exception:
+                pass
+
+            if in_settlement:
+                settlement_cards.append(card)
+            else:
+                non_settlement_cards.append(card)
+
+        # Освобождаем merged/prepared
+        del merged
+        del prepared
+        gc.collect()
 
     logger.info(
         f"Классификация: {len(settlement_cards)} в НП, "

@@ -12,6 +12,7 @@
 """
 
 import asyncio
+import gc
 import html as html_mod
 import logging
 import os
@@ -1825,6 +1826,13 @@ async def _run_analysis(
         f"LLM={'да' if (use_llm and llm_summary_text) else 'нет'}"
     )
 
+    # Освобождаем память: удаляем сырые карточки из сессии
+    # (сами очаги остаются в analytics_clusters для QA)
+    context.user_data.pop("analytics_cards", None)
+    context.user_data.pop("analytics_prev_cards", None)
+    context.user_data.pop("analytics_comparison", None)
+    gc.collect()
+
 
 def _clear_analytics_data(user_data: dict) -> None:
     """Очищает все данные аналитики из user_data (включая тяжёлые списки ДТП)."""
@@ -2229,6 +2237,7 @@ async def _run_concentration_points(
         # Освобождаем память: удаляем камеры и сырые карточки из сессии
         context.user_data.pop("cameras_data", None)
         # Полигоны оставляем — они нужны для аналитики с ИИ
+        gc.collect()
 
     except Exception as e:
         logger.exception(f"Ошибка расчёта очагов (динамика): {e}")
