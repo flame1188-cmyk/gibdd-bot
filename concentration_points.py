@@ -105,9 +105,8 @@ EXCLUDED_SDOR_FOR_KUL = [
     "иное место",
 ]
 
-# Кэширование границ НП (в постоянном хранилище, /data на Amvera)
-_DATA_DIR = os.environ.get("CAMERA_DATA_DIR", "data")
-CACHE_DIR = os.path.join(_DATA_DIR, "osm_cache")
+# Кэширование границ НП
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
 CACHE_TTL_SECONDS = 24 * 60 * 60  # 24 часа
 
 # In-memory LRU-кэш распарсенных полигонов (избегает повторного парсинга JSON)
@@ -116,7 +115,7 @@ _memory_cache: OrderedDict[str, tuple[float, list]] = OrderedDict()  # bbox → 
 
 # Параметры bbox
 BBOX_MARGIN = 0.02  # ~2.2 км — минимальный запас вокруг ДТП
-BBOX_TILE_MAX_DEG = 1.5  # макс. размер стороны тайла (при превышении — разбиение)
+BBOX_TILE_MAX_DEG = 3.0  # макс. размер стороны тайла (при превышении — разбиение)
 BBOX_TILE_OVERLAP = 0.02  # перехлёст тайлов, чтобы НП на границе не потерялись
 BBOX_MIN_CLAMP = 0.01  # минимальный размер bbox (если ДТП в одной точке)
 
@@ -680,6 +679,12 @@ OVERPASS_HEADERS = {
     "Accept": "application/json",
 }
 
+# Rate limiting для Overpass API
+OVERPASS_MIN_INTERVAL = 10.0  # мин. интервал между запросами (сек)
+OVERPASS_429_WAIT = 30.0     # базовое ожидание при 429 (сек)
+_overpass_client: httpx.AsyncClient | None = None  # общий HTTP-клиент
+_overpass_last_request_time: float = 0.0  # время последнего запроса
+
 PLACE_FILTER = "city|town|village|hamlet"
 
 
@@ -885,144 +890,80 @@ def _filter_elements_for_bbox(
     return filtered
 
 
-async def _fetch_overpass_parallel(
-    bbox_str: str,
-    tile_idx: int = 0,
-    total_tiles: int = 1,
-) -> list[dict] | None:
-    """
-    Параллельный запрос к зеркалам Overpass API.
-
-    Стратегия:
-    1. Параллельно запускаем запросы к 2 зеркалам (out geom)
-    2. Если оба не удались — пауза 5 сек, повторная попытка geom
-    3. Если и повторная попытка не удалась — fallback на out bb
-    4. Последняя надежда: out geom последовательно на оставшихся зеркалах
-    """
-    geom_query = (
-        "[out:json][timeout:90];\n"
-        "(\n"
-        f'  relation["place"~"{PLACE_FILTER}"]({bbox_str});\n'
-        f'  way["place"~"{PLACE_FILTER}"]({bbox_str});\n'
-        ");\n"
-        "out geom;\n"
-    )
-
-    bb_query = (
-        "[out:json][timeout:90];\n"
-        "(\n"
-        f'  relation["place"~"{PLACE_FILTER}"]({bbox_str});\n'
-        f'  way["place"~"{PLACE_FILTER}"]({bbox_str});\n'
-        ");\n"
-        "out bb;\n"
-    )
-
-    # --- Пытаемся получить geom параллельно с 2 зеркал ---
-    geom_urls = OVERPASS_URLS[:2]
-
-    for attempt in range(1, 3):  # максимум 2 попытки geom
-        geom_tasks = []
-        for url in geom_urls:
-            geom_tasks.append(
-                asyncio.create_task(
-                    _overpass_request(url, geom_query, OVERPASS_HEADERS, "geom"),
-                    name=f"geom-{url}",
-                )
-            )
-
-        geom_results = await asyncio.gather(*geom_tasks, return_exceptions=True)
-
-        for result in geom_results:
-            if isinstance(result, list) and result:
-                polygons, is_bbox = _parse_overpass_elements(result)
-                if polygons and not is_bbox:
-                    logger.info(
-                        f"Тайл {tile_idx + 1}/{total_tiles}: "
-                        f"{len(polygons)} полигонов (out geom, parallel"
-                        f"{f', попытка {attempt}' if attempt > 1 else ''})"
-                    )
-                    _save_cache(bbox_str, result)
-                    return result
-
-        # Перед второй попыткой — пауза, чтобы сервер Overpass успел
-        if attempt == 1:
-            logger.info(
-                f"Тайл {tile_idx + 1}/{total_tiles}: "
-                f"geom не удался, повторная попытка через 5 сек..."
-            )
-            await asyncio.sleep(5)
-
-    # --- Fallback: параллельно out bb на 2 зеркалах ---
-    bb_tasks = []
-    for url in OVERPASS_URLS[:2]:
-        bb_tasks.append(
-            asyncio.create_task(
-                _overpass_request(url, bb_query, OVERPASS_HEADERS, "bb"),
-                name=f"bb-{url}",
-            )
+def _get_overpass_client() -> httpx.AsyncClient:
+    """Возвращает общий httpx.AsyncClient для запросов к Overpass."""
+    global _overpass_client
+    if _overpass_client is None or _overpass_client.is_closed:
+        _overpass_client = httpx.AsyncClient(
+            verify=False,
+            headers=OVERPASS_HEADERS,
+            timeout=60.0,
+            limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
         )
+    return _overpass_client
 
-    bb_results = await asyncio.gather(*bb_tasks, return_exceptions=True)
 
-    for result in bb_results:
-        if isinstance(result, list) and result:
-            polygons, is_bbox = _parse_overpass_elements(result)
-            if polygons:
-                logger.info(
-                    f"Тайл {tile_idx + 1}/{total_tiles}: "
-                    f"{len(polygons)} bounding boxes (out bb, parallel)"
-                )
-                # НЕ сохраняем bb в кэш
-                return result
-
-    # --- Последняя попытка: seq через все зеркала (geom) ---
-    for url in OVERPASS_URLS[2:]:
-        elements = await _overpass_request(
-            url, geom_query, OVERPASS_HEADERS, "geom",
-        )
-        if elements is not None:
-            polygons, is_bbox = _parse_overpass_elements(elements)
-            if polygons and not is_bbox:
-                _save_cache(bbox_str, elements)
-                return elements
-
-    logger.warning(
-        f"Тайл {tile_idx + 1}/{total_tiles}: все зеркала недоступны"
-    )
-    return None
+async def close_overpass_client() -> None:
+    """Закрывает общий HTTP-клиент Overpass. Вызывается из bot.py при shutdown."""
+    global _overpass_client
+    if _overpass_client is not None and not _overpass_client.is_closed:
+        await _overpass_client.aclose()
+        _overpass_client = None
 
 
 async def _overpass_request(
     url: str,
     query: str,
-    headers: dict,
     mode: str,
 ) -> list[dict] | None:
     """
-    Выполняет единичный запрос к Overpass API.
+    Выполняет единичный запрос к Overpass API с rate limiting.
 
-    Args:
-        url: URL зеркала Overpass
-        query: Overpass QL запрос
-        headers: HTTP-заголовки
-        mode: «geom» или «bb» (для логирования)
-
-    Returns:
-        Список elements или None при ошибке.
+    Rate limiting:
+    - Между любыми запросами — мин. OVERPASS_MIN_INTERVAL секунд
+    - При HTTP 429 — пауза Retry-After или OVERPASS_429_WAIT
+    - Использует общий httpx.AsyncClient (connection pooling)
     """
+    global _overpass_last_request_time
+
+    # Rate limiting: ждём, если предыдущий запрос был недавно
+    now = time.time()
+    elapsed = now - _overpass_last_request_time
+    if elapsed < OVERPASS_MIN_INTERVAL:
+        wait = OVERPASS_MIN_INTERVAL - elapsed
+        logger.debug(f"Overpass rate limit: ждём {wait:.1f}с...")
+        await asyncio.sleep(wait)
+
     try:
         logger.info(
             f"Overpass API ({url}): запрос (mode={mode})..."
         )
-        async with httpx.AsyncClient(
-            verify=False,
-            headers=headers,
-        ) as client:
-            resp = await client.post(
-                url, data={"data": query}, timeout=120,
+        _overpass_last_request_time = time.time()
+
+        client = _get_overpass_client()
+        resp = await client.post(url, data={"data": query}, timeout=60.0)
+
+        if resp.status_code == 429:
+            # Парсим Retry-After
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    wait_sec = float(retry_after)
+                except ValueError:
+                    wait_sec = OVERPASS_429_WAIT
+            else:
+                wait_sec = OVERPASS_429_WAIT
+            logger.warning(
+                f"Overpass API ({url}, mode={mode}): HTTP 429, "
+                f"ждём {wait_sec:.0f}с (Retry-After: {retry_after or 'нет'})"
             )
-            resp.raise_for_status()
-            data = resp.json()
+            await asyncio.sleep(wait_sec)
+            # Повторный запрос после ожидания
+            _overpass_last_request_time = time.time()
+            resp = await client.post(url, data={"data": query}, timeout=60.0)
+
+        resp.raise_for_status()
+        data = resp.json()
 
         elements = data.get("elements", [])
         logger.info(
@@ -1042,6 +983,79 @@ async def _overpass_request(
             f"Overpass API ({url}, mode={mode}): {e}"
         )
         return None
+
+
+async def _fetch_overpass_parallel(
+    bbox_str: str,
+    tile_idx: int = 0,
+    total_tiles: int = 1,
+) -> list[dict] | None:
+    """
+    Последовательный запрос к зеркалам Overpass API с rate limiting.
+
+    Стратегия:
+    1. Последовательно пробуем все зеркала — out geom (2 прохода)
+    2. Fallback: последовательно — out bb на всех зеркалах
+    3. Rate limiter обеспечивает мин. 10с между запросами
+    """
+    geom_query = (
+        "[out:json][timeout:90];\n"
+        "(\n"
+        f'  relation["place"~"{PLACE_FILTER}"]({bbox_str});\n'
+        f'  way["place"~"{PLACE_FILTER}"]({bbox_str});\n'
+        ");\n"
+        "out geom;\n"
+    )
+
+    bb_query = (
+        "[out:json][timeout:90];\n"
+        "(\n"
+        f'  relation["place"~"{PLACE_FILTER}"]({bbox_str});\n'
+        f'  way["place"~"{PLACE_FILTER}"]({bbox_str});\n'
+        ");\n"
+        "out bb;\n"
+    )
+
+    # --- Последовательно пробуем зеркала: сначала geom, потом bb ---
+    # Сначала geom на всех зеркалах
+    for attempt in range(1, 3):  # максимум 2 прохода по всем зеркалам
+        for url in OVERPASS_URLS:
+            elements = await _overpass_request(url, geom_query, "geom")
+            if elements is not None:
+                polygons, is_bbox = _parse_overpass_elements(elements)
+                if polygons and not is_bbox:
+                    logger.info(
+                        f"Тайл {tile_idx + 1}/{total_tiles}: "
+                        f"{len(polygons)} полигонов (out geom"
+                        f"{f', попытка {attempt}' if attempt > 1 else ''})"
+                    )
+                    _save_cache(bbox_str, elements)
+                    return elements
+
+        if attempt == 1:
+            logger.info(
+                f"Тайл {tile_idx + 1}/{total_tiles}: "
+                f"geom не удался, повторная попытка через 10 сек..."
+            )
+            await asyncio.sleep(10)
+
+    # --- Fallback: out bb на всех зеркалах ---
+    for url in OVERPASS_URLS:
+        elements = await _overpass_request(url, bb_query, "bb")
+        if elements is not None:
+            polygons, is_bbox = _parse_overpass_elements(elements)
+            if polygons:
+                logger.info(
+                    f"Тайл {tile_idx + 1}/{total_tiles}: "
+                    f"{len(polygons)} bounding boxes (out bb)"
+                )
+                # НЕ сохраняем bb в кэш
+                return elements
+
+    logger.warning(
+        f"Тайл {tile_idx + 1}/{total_tiles}: все зеркала недоступны"
+    )
+    return None
 
 
 # ========================

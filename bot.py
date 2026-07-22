@@ -95,6 +95,7 @@ from concentration_points import (
     get_dynamics_column_names,
     get_dynamics_detail_column_names,
     enrich_clusters_with_cameras,
+    close_overpass_client as _close_overpass_client,
 )
 from point_statistics import (
     parse_coordinates,
@@ -3413,6 +3414,7 @@ async def _post_shutdown(app) -> None:
         return
     await close_client()
     await close_llm_client()
+    await _close_overpass_client()
     logger.info("Все HTTP-клиенты закрыты (post_shutdown)")
 
 
