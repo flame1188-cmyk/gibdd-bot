@@ -1826,12 +1826,11 @@ async def _run_analysis(
         f"LLM={'да' if (use_llm and llm_summary_text) else 'нет'}"
     )
 
-    # Освобождаем память: удаляем сырые карточки из сессии
-    # (сами очаги остаются в analytics_clusters для QA)
-    context.user_data.pop("analytics_cards", None)
-    context.user_data.pop("analytics_prev_cards", None)
-    context.user_data.pop("analytics_comparison", None)
-    gc.collect()
+    # НЕ удаляем analytics_cards/comparison здесь — они нужны для:
+    # - кнопки «В меню» (_build_menu_keyboard проверяет analytics_cards)
+    # - QA-вопросов (_handle_analytics_question использует cards и comparison)
+    # - повторного запуска очагов/HTML-карты из меню
+    # Полная очистка происходит в _clear_analytics_data() при «Завершить»/«Сменить данные»/cancel.
 
 
 def _clear_analytics_data(user_data: dict) -> None:
