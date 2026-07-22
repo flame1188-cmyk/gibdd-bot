@@ -31,7 +31,9 @@ def _get_llm_client() -> httpx.AsyncClient:
     """Возвращает переиспользуемый httpx-клиент для ZhipuAI API."""
     global _llm_client
     if _llm_client is None or _llm_client.is_closed:
-        _llm_client = httpx.AsyncClient(timeout=180)
+        # 300с = 5 мин: GLM-4.7-Flash с большими промптами (30-40K симв.)
+        # может обрабатывать дольше стандартных 3 минут
+        _llm_client = httpx.AsyncClient(timeout=300)
         logger.info("Создан новый HTTP-клиент для LLM (ZhipuAI)")
     return _llm_client
 
@@ -443,11 +445,21 @@ async def ask_llm(
             if response.status_code == 429:
                 if attempt < max_retries:
                     # Пытаемся прочитать точное время ожидания из заголовка
-                    retry_after = response.headers.get("Retry-After") or response.headers.get("retry-after")
+                    retry_after = (
+                        response.headers.get("Retry-After")
+                        or response.headers.get("retry-after")
+                    )
+                    if not retry_after:
+                        # ZhipuAI может вернуть задержку в JSON-теле
+                        try:
+                            body = response.json()
+                            retry_after = str(body.get("retry_after") or body.get("wait") or "")
+                        except Exception:
+                            pass
                     if retry_after:
                         try:
-                            wait = int(retry_after) + 5  # +5 сек запас
-                        except ValueError:
+                            wait = int(float(retry_after)) + 5  # +5 сек запас
+                        except (ValueError, TypeError):
                             wait = retry_delays[attempt]
                     else:
                         wait = retry_delays[attempt]
@@ -495,8 +507,14 @@ async def ask_llm(
             raise
         except httpx.TimeoutException:
             if attempt < max_retries:
-                wait = 20
-                logger.warning(f"LLM таймаут. Попытка {attempt + 1}, ожидание {wait} сек...")
+                # После таймаута ZhipuAI может быть перегружен —
+                # увеличиваем паузу с каждой попыткой
+                wait = retry_delays[min(attempt, len(retry_delays) - 1)]
+                logger.warning(
+                    f"LLM таймаут (>{300//60} мин). "
+                    f"Попытка {attempt + 1}/{max_retries}, "
+                    f"ожидание {wait} сек..."
+                )
                 await asyncio.sleep(wait)
                 continue
             raise
