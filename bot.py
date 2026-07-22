@@ -1782,8 +1782,8 @@ async def _run_analysis(
     except Exception as e:
         logger.warning(f"Не удалось сгенерировать HTML-отчёт аналитики: {e}")
 
-    # Предлагаем задать вопросы (если есть LLM-ключ)
-    if LLM_API_KEY:
+    # Предлагаем задать вопросы (только если аналитика с ИИ)
+    if use_llm and LLM_API_KEY:
         context.user_data["qa_mode"] = True
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(
