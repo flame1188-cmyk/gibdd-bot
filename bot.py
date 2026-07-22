@@ -1836,6 +1836,7 @@ def _clear_analytics_data(user_data: dict) -> None:
         "analytics_news_context", "qa_mode",
         "point_stats_mode", "point_stats_lat", "point_stats_lon", "point_stats_radius",
         "cameras_data", "waiting_camera_file", "waiting_camera_for_map",
+        "_settlement_polygons", "_preload_task",
     ]:
         user_data.pop(key, None)
 
@@ -2224,6 +2225,10 @@ async def _run_concentration_points(
             f"{current_total_clusters} очагов из {len(current_cards)} ДТП"
             + (f", динамика: {prev_label}" if prev_cards else "")
         )
+
+        # Освобождаем память: удаляем камеры и сырые карточки из сессии
+        context.user_data.pop("cameras_data", None)
+        # Полигоны оставляем — они нужны для аналитики с ИИ
 
     except Exception as e:
         logger.exception(f"Ошибка расчёта очагов (динамика): {e}")

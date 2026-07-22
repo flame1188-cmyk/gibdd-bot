@@ -36,6 +36,7 @@ import math
 import json
 import os
 import time
+import gc
 import hashlib
 import logging
 from collections import Counter, OrderedDict
@@ -110,7 +111,7 @@ CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
 CACHE_TTL_SECONDS = 24 * 60 * 60  # 24 часа
 
 # In-memory LRU-кэш распарсенных полигонов (избегает повторного парсинга JSON)
-MEMORY_CACHE_MAX = 5  # максимум записей
+MEMORY_CACHE_MAX = 2  # максимум записей
 _memory_cache: OrderedDict[str, tuple[float, list]] = OrderedDict()  # bbox → (timestamp, polygons)
 
 # Параметры bbox
@@ -847,6 +848,9 @@ async def fetch_settlement_boundaries(
         f"Итого границ НП: {len(polygons)} полигонов "
         f"(элементов: {len(all_elements)}, тайлов: {len(tiles)})"
     )
+    # Освобождаем память: удаляем сырые элементы и запускаем GC
+    del all_elements
+    gc.collect()
     return polygons
 
 
