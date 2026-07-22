@@ -1645,8 +1645,11 @@ async def _run_analysis(
                 await status_msg.edit_text(
                     f"{mode_label}: рассчитываю очаги ДТП..."
                 )
+                # Используем полигоны из кэша (если есть от «Очаги ДТП»)
+                existing_polygons = context.user_data.get("_settlement_polygons")
                 clusters, _preclusters = await calculate_concentration_points(
                     current_cards,
+                    settlement_polygons=existing_polygons,
                 )
                 if clusters:
                     clusters_ctx = format_clusters_for_prompt(clusters, max_clusters=10)
@@ -1987,11 +1990,15 @@ async def _run_concentration_points(
             # Fallback — передаём как есть
             await progress_callback(f"\u23F3 {text}")
 
-        clusters = await calculate_concentration_dynamics(
+        clusters, saved_polygons = await calculate_concentration_dynamics(
             current_cards,
             prev_cards,
             progress_callback=staged_progress,
         )
+
+        # Сохраняем полигоны для переиспользования в аналитике с ИИ
+        if saved_polygons:
+            context.user_data["_settlement_polygons"] = saved_polygons
 
         if not clusters:
             await status_msg.edit_text(

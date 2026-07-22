@@ -2713,12 +2713,14 @@ async def calculate_concentration_dynamics(
     current_cards: list[dict],
     prev_cards: list[dict],
     progress_callback: Callable[[str], Awaitable[None]] | None = None,
-) -> list[dict]:
+    settlement_polygons: list[Polygon | MultiPolygon] | None = None,
+) -> tuple[list[dict], list[Polygon | MultiPolygon] | None]:
     """
     Рассчитывает очаги для двух периодов и определяет динамику каждого.
 
     Границы НП загружаются из OSM **один раз** по объединённому bbox
     обоих периодов — это сокращает нагрузку на Overpass API в 2 раза.
+    Если передан settlement_polygons — используется без запроса к OSM.
 
     Каждому очагу добавляется ключ ``dynamics``:
     {
@@ -2736,9 +2738,10 @@ async def calculate_concentration_dynamics(
         current_cards: Карточки ДТП текущего периода
         prev_cards: Карточки ДТП прошлого периода (те же месяцы)
         progress_callback: async-функция для обновления статуса
+        settlement_polygons: Если переданы — используются вместо запроса к OSM.
 
     Returns:
-        Список очагов с полем ``dynamics``
+        (очаги_с_dynamics, settlement_polygons) — полигоны для переиспользования.
     """
     # --- Готовим карточки с координатами из обоих периодов ---
     current_filtered = [
@@ -2752,31 +2755,37 @@ async def calculate_concentration_dynamics(
 
     if not current_filtered:
         logger.warning("Нет карточек текущего периода с координатами")
-        return []
+        return [], None
 
     # --- Загружаем границы НП ОДИН РАЗ по объединённому bbox ---
-    combined_cards = current_filtered + prev_filtered
-    if prev_filtered:
-        if progress_callback:
-            await progress_callback(
-                f"Загрузка границ НП из OpenStreetMap...\n"
-                f"(Один запрос для обоих периодов)\n"
-                f"ДТП текущего: {len(current_filtered)}, "
-                f"прошлого: {len(prev_filtered)}"
+    if settlement_polygons is None:
+        combined_cards = current_filtered + prev_filtered
+        if prev_filtered:
+            if progress_callback:
+                await progress_callback(
+                    f"Загрузка границ НП из OpenStreetMap...\n"
+                    f"(Один запрос для обоих периодов)\n"
+                    f"ДТП текущего: {len(current_filtered)}, "
+                    f"прошлого: {len(prev_filtered)}"
+                )
+            settlement_polygons = await fetch_settlement_boundaries(
+                combined_cards, progress_callback,
             )
-        settlement_polygons = await fetch_settlement_boundaries(
-            combined_cards, progress_callback,
-        )
-    else:
-        settlement_polygons = await fetch_settlement_boundaries(
-            current_filtered, progress_callback,
-        )
+        else:
+            settlement_polygons = await fetch_settlement_boundaries(
+                current_filtered, progress_callback,
+            )
 
-    if settlement_polygons:
+        if settlement_polygons:
+            logger.info(
+                f"Динамика: границы НП загружены один раз: "
+                f"{len(settlement_polygons)} полигонов "
+                f"(OSM-запрос пропущен для прошлого периода)"
+            )
+    else:
         logger.info(
-            f"Динамика: границы НП загружены один раз: "
-            f"{len(settlement_polygons)} полигонов "
-            f"(OSM-запрос пропущен для прошлого периода)"
+            f"Динамика: границы НП переданы извне: "
+            f"{len(settlement_polygons)} полигонов (OSM-запрос пропущен)"
         )
 
     # --- Очаги текущего периода ---
@@ -2805,7 +2814,7 @@ async def calculate_concentration_dynamics(
         # Сохраняем предочаги в поле текущих очагов для передачи наверх
         if current_clusters:
             current_clusters[0]["_preclusters"] = current_preclusters
-        return current_clusters
+        return current_clusters, settlement_polygons
 
     # --- Очаги прошлого периода (те же полигоны!) ---
     if progress_callback:
@@ -2834,7 +2843,7 @@ async def calculate_concentration_dynamics(
         )
         if current_clusters:
             current_clusters[0]["_preclusters"] = current_preclusters
-        return current_clusters
+        return current_clusters, settlement_polygons
 
     # --- Сопоставление ---
     if progress_callback:
@@ -2912,7 +2921,7 @@ async def calculate_concentration_dynamics(
     if current_clusters:
         current_clusters[0]["_preclusters"] = current_preclusters
 
-    return current_clusters
+    return current_clusters, settlement_polygons
 
 
 # ========================
