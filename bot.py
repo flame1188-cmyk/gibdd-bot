@@ -768,6 +768,22 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                         reg_name = r["name"]
                         break
 
+                # Очищаем данные предыдущего региона/аналитики,
+                # чтобы не накопить тысячи карточек и OSM-полигонов в RAM.
+                _old_reg = context.user_data.get("reg_code")
+                _clear_analytics_data(context.user_data)
+                if _old_reg and _old_reg != reg_code:
+                    # Инвалидируем записи старого региона из data_cache
+                    for _y in [datetime.now().year, datetime.now().year - 1]:
+                        data_cache.invalidate(
+                            _old_reg, [f"{m}.{_y}" for m in range(1, 13)]
+                        )
+                    gc.collect()
+                    logger.info(
+                        f"Смена региона: {_old_reg} -> {reg_code}, "
+                        f"старые данные очищены"
+                    )
+
                 context.user_data["reg_code"] = reg_code
                 context.user_data["reg_name"] = reg_name
 
@@ -1922,11 +1938,24 @@ async def _run_analysis(
 
             # Рассчитываем очаги ДТП для передачи в LLM
             clusters_ctx = ""
+            existing_clusters = context.user_data.get("analytics_clusters")
             if is_large:
                 # Для крупных регионов пропускаем расчёт очагов —
                 # это требует удержания всех карточек в памяти.
                 logger.info("LLM-анализ: расчёт очагов пропущен (крупный регион)")
                 context.user_data["analytics_clusters"] = []
+            elif existing_clusters:
+                # Очаги уже рассчитаны (кнопка «Очаги ДТП»),
+                # используем готовый результат без пересчёта —
+                # пересчёт требует OSM-полигонов и всех карточек в памяти,
+                # что может вызвать OOM (5992+6155 ДТП + 1443 полигона).
+                clusters_ctx = format_clusters_for_prompt(
+                    existing_clusters, max_clusters=10
+                )
+                logger.info(
+                    f"LLM-анализ: очаги взяты из кэша "
+                    f"({len(existing_clusters)} очагов, {len(clusters_ctx)} симв.)"
+                )
             else:
                 try:
                     await status_msg.edit_text(
@@ -2544,8 +2573,32 @@ async def _run_concentration_points(
 
         # Освобождаем память: удаляем камеры и сырые карточки из сессии
         context.user_data.pop("cameras_data", None)
-        # Полигоны оставляем — они нужны для аналитики с ИИ
-        gc.collect()
+
+        # Для средних/крупных регионов (>4500 ДТП) освобождаем OSM-полигоны
+        # и карточки прошлого года — они больше не нужны, а очаги уже сохранены.
+        # LLM-аналитика использует готовые analytics_clusters из кэша.
+        _card_count = context.user_data.get("_large_region_count") or \
+            len(context.user_data.get("analytics_cards", []))
+        if _card_count > 4500:
+            context.user_data.pop("_settlement_polygons", None)
+            context.user_data.pop("analytics_prev_cards", None)
+            # Инвалидируем прошлый год из data_cache (очаги уже посчитаны)
+            _prev_reg = context.user_data.get("analytics_reg_code")
+            _prev_period = context.user_data.get("analytics_period")
+            if _prev_reg and _prev_period:
+                data_cache.invalidate(
+                    _prev_reg,
+                    [f"{m}.{_prev_period.year - 1}" for m in _prev_period.months],
+                )
+            gc.collect()
+            logger.info(
+                f"Очаги: освобождены полигоны и prev_cards "
+                f"({_card_count} ДТП > 4500)"
+            )
+        else:
+            # Полигоны оставляем для небольших регионов —
+            # они нужны для аналитики с ИИ (пересчёт очагов)
+            gc.collect()
 
     except Exception as e:
         logger.exception(f"Ошибка расчёта очагов (динамика): {e}")
