@@ -77,8 +77,8 @@ def _auto_width(ws, col_count: int, max_width: int = 40) -> None:
         ws.column_dimensions[column_letter].width = max(adjusted_width, 8)
 
 
-# Порог для переключения на write_only режим (экономия памяти)
-_WRITE_ONLY_THRESHOLD = 1500
+# Импорт вынесен наверх для единого использования
+from openpyxl.utils import get_column_letter
 
 
 def _create_workbook(
@@ -86,72 +86,18 @@ def _create_workbook(
     data_rows: list[dict[str, str]],
 ) -> Workbook:
     """
-    Создаёт объект Workbook с заголовками и данными.
-    Для больших файлов (>1500 строк) использует write_only режим
-    для экономии памяти (не держит все ячейки в RAM).
+    Создаёт Workbook в write_only режиме — ячейки не хранятся в памяти,
+    а пишутся потоково в буфер. Единообразный стиль для всех файлов.
 
     Args:
         column_names: Список названий колонок (порядок важен)
         data_rows: Список словарей {название_колонки: значение}
     """
-    col_count = len(column_names)
-    row_count = len(data_rows)
-
-    if row_count > _WRITE_ONLY_THRESHOLD:
-        return _create_workbook_write_only(column_names, data_rows)
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Данные"
-
-    # Заголовки
-    for col_idx, col_name in enumerate(column_names, start=1):
-        ws.cell(row=1, column=col_idx, value=col_name)
-
-    # Данные
-    for row_idx, row_data in enumerate(data_rows, start=2):
-        for col_idx, col_name in enumerate(column_names, start=1):
-            value = row_data.get(col_name, "")
-            ws.cell(row=row_idx, column=col_idx, value=value)
-
-    # Стили заголовков
-    _apply_header_style(ws, col_count)
-
-    # Стили данных (только для небольших файлов)
-    _apply_data_styles(ws, row_count, col_count)
-
-    # Автоподбор ширины
-    _auto_width(ws, col_count)
-
-    # Заморозка заголовков (чтобы при прокрутке шапка оставалась видна)
-    ws.freeze_panes = "A2"
-
-    # Авторазмер листа по содержимому
-    if row_count > 0:
-        ws.auto_filter.ref = ws.dimensions
-
-    return wb
-
-
-def _create_workbook_write_only(
-    column_names: list[str],
-    data_rows: list[dict[str, str]],
-) -> Workbook:
-    """
-    Создаёт Workbook в write_only режиме — ячейки не хранятся в памяти,
-    а пишутся потоково в буфер. Экономит ~100-200 МБ для больших файлов.
-
-    Ограничения write_only: нет стилей ячеек, нет freeze_panes,
-    нет auto_filter. Заголовки стилизуются через ColumnDimension.
-    """
     wb = Workbook(write_only=True)
     ws = wb.create_sheet(title="Данные")
 
-    # Заголовки (write_only поддерживает стили строк)
-    header_row = [
-        col_name for col_name in column_names
-    ]
-    ws.append(header_row)
+    # Заголовки
+    ws.append(list(column_names))
 
     # Данные — построчная запись, без хранения в памяти
     for row_data in data_rows:
@@ -160,11 +106,8 @@ def _create_workbook_write_only(
 
     # Автоподбор ширины колонок (по заголовку + первые 50 строк)
     check_rows = min(len(data_rows), 50)
-    col_letters = []
     for col_idx, col_name in enumerate(column_names, start=1):
-        from openpyxl.utils import get_column_letter
         col_letter = get_column_letter(col_idx)
-        col_letters.append(col_letter)
         max_len = len(col_name)
         for r in range(check_rows):
             val = data_rows[r].get(col_name, "")
