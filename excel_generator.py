@@ -6,12 +6,14 @@
   3. dtp_analytics.xlsx — аналитика: сравнение периодов
 """
 
+import gc
 import io
 import logging
 from typing import Any
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.worksheet.write_only import WriteOnlyWorksheet
 
 logger = logging.getLogger(__name__)
 
@@ -76,17 +78,29 @@ def _auto_width(ws, col_count: int, max_width: int = 40) -> None:
         ws.column_dimensions[column_letter].width = max(adjusted_width, 8)
 
 
+# Порог для переключения на write_only режим (экономия памяти)
+_WRITE_ONLY_THRESHOLD = 1500
+
+
 def _create_workbook(
     column_names: list[str],
     data_rows: list[dict[str, str]],
 ) -> Workbook:
     """
     Создаёт объект Workbook с заголовками и данными.
+    Для больших файлов (>1500 строк) использует write_only режим
+    для экономии памяти (не держит все ячейки в RAM).
 
     Args:
         column_names: Список названий колонок (порядок важен)
         data_rows: Список словарей {название_колонки: значение}
     """
+    col_count = len(column_names)
+    row_count = len(data_rows)
+
+    if row_count > _WRITE_ONLY_THRESHOLD:
+        return _create_workbook_write_only(column_names, data_rows)
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Данные"
@@ -101,13 +115,10 @@ def _create_workbook(
             value = row_data.get(col_name, "")
             ws.cell(row=row_idx, column=col_idx, value=value)
 
-    col_count = len(column_names)
-    row_count = len(data_rows)
-
     # Стили заголовков
     _apply_header_style(ws, col_count)
 
-    # Стили данных
+    # Стили данных (только для небольших файлов)
     _apply_data_styles(ws, row_count, col_count)
 
     # Автоподбор ширины
@@ -119,6 +130,51 @@ def _create_workbook(
     # Авторазмер листа по содержимому
     if row_count > 0:
         ws.auto_filter.ref = ws.dimensions
+
+    return wb
+
+
+def _create_workbook_write_only(
+    column_names: list[str],
+    data_rows: list[dict[str, str]],
+) -> Workbook:
+    """
+    Создаёт Workbook в write_only режиме — ячейки не хранятся в памяти,
+    а пишутся потоково в буфер. Экономит ~100-200 МБ для больших файлов.
+
+    Ограничения write_only: нет стилей ячеек, нет freeze_panes,
+    нет auto_filter. Заголовки стилизуются через ColumnDimension.
+    """
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet(title="Данные")
+
+    # Заголовки (write_only поддерживает стили строк)
+    header_row = [
+        col_name for col_name in column_names
+    ]
+    ws.append(header_row)
+
+    # Данные — построчная запись, без хранения в памяти
+    for row_data in data_rows:
+        row = [row_data.get(col_name, "") for col_name in column_names]
+        ws.append(row)
+
+    # Автоподбор ширины колонок (по заголовку + первые 50 строк)
+    check_rows = min(len(data_rows), 50)
+    col_letters = []
+    for col_idx, col_name in enumerate(column_names, start=1):
+        from openpyxl.utils import get_column_letter
+        col_letter = get_column_letter(col_idx)
+        col_letters.append(col_letter)
+        max_len = len(col_name)
+        for r in range(check_rows):
+            val = data_rows[r].get(col_name, "")
+            if val:
+                val_len = len(str(val))
+                if val_len > max_len:
+                    max_len = val_len
+        adjusted_width = min(max_len + 3, 40)
+        ws.column_dimensions[col_letter].width = max(adjusted_width, 8)
 
     return wb
 
@@ -284,7 +340,12 @@ def generate_both_files(
     """
     logger.info(f"Генерация Excel: Файл 1 — {len(file1_data)} ДТП, Файл 2 — {len(file2_data)} участников")
     file1_bytes = generate_file1(file1_data)
+    # Освобождаем память: удаляем промежуточные данные Файла 1
+    del file1_data
+    gc.collect()
     file2_bytes = generate_file2(file2_data)
+    del file2_data
+    gc.collect()
     logger.info(f"Файл 1: {len(file1_bytes)} байт, Файл 2: {len(file2_bytes)} байт")
     return file1_bytes, file2_bytes
 

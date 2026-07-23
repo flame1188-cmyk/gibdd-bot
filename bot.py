@@ -1225,7 +1225,12 @@ async def _start_fetching(
 
         file1_data = build_file1_data(all_cards)
         file2_data = build_file2_data(all_cards)
+        participants_count = len(file2_data)
         file1_bytes, file2_bytes = generate_both_files(file1_data, file2_data)
+        # generate_both_files уже удалила свои ссылки и сделала gc.collect(),
+        # но в этой области видимости переменные ещё живы — освобождаем
+        del file1_data, file2_data
+        gc.collect()
 
         # Отправляем файлы
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1263,7 +1268,7 @@ async def _start_fetching(
             caption=(
                 f"Участники ДТП\n"
                 f"{reg_name} | {period.label}\n"
-                f"Участников: {len(file2_data)}"
+                f"Участников: {participants_count}"
             ),
         ), "send_document (участники ДТП)")
 
@@ -1273,7 +1278,11 @@ async def _start_fetching(
         except Exception:
             pass
 
-        logger.info(f"Файлы отправлены: {len(all_cards)} ДТП, {len(file2_data)} участников")
+        logger.info(f"Файлы отправлены: {len(all_cards)} ДТП, {participants_count} участников")
+
+        # Освобождаем байты файлов (уже отправлены)
+        del file1_bytes, file2_bytes
+        gc.collect()
 
         # Предлагаем провести анализ
         await _offer_analysis(context, chat_id, reg_name, reg_code, period, all_cards)
