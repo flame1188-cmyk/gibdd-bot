@@ -13,7 +13,6 @@ from typing import Any
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-from openpyxl.worksheet.write_only import WriteOnlyWorksheet
 
 logger = logging.getLogger(__name__)
 
