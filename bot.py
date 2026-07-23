@@ -1287,6 +1287,12 @@ async def _start_fetching(
         # Предлагаем провести анализ
         await _offer_analysis(context, chat_id, reg_name, reg_code, period, all_cards)
 
+        # Для крупных регионов: all_cards не сохранён в user_data (только в data_cache),
+        # поэтому удаляем локальную ссылку чтобы освободить память
+        if len(all_cards) > 3000:
+            del all_cards
+            gc.collect()
+
     except Exception as e:
         logger.exception(f"Ошибка генерации/отправки файлов: {e}")
         user_msg = _sanitize_error(e)
@@ -1307,6 +1313,56 @@ async def _start_fetching(
             context.user_data.pop(key, None)
 
 
+def _get_current_cards(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> list[dict] | None:
+    """
+    Получает карточки ДТП текущего периода.
+    Для обычных регионов — из user_data (analytics_cards).
+    Для крупных регионов (>3000 ДТП) — из data_cache.
+    Возвращает None если данные не найдены.
+    """
+    cards = context.user_data.get("analytics_cards", [])
+    if cards:
+        return cards
+
+    reg_code = context.user_data.get("analytics_reg_code", "")
+    period = context.user_data.get("analytics_period")
+    if not reg_code or not period:
+        return None
+
+    dat_list = [f"{m}.{period.year}" for m in period.months]
+    cached = data_cache.get(reg_code, dat_list)
+    if cached:
+        return cached[0]
+    return None
+
+
+def _get_prev_cards(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> list[dict] | None:
+    """
+    Получает карточки ДТП за прошлый период.
+    Сначала проверяет user_data, потом data_cache.
+    Возвращает None если данные не найдены.
+    """
+    prev_cards = context.user_data.get("analytics_prev_cards", [])
+    if prev_cards:
+        return prev_cards
+
+    reg_code = context.user_data.get("analytics_reg_code", "")
+    period = context.user_data.get("analytics_period")
+    if not reg_code or not period:
+        return None
+
+    prev_year = period.year - 1
+    dat_list_prev = [f"{m}.{prev_year}" for m in period.months]
+    cached = data_cache.get(reg_code, dat_list_prev)
+    if cached:
+        return cached[0]
+    return None
+
+
 def _build_menu_keyboard(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> tuple[str, "InlineKeyboardMarkup"] | tuple[None, None]:
@@ -1317,7 +1373,7 @@ def _build_menu_keyboard(
     """
     reg_name = context.user_data.get("analytics_reg_name", "")
     period = context.user_data.get("analytics_period")
-    current_cards = context.user_data.get("analytics_cards", [])
+    current_cards = _get_current_cards(context)
 
     if not period or not current_cards:
         return None, None
@@ -1445,15 +1501,39 @@ async def _offer_analysis(
     Также запускает фоновую preload-задачу для данных за прошлый год.
     """
     # Сохраняем данные для аналитики в user_data
+    # Для крупных регионов (>3000 ДТП) НЕ храним карточки в user_data —
+    # они доступны в data_cache. Это экономит ~30-60 МБ на хостинге 2 GB RAM.
     context.user_data["analytics_ready"] = True
     context.user_data["analytics_reg_code"] = reg_code
     context.user_data["analytics_reg_name"] = reg_name
     context.user_data["analytics_period"] = period
-    context.user_data["analytics_cards"] = current_cards
 
-    # --- Идея 2: фоновый preload данных за прошлый год ---
-    preload_task = asyncio.create_task(_preload_prev_year(reg_code, period))
-    context.user_data["_preload_task"] = preload_task
+    _LARGE_REGION_THRESHOLD = 3000
+    if len(current_cards) > _LARGE_REGION_THRESHOLD:
+        # Крупный регион: карточки в data_cache, в user_data храним только флаг
+        context.user_data.pop("analytics_cards", None)
+        context.user_data["_large_region"] = True
+        logger.info(
+            f"Крупный регион: {len(current_cards)} ДТП, карточки в data_cache"
+        )
+    else:
+        context.user_data["analytics_cards"] = current_cards
+        context.user_data.pop("_large_region", None)
+
+    # --- Фоновый preload данных за прошлый год ---
+    # Для крупных регионов (>3000 ДТП) НЕ запускаем preload —
+    # это дополнительно загружает столько же данных в память,
+    # что может вызвать OOM на хостинге с 2 GB RAM.
+    # Данные за прошлый год загрузятся по требованию при аналитике.
+    if len(current_cards) <= _LARGE_REGION_THRESHOLD:
+        preload_task = asyncio.create_task(_preload_prev_year(reg_code, period))
+        context.user_data["_preload_task"] = preload_task
+    else:
+        logger.info(
+            f"Пропуск preload: {len(current_cards)} ДТП (>{_LARGE_REGION_THRESHOLD}), "
+            f"данные за прошлый год загрузятся при аналитике"
+        )
+        context.user_data.pop("_preload_task", None)
 
     text, keyboard = _build_menu_keyboard(context)
     if text and keyboard:
@@ -1481,7 +1561,7 @@ async def _run_analysis(
     reg_code = context.user_data.get("analytics_reg_code", "")
     reg_name = context.user_data.get("analytics_reg_name", "")
     period = context.user_data.get("analytics_period")
-    current_cards = context.user_data.get("analytics_cards", [])
+    current_cards = _get_current_cards(context)
 
     if not reg_code or not period or not current_cards:
         await update.callback_query.edit_message_text(
@@ -1870,7 +1950,7 @@ async def _run_concentration_points(
     reg_name = context.user_data.get("analytics_reg_name", "")
     reg_code = context.user_data.get("analytics_reg_code", "")
     period = context.user_data.get("analytics_period")
-    current_cards = context.user_data.get("analytics_cards", [])
+    current_cards = _get_current_cards(context) or []
 
     if not period or not current_cards:
         await update.callback_query.edit_message_text(
@@ -2268,7 +2348,7 @@ async def _html_map_menu(
     """Показывает подменю для HTML-карты ДТП."""
     query = update.callback_query
 
-    cards = context.user_data.get("analytics_cards", [])
+    cards = _get_current_cards(context) or []
     if not cards:
         await query.edit_message_text(
             "Данные не найдены. Выполните выгрузку заново."
@@ -2301,7 +2381,7 @@ async def _generate_and_send_dtp_map(
     chat_id = update.effective_chat.id
     reg_name = context.user_data.get("analytics_reg_name", "")
     period = context.user_data.get("analytics_period")
-    cards = context.user_data.get("analytics_cards", [])
+    cards = _get_current_cards(context) or []
 
     if not cards or not period:
         msg = await (update.callback_query.edit_message_text
@@ -2522,7 +2602,7 @@ async def _start_point_stats(
     reg_code = context.user_data.get("analytics_reg_code", "")
     reg_name = context.user_data.get("analytics_reg_name", "")
     period = context.user_data.get("analytics_period")
-    current_cards = context.user_data.get("analytics_cards", [])
+    current_cards = _get_current_cards(context) or []
 
     if not period or not current_cards:
         await update.callback_query.edit_message_text(
@@ -2630,7 +2710,7 @@ async def _send_point_stats_excel(
     # Подтверждение
     await update.callback_query.answer("Генерирую Excel-файл...")
 
-    current_cards = context.user_data.get("analytics_cards", [])
+    current_cards = _get_current_cards(context) or []
     prev_cards = context.user_data.get("analytics_prev_cards", [])
     period = context.user_data.get("analytics_period")
     current_label = period.label if period else "Текущий период"
@@ -2724,7 +2804,7 @@ async def _send_point_stats_html(
         return
 
     reg_name = context.user_data.get("analytics_reg_name", "")
-    current_cards = context.user_data.get("analytics_cards", [])
+    current_cards = _get_current_cards(context) or []
     prev_cards = context.user_data.get("analytics_prev_cards", [])
     period = context.user_data.get("analytics_period")
     current_label = period.label if period else "Текущий период"
@@ -2811,7 +2891,7 @@ async def _process_point_stats(
         edit_query: Если передан — редактирует сообщение с кнопками.
             Иначе отправляет новое сообщение.
     """
-    current_cards = context.user_data.get("analytics_cards", [])
+    current_cards = _get_current_cards(context) or []
     prev_cards = context.user_data.get("analytics_prev_cards", [])
     period = context.user_data.get("analytics_period")
     current_label = period.label if period else ""
@@ -2938,7 +3018,7 @@ async def _handle_analytics_question(
         # Формируем дополнение из сырых карточек (если есть)
         # Для вопросов берём меньше карточек — только статистику + 15 самых тяжёлых
         raw_sup = ""
-        current_cards = context.user_data.get("analytics_cards", [])
+        current_cards = _get_current_cards(context) or []
         prev_cards = context.user_data.get("analytics_prev_cards", [])
         if current_cards or prev_cards:
             raw_sup = extract_raw_supplement(current_cards, current_label, max_cards=15)
