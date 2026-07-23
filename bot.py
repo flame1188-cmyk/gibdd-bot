@@ -770,7 +770,8 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
                 # Очищаем данные предыдущего региона/аналитики,
                 # чтобы не накопить тысячи карточек и OSM-полигонов в RAM.
-                _old_reg = context.user_data.get("reg_code")
+                _old_reg = context.user_data.get("reg_code") or \
+                    context.user_data.get("_old_reg_for_cache")
                 _clear_analytics_data(context.user_data)
                 if _old_reg and _old_reg != reg_code:
                     # Инвалидируем записи старого региона из data_cache
@@ -1089,6 +1090,11 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
             # --- Сменить данные (очистка + /dtp) ---
             if data == "change_data":
+                # Сохраняем код старого региона ДО очистки user_data,
+                # чтобы при выборе нового региона инвалидировать его кэш.
+                _old_reg_for_cache = context.user_data.get("reg_code")
+                if _old_reg_for_cache:
+                    context.user_data["_old_reg_for_cache"] = _old_reg_for_cache
                 _clear_analytics_data(context.user_data)
                 regions = _get_regions(context)
                 keyboard = build_region_keyboard(regions, page=0)
@@ -2163,7 +2169,7 @@ def _clear_analytics_data(user_data: dict) -> None:
         "point_stats_mode", "point_stats_lat", "point_stats_lon", "point_stats_radius",
         "cameras_data", "waiting_camera_file", "waiting_camera_for_map",
         "_settlement_polygons", "_preload_task",
-        "_large_region", "_large_region_count",
+        "_large_region", "_large_region_count", "_old_reg_for_cache",
     ]:
         user_data.pop(key, None)
 
