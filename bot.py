@@ -2037,12 +2037,14 @@ async def _run_analysis(
         # (например <i>, <b>) не ломали Telegram HTML-парсер
         safe_llm = html_mod.escape(llm_summary_text)
         # Режим с ИИ: сначала LLM-резюме, потом таблица + Excel
+        # НЕ оборачиваем в <i> — _send_long_message разбивает текст по \n\n,
+        # что разорвёт тег <i>...</i> между частями и вызовет BadRequest.
         await _send_long_message(
             context.bot, chat_id,
             text=(
                 f"\U0001F916 <b>Аналитика ИИ: {reg_name}</b>\n"
                 f"{current_label} vs {prev_label}\n\n"
-                f"<i>{safe_llm}</i>"
+                f"{safe_llm}"
             ),
             parse_mode="HTML",
         )
