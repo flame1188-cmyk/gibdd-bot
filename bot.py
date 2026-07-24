@@ -2232,6 +2232,11 @@ async def _run_concentration_points(
         else:
             await progress_callback("\u23F3 [5/5] Генерация Excel-файла...")
 
+        # --- Предочаги: извлекаем и обогащаем камерами ---
+        preclusters = clusters[0].get("_preclusters", []) if clusters else []
+        if preclusters and cameras:
+            enrich_clusters_with_cameras(preclusters, cameras)
+
         # --- Генерируем Excel с 4 листами ---
         def _build_concentration_excel():
             # Лист 1: очаги запрашиваемого года (стандартный формат)
@@ -2248,15 +2253,11 @@ async def _run_concentration_points(
             )
             _detail_columns = get_dynamics_detail_column_names()
 
-            # Лист 4: предочаги
-            _preclusters = clusters[0].get("_preclusters", []) if clusters else []
+            # Лист 4: предочаги (используем уже обогащённые preclusters)
             _precluster_data = None
             _precluster_columns = None
-            if _preclusters:
-                # Обогащаем предочаги камерами
-                if cameras:
-                    enrich_clusters_with_cameras(_preclusters, cameras)
-                _precluster_data = build_precluster_excel_data(_preclusters)
+            if preclusters:
+                _precluster_data = build_precluster_excel_data(preclusters)
                 _precluster_columns = get_precluster_column_names()
 
             _conc_bytes = generate_concentration_dynamics_file(
