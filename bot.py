@@ -1300,14 +1300,16 @@ async def _start_fetching(
             f"Генерация Excel-файлов..."
         ), "edit_message_text (статус генерации)")
 
-        file1_data = build_file1_data(all_cards)
-        file2_data = build_file2_data(all_cards)
+        # Синхронные CPU-bound операции — выполняем в пуле потоков,
+        # чтобы не блокировать event loop бота (при 3000+ ДТП
+        # parse + generate может занимать 60-120 секунд)
+        file1_data, file2_data = await asyncio.to_thread(
+            lambda: (build_file1_data(all_cards), build_file2_data(all_cards))
+        )
         participants_count = len(file2_data)
-        file1_bytes, file2_bytes = generate_both_files(file1_data, file2_data)
-        # generate_both_files уже удалила свои ссылки и сделала gc.collect(),
-        # но в этой области видимости переменные ещё живы — освобождаем
-        del file1_data, file2_data
-        gc.collect()
+        file1_bytes, file2_bytes = await asyncio.to_thread(
+            generate_both_files, file1_data, file2_data
+        )
 
         # Отправляем файлы
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1888,7 +1890,9 @@ async def _run_analysis(
         previous_label=prev_label,
     )
     column_names = get_analytics_column_names(current_label, prev_label)
-    analytics_bytes = generate_analytics_file(analytics_data, column_names)
+    analytics_bytes = await asyncio.to_thread(
+        generate_analytics_file, analytics_data, column_names
+    )
 
     # Удаляем сообщение о статусе (если не было ошибки LLM)
     if use_llm and not llm_summary_text:
@@ -2236,37 +2240,41 @@ async def _run_concentration_points(
             await progress_callback("\u23F3 [5/5] Генерация Excel-файла...")
 
         # --- Генерируем Excel с 4 листами ---
-        # Лист 1: очаги запрашиваемого года (стандартный формат)
-        current_data = build_concentration_excel_data(current_only_clusters)
-        current_columns = get_concentration_column_names()
+        def _build_concentration_excel():
+            # Лист 1: очаги запрашиваемого года (стандартный формат)
+            _current_data = build_concentration_excel_data(current_only_clusters)
+            _current_columns = get_concentration_column_names()
 
-        # Лист 2: динамика очагов (текущие + исчезнувшие)
-        dyn_data = build_dynamics_excel_data(clusters)
-        dyn_columns = get_dynamics_column_names()
+            # Лист 2: динамика очагов (текущие + исчезнувшие)
+            _dyn_data = build_dynamics_excel_data(clusters)
+            _dyn_columns = get_dynamics_column_names()
 
-        # Лист 3: детализация ДТП
-        detail_data = build_dynamics_detail_data(
-            clusters, current_label, prev_label,
-        )
-        detail_columns = get_dynamics_detail_column_names()
+            # Лист 3: детализация ДТП
+            _detail_data = build_dynamics_detail_data(
+                clusters, current_label, prev_label,
+            )
+            _detail_columns = get_dynamics_detail_column_names()
 
-        # Лист 4: предочаги
-        preclusters = clusters[0].get("_preclusters", []) if clusters else []
-        precluster_data = None
-        precluster_columns = None
-        if preclusters:
-            # Обогащаем предочаги камерами
-            if cameras:
-                enrich_clusters_with_cameras(preclusters, cameras)
-            precluster_data = build_precluster_excel_data(preclusters)
-            precluster_columns = get_precluster_column_names()
+            # Лист 4: предочаги
+            _preclusters = clusters[0].get("_preclusters", []) if clusters else []
+            _precluster_data = None
+            _precluster_columns = None
+            if _preclusters:
+                # Обогащаем предочаги камерами
+                if cameras:
+                    enrich_clusters_with_cameras(_preclusters, cameras)
+                _precluster_data = build_precluster_excel_data(_preclusters)
+                _precluster_columns = get_precluster_column_names()
 
-        conc_bytes = generate_concentration_dynamics_file(
-            current_data, current_columns,
-            dyn_data, dyn_columns,
-            detail_data, detail_columns,
-            precluster_data, precluster_columns,
-        )
+            _conc_bytes = generate_concentration_dynamics_file(
+                _current_data, _current_columns,
+                _dyn_data, _dyn_columns,
+                _detail_data, _detail_columns,
+                _precluster_data, _precluster_columns,
+            )
+            return _conc_bytes
+
+        conc_bytes = await asyncio.to_thread(_build_concentration_excel)
 
         # Удаляем статус
         try:
@@ -2845,7 +2853,8 @@ async def _send_point_stats_excel(
     column_names = get_point_stats_column_names()
 
     # Генерируем файл
-    excel_bytes = generate_point_stats_file(
+    excel_bytes = await asyncio.to_thread(
+        generate_point_stats_file,
         current_rows=current_rows,
         prev_rows=prev_rows if prev_rows else None,
         column_names=column_names,
