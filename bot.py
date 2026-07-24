@@ -18,7 +18,8 @@ import logging
 import os
 import sys
 import time
-import tracemalloc
+# tracemalloc удалён: с 2 ГБ RAM и выясненной причиной OOM (лимит хостинга)
+# диагностика аллокаций больше не нужна
 from datetime import datetime
 from typing import Any
 
@@ -169,16 +170,8 @@ def _log_memory(label: str) -> int:
         rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # KB → MB
     except Exception:
         rss_mb = -1
-    # tracemalloc: текущий размер аллокаций Python
-    try:
-        current, peak = tracemalloc.get_traced_memory()
-        alloc_mb = current / 1024 / 1024
-        logger.info(
-            f"[MEM] {label}: RSS={rss_mb:.1f} MB, "
-            f"Python alloc={alloc_mb:.1f} MB, peak={peak/1024/1024:.1f} MB"
-        )
-    except Exception:
-        logger.info(f"[MEM] {label}: RSS={rss_mb:.1f} MB")
+    # tracemalloc удалён — замедлял генерацию Excel в 177-400x
+    logger.info(f"[MEM] {label}: RSS={rss_mb:.1f} MB")
     return int(rss_mb) if rss_mb >= 0 else 0
 
 
@@ -3674,8 +3667,8 @@ def _build_app(token: str) -> "Application":
 
 
 def main() -> None:
-    # Запускаем отслеживание аллокаций памяти для диагностики OOM
-    tracemalloc.start(25)  # храним 25 самых больших трассировок
+    # tracemalloc.start(25) удалён — замедлял openpyxl в 177-400x
+    # (трассировка 25 фреймов стека на каждую аллокацию Python)
     logger.info("=== GIBDD Telegram Bot запускается ===")
 
     errors = validate_config()
