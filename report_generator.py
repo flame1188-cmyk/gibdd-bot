@@ -32,9 +32,10 @@ _LIB_URLS = {
     "leaflet.css": "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css",
     "leaflet.js": "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js",
     "leaflet.markercluster.css": "https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css",
+    "leaflet.markercluster.default.css": "https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css",
     "leaflet.markercluster.js": "https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js",
-    "leaflet.measure.css": "https://cdnjs.cloudflare.com/ajax/libs/leaflet-measure/3.1.0/leaflet.measure.css",
-    "leaflet.measure.js": "https://cdnjs.cloudflare.com/ajax/libs/leaflet-measure/3.1.0/leaflet.measure.js",
+    "leaflet.measure.css": "https://unpkg.com/leaflet-measure@3.1.0/leaflet.measure.css",
+    "leaflet.measure.js": "https://unpkg.com/leaflet-measure@3.1.0/leaflet.measure.js",
     "echarts.min.js": "https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js",
 }
 
@@ -347,6 +348,9 @@ class ReportGenerator:
             mc_css = libs.get("leaflet.markercluster.css", "")
             if mc_css:
                 head_parts.append(f"<style>{mc_css}</style>")
+            mc_def_css = libs.get("leaflet.markercluster.default.css", "")
+            if mc_def_css:
+                head_parts.append(f"<style>{mc_def_css}</style>")
             mc_js = libs.get("leaflet.markercluster.js", "")
             if mc_js:
                 head_parts.append(f"<script>{mc_js}</script>")
@@ -1103,13 +1107,13 @@ L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
 }}).addTo(map);
 
 // --- Линейка ---
-L.control.measure({{
-    position: 'topleft',
-    primaryLengthUnit: 'meters',
-    secondaryLengthUnit: 'kilometers',
-    localization: {{
-    }}
-}}).addTo(map);
+try {{
+    L.control.measure({{
+        position: 'topleft',
+        primaryLengthUnit: 'meters',
+        secondaryLengthUnit: 'kilometers'
+    }}).addTo(map);
+}} catch(e) {{ console.warn('Линейка недоступна:', e); }}
 
 // --- Данные ---
 var dtpData = {dtp_geojson};
@@ -1795,13 +1799,13 @@ L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
 }}).addTo(map);
 
 // --- Линейка ---
-L.control.measure({{
-    position: 'topleft',
-    primaryLengthUnit: 'meters',
-    secondaryLengthUnit: 'kilometers',
-    localization: {{
-    }}
-}}).addTo(map);
+try {{
+    L.control.measure({{
+        position: 'topleft',
+        primaryLengthUnit: 'meters',
+        secondaryLengthUnit: 'kilometers'
+    }}).addTo(map);
+}} catch(e) {{ console.warn('Линейка недоступна:', e); }}
 
 // --- Алгоритм Грэхема (convex hull) ---
 function convexHull(pts) {{
@@ -2187,13 +2191,13 @@ L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
 }}).addTo(map);
 
 // --- Линейка ---
-L.control.measure({{
-    position: 'topleft',
-    primaryLengthUnit: 'meters',
-    secondaryLengthUnit: 'kilometers',
-    localization: {{
-    }}
-}}).addTo(map);
+try {{
+    L.control.measure({{
+        position: 'topleft',
+        primaryLengthUnit: 'meters',
+        secondaryLengthUnit: 'kilometers'
+    }}).addTo(map);
+}} catch(e) {{ console.warn('Линейка недоступна:', e); }}
 
 // --- Точка пользователя ---
 var userMarker = L.circleMarker([{lat}, {lon}], {{
