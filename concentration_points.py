@@ -2688,7 +2688,7 @@ async def calculate_concentration_points(
     cards: list[dict],
     progress_callback: Callable[[str], Awaitable[None]] | None = None,
     settlement_polygons: list[Polygon | MultiPolygon] | None = None,
-) -> list[dict]:
+) -> tuple[list[dict], list[dict], list[Polygon | MultiPolygon] | None]:
     """
     Главная функция: расчёт всех очагов концентрации ДТП.
 
@@ -2700,10 +2700,10 @@ async def calculate_concentration_points(
             (например, при сравнении с прошлым годом).
 
     Returns:
-        Список словарей очагов
+        (очаги, предочаги, settlement_polygons) — полигоны для переиспользования.
     """
     if not cards:
-        return []
+        return [], [], None
 
     # Шаг 1: Фильтр — только карточки с координатами
     #   и исключаем ДТП вне дороги (внутридворовые, автостоянки)
@@ -2718,7 +2718,7 @@ async def calculate_concentration_points(
 
     if not cards_with_coords:
         logger.warning("Нет карточек с координатами — расчёт невозможен")
-        return []
+        return [], [], None
 
     # Шаг 2: Границы НП
     # Если полигоны переданы снаружи — используем их (OSM не запрашиваем)
@@ -2809,7 +2809,7 @@ async def calculate_concentration_points(
         f"вне НП: {len(non_settlement_preclusters)})"
     )
 
-    return all_clusters, all_preclusters
+    return all_clusters, all_preclusters, settlement_polygons
 
 
 # ========================
@@ -2965,7 +2965,7 @@ async def calculate_concentration_dynamics(
     # --- Очаги текущего периода ---
     if progress_callback:
         await progress_callback("Расчёт очагов текущего периода...")
-    current_clusters, current_preclusters = await calculate_concentration_points(
+    current_clusters, current_preclusters, _polys = await calculate_concentration_points(
         current_cards,
         progress_callback,
         settlement_polygons=settlement_polygons,
@@ -2995,7 +2995,7 @@ async def calculate_concentration_dynamics(
         await progress_callback(
             f"Расчёт очагов за прошлый год ({len(prev_cards)} ДТП)..."
         )
-    prev_clusters, prev_preclusters = await calculate_concentration_points(
+    prev_clusters, prev_preclusters, _polys = await calculate_concentration_points(
         prev_cards,
         progress_callback,
         settlement_polygons=settlement_polygons,

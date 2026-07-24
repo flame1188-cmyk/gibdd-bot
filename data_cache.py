@@ -109,11 +109,32 @@ class _DataCache:
         with self._lock:
             self._cache.pop(key, None)
 
-    def clear(self) -> None:
-        """Очищает весь кэш."""
+    def invalidate_by_region(self, reg_code: str) -> int:
+        """Удаляет ВСЕ записи кэша для заданного региона.
+
+        Возвращает количество удалённых записей.
+        Безопаснее чем selective invalidate — не зависит от точного
+        совпадения формата dat_list.
+        """
+        prefix = f"{reg_code}:"
+        removed = 0
         with self._lock:
+            keys_to_remove = [k for k in self._cache if k.startswith(prefix)]
+            for k in keys_to_remove:
+                del self._cache[k]
+                removed += 1
+        if removed:
+            logger.info(f"Кэш: удалены {removed} записей региона {reg_code}")
+        else:
+            logger.debug(f"Кэш: нет записей региона {reg_code} для удаления")
+        return removed
+
+    def clear(self) -> None:
+        """Очищает весь кэш и освобождает ссылки на карточки."""
+        with self._lock:
+            n = len(self._cache)
             self._cache.clear()
-            logger.info("Кэш: полностью очищен")
+        logger.info(f"Кэш: полностью очищен ({n} записей удалено)")
 
     def stats_dict(self) -> dict[str, int]:
         """Статистика кэша для программного доступа."""

@@ -18,6 +18,7 @@ import logging
 import os
 import sys
 import time
+import tracemalloc
 from datetime import datetime
 from typing import Any
 
@@ -156,6 +157,30 @@ def _mark_api_down():
 
 def _is_api_down() -> bool:
     return _api_down
+
+
+def _log_memory(label: str) -> int:
+    """Логирует текущее использование памяти и возвращает RSS в МБ.
+
+    Используется для диагностики OOM: показывает RSS до/после очистки.
+    """
+    import resource
+    try:
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # KB → MB
+    except Exception:
+        rss_mb = -1
+    # tracemalloc: текущий размер аллокаций Python
+    try:
+        current, peak = tracemalloc.get_traced_memory()
+        alloc_mb = current / 1024 / 1024
+        logger.info(
+            f"[MEM] {label}: RSS={rss_mb:.1f} MB, "
+            f"Python alloc={alloc_mb:.1f} MB, peak={peak/1024/1024:.1f} MB"
+        )
+    except Exception:
+        logger.info(f"[MEM] {label}: RSS={rss_mb:.1f} MB")
+    return int(rss_mb) if rss_mb >= 0 else 0
+
 
 # ========================
 # Глобальный кэш данных выгрузки (модуль data_cache.py)
@@ -773,15 +798,14 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 _old_reg = context.user_data.get("reg_code")
                 _clear_analytics_data(context.user_data)
                 if _old_reg and _old_reg != reg_code:
-                    # Инвалидируем записи старого региона из data_cache
-                    for _y in [datetime.now().year, datetime.now().year - 1]:
-                        data_cache.invalidate(
-                            _old_reg, [f"{m}.{_y}" for m in range(1, 13)]
-                        )
-                    gc.collect()
+                    # Удаляем ВСЕ записи старого региона из data_cache
+                    # (используем invalidate_by_region вместо selective
+                    #  invalidate — надёжнее, не зависит от формата дат)
+                    removed = data_cache.invalidate_by_region(_old_reg)
+                    _freed = gc.collect()
                     logger.info(
                         f"Смена региона: {_old_reg} -> {reg_code}, "
-                        f"старые данные очищены"
+                        f"кэш: {removed} записей удалено, gc: {_freed} объектов"
                     )
 
                 context.user_data["reg_code"] = reg_code
@@ -1089,20 +1113,34 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
             # --- Сменить данные (очистка + /dtp) ---
             if data == "change_data":
-                # Инвалидируем кэш старого региона ДО очистки user_data,
-                # чтобы освободить карточки из глобального data_cache.
+                # Полная очистка памяти при смене региона.
+                # 1) Удаляем карточки старого региона из глобального data_cache
+                #    (это критично — analytics_cards и data_cache ссылаются
+                #    на одни и те же dict-объекты, поэтому очистка user_data
+                #    без очистки кэша НЕ освобождает память).
                 _old_reg_for_cache = context.user_data.get("reg_code")
+                _mem_before = _log_memory("Смена данных: ПАМЯТЬ ДО очистки")
+
                 if _old_reg_for_cache:
-                    for _y in [datetime.now().year, datetime.now().year - 1]:
-                        data_cache.invalidate(
-                            _old_reg_for_cache,
-                            [f"{m}.{_y}" for m in range(1, 13)]
-                        )
+                    removed = data_cache.invalidate_by_region(_old_reg_for_cache)
                     logger.info(
-                        f"Смена данных: инвалидирован кэш региона {_old_reg_for_cache}"
+                        f"Смена данных: из кэша удалено {removed} записей региона {_old_reg_for_cache}"
                     )
+                else:
+                    # reg_code отсутствует — очищаем весь кэш на всякий случай
+                    data_cache.clear()
+                    logger.info("Смена данных: reg_code отсутствует, кэш полностью очищен")
+
+                # 2) Очищаем user_data (карточки, полигоны, очаги, etc.)
                 _clear_analytics_data(context.user_data)
-                gc.collect()
+
+                # 3) Принудительный сбор мусора
+                _freed = gc.collect()
+                _mem_after = _log_memory("Смена данных: ПАМЯТЬ ПОСЛЕ очистки")
+                logger.info(
+                    f"Смена данных: gc.collect() собрал {_freed} объектов, "
+                    f"RSS ~{_mem_before}->{_mem_after} MB"
+                )
                 regions = _get_regions(context)
                 keyboard = build_region_keyboard(regions, page=0)
                 await _safe_edit(query, "Выберите регион:",
@@ -1185,6 +1223,9 @@ async def _start_fetching(
     global _api_down
     _api_down = False
 
+    # Логируем память перед выгрузкой (для диагностики OOM)
+    _log_memory(f"Выгрузка СТАРТ: {reg_name}, {period.label}")
+
     try:
         await _tg_retry(lambda: query.edit_message_text(
             f"Выгрузка данных:\n\n"
@@ -1242,6 +1283,12 @@ async def _start_fetching(
         except (TimedOut, NetworkError):
             logger.warning("Не удалось отправить сообщение об ошибках выгрузки")
         return
+
+    # Логируем память после загрузки всех карточек
+    _log_memory(
+        f"Выгрузка ЗАГРУЖЕНО: {reg_name}, {len(all_cards)} ДТП, "
+        f"кэш: {data_cache.stats()}"
+    )
 
     # Обработка и генерация Excel
     try:
@@ -1348,11 +1395,7 @@ def _get_current_cards(
 ) -> list[dict] | None:
     """
     Получает карточки ДТП текущего периода.
-    Для обычных регионов — из user_data (analytics_cards).
-    Для крупных регионов (>6500 ДТП) — из data_cache.
-    Для крупных регионов после аналитики (когда данные были освобождены) —
-    возвращает None, но _large_region флаг в user_data позволяет
-    _build_menu_keyboard() корректно работать.
+    Сначала проверяет user_data, потом data_cache.
     Возвращает None если данные не найдены.
     """
     cards = context.user_data.get("analytics_cards", [])
@@ -1373,8 +1416,7 @@ def _get_current_cards(
 
 def _has_analytics_data(context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
-    Проверяет, есть ли в принципе данные для аналитики (даже если
-    карточки были освобождены из-за OOM-защиты у крупных регионов).
+    Проверяет, есть ли данные для аналитики.
     Используется для построения меню.
     """
     period = context.user_data.get("analytics_period")
@@ -1385,13 +1427,11 @@ def _has_analytics_data(context: ContextTypes.DEFAULT_TYPE) -> bool:
 def _get_card_count(context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     Возвращает количество ДТП текущего периода.
-    Для крупных регионов после очистки — берёт из сохранённого счётчика.
     """
     cards = _get_current_cards(context)
     if cards:
         return len(cards)
-    # Для крупных регионов после очистки памяти
-    return context.user_data.get("_large_region_count", 0)
+    return 0
 
 
 def _get_prev_cards(
@@ -1426,18 +1466,15 @@ def _build_menu_keyboard(
     Строит клавиатуру главного меню по кэшированным данным.
     Возвращает (text, keyboard) или (None, None) если данных нет.
     Переиспользуется после каждого сценария для возврата в меню.
-    Для крупных регионов работает даже после освобождения карточек из памяти.
     """
     reg_name = context.user_data.get("analytics_reg_name", "")
     period = context.user_data.get("analytics_period")
     current_cards = _get_current_cards(context)
-    is_large = context.user_data.get("_large_region", False)
 
-    # Для крупных регионов после очистки памяти используем флаг
-    if not period or (not current_cards and not is_large):
+    if not period or not current_cards:
         return None, None
 
-    card_count = len(current_cards) if current_cards else context.user_data.get("_large_region_count", 0)
+    card_count = len(current_cards)
 
     prev_year = period.year - 1
     prev_label = period.label.replace(str(period.year), str(prev_year))
@@ -1562,41 +1599,15 @@ async def _offer_analysis(
     Также запускает фоновую preload-задачу для данных за прошлый год.
     """
     # Сохраняем данные для аналитики в user_data
-    # Для крупных регионов (>6000 ДТП) НЕ храним карточки в user_data —
-    # они доступны в data_cache. Это экономит ~30-60 МБ на хостинге 2 GB RAM.
     context.user_data["analytics_ready"] = True
     context.user_data["analytics_reg_code"] = reg_code
     context.user_data["analytics_reg_name"] = reg_name
     context.user_data["analytics_period"] = period
-
-    _LARGE_REGION_THRESHOLD = 6500
-    if len(current_cards) > _LARGE_REGION_THRESHOLD:
-        # Крупный регион: карточки в data_cache, в user_data храним только флаг
-        context.user_data.pop("analytics_cards", None)
-        context.user_data["_large_region"] = True
-        context.user_data["_large_region_count"] = len(current_cards)
-        logger.info(
-            f"Крупный регион: {len(current_cards)} ДТП, карточки в data_cache"
-        )
-    else:
-        context.user_data["analytics_cards"] = current_cards
-        context.user_data.pop("_large_region", None)
+    context.user_data["analytics_cards"] = current_cards
 
     # --- Фоновый preload данных за прошлый год ---
-    # Для регионов с большим количеством ДТП (>4500) НЕ запускаем preload —
-    # это дополнительно загружает столько же данных в память,
-    # что может вызвать OOM на хостинге с 2 GB RAM.
-    # Данные за прошлый год загрузятся по требованию при аналитике.
-    _PRELOAD_THRESHOLD = 4500
-    if len(current_cards) <= _PRELOAD_THRESHOLD:
-        preload_task = asyncio.create_task(_preload_prev_year(reg_code, period))
-        context.user_data["_preload_task"] = preload_task
-    else:
-        logger.info(
-            f"Пропуск preload: {len(current_cards)} ДТП (>{_PRELOAD_THRESHOLD}), "
-            f"данные за прошлый год загрузятся при аналитике"
-        )
-        context.user_data.pop("_preload_task", None)
+    preload_task = asyncio.create_task(_preload_prev_year(reg_code, period))
+    context.user_data["_preload_task"] = preload_task
 
     text, keyboard = _build_menu_keyboard(context)
     if text and keyboard:
@@ -1604,85 +1615,6 @@ async def _offer_analysis(
             chat_id=chat_id,
             text=text,
             reply_markup=keyboard,
-            parse_mode="HTML",
-        )
-
-
-async def _resend_analytics_results(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    is_large: bool = False,
-) -> None:
-    """
-    Повторно отправляет результаты аналитики из сохранённых данных.
-    Используется для крупных регионов, когда карточки были освобождены
-    из памяти, но comparison-результаты сохранены.
-    """
-    chat_id = update.effective_chat.id
-    reg_name = context.user_data.get("analytics_reg_name", "")
-    current_label = context.user_data.get("analytics_current_label", "")
-    prev_label = context.user_data.get("analytics_prev_label", "")
-    comparison = context.user_data.get("analytics_comparison")
-    card_count = context.user_data.get("_large_region_count", 0)
-
-    if not comparison or not current_label or not prev_label:
-        await update.callback_query.edit_message_text(
-            "Результаты аналитики не найдены. Выполните выгрузку заново."
-        )
-        return
-
-    try:
-        await update.callback_query.answer()
-    except Exception:
-        pass
-
-    # Генерируем текст аналитики
-    analytics_text = build_analytics_message(
-        comparison=comparison,
-        reg_name=reg_name,
-        current_label=current_label,
-        previous_label=prev_label,
-    )
-    await _send_long_message(
-        context.bot, chat_id,
-        text=f"\U0001F4CA <b>Аналитика: {reg_name}</b>\n\n{analytics_text}",
-        parse_mode="HTML",
-    )
-
-    # Генерируем и отправляем Excel
-    analytics_data = build_analytics_excel_data(
-        comparison=comparison,
-        reg_name=reg_name,
-        current_label=current_label,
-        previous_label=prev_label,
-    )
-    column_names = get_analytics_column_names(current_label, prev_label)
-    analytics_bytes = generate_analytics_file(analytics_data, column_names)
-
-    prev_year = prev_label.split()[-1] if prev_label else ""
-    cur_year = current_label.split()[-1] if current_label else ""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_reg = reg_name.replace(" ", "_")[:30]
-    filename = f"dtp_analytics_{safe_reg}_{cur_year}_vs_{prev_year}_{timestamp}.xlsx"
-
-    await _tg_retry(lambda: context.bot.send_document(
-        chat_id=chat_id,
-        document=analytics_bytes,
-        filename=filename,
-        caption=(
-            f"\U0001F4CA Аналитика: {reg_name}\n"
-            f"{current_label} vs {prev_label}\n"
-            f"ДТП: {card_count} (данные из памяти были освобождены)"
-        ),
-    ), "send_document (аналитика повторно)")
-
-    # Показываем меню
-    menu_text, menu_kb = _build_menu_keyboard(context)
-    if menu_text and menu_kb:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=menu_text,
-            reply_markup=menu_kb,
             parse_mode="HTML",
         )
 
@@ -1704,28 +1636,8 @@ async def _run_analysis(
     reg_name = context.user_data.get("analytics_reg_name", "")
     period = context.user_data.get("analytics_period")
     current_cards = _get_current_cards(context)
-    is_large = context.user_data.get("_large_region", False)
 
     if not reg_code or not period or not current_cards:
-        # Для крупных регионов после очистки памяти: аналитика уже была выполнена.
-        # Показываем сохранённые результаты или предлагаем заново.
-        if is_large and period and reg_code:
-            card_count = context.user_data.get("_large_region_count", 0)
-            comparison = context.user_data.get("analytics_comparison")
-            if comparison:
-                # Результаты аналитики есть — отправляем заново
-                await _resend_analytics_results(
-                    update, context, is_large=True
-                )
-                return
-            else:
-                await update.callback_query.edit_message_text(
-                    f"\u26A0\uFE0F Данные по {reg_name} ({card_count} ДТП) "
-                    f"были освобождены из памяти.\n\n"
-                    f"Для повторного анализа выполните выгрузку заново (/dtp).\n"
-                    f"При аналитике данные за прошлый год загрузятся автоматически."
-                )
-                return
         await update.callback_query.edit_message_text(
             "Данные для анализа не найдены. Пожалуйста, выполните выгрузку заново."
         )
@@ -1737,31 +1649,8 @@ async def _run_analysis(
     prev_label = period.label.replace(str(period.year), str(prev_year))
     current_label = period.label
 
-    # Сохраняем количество ДТП до возможной очистки
+    # Сохраняем количество ДТП
     current_cards_count = len(current_cards)
-
-    # Для крупных регионов: рассчитываем метрики по текущему году ЗРАЗУ
-    # и освобождаем память ДО загрузки прошлого года.
-    # Это предотвращает OOM: данные текущего + прошлого года
-    # (>6000 ДТП × 2) не помещаются в 2 GB RAM одновременно.
-    current_metrics = None
-    raw_sup_current = ""
-    if is_large:
-        current_metrics = calculate_metrics(current_cards)
-        if use_llm and LLM_API_KEY:
-            raw_sup_current = extract_raw_supplement(
-                current_cards, current_label, max_cards=50
-            )
-        # Удаляем текущий год из data_cache и освобождаем локальную ссылку
-        dat_list_current = [f"{m}.{period.year}" for m in period.months]
-        data_cache.invalidate(reg_code, dat_list_current)
-        del current_cards
-        gc.collect()
-        current_cards = []
-        logger.info(
-            f"Аналитика: текущие карточки освобождены "
-            f"({current_cards_count} ДТП, {len(dat_list_current)} мес)"
-        )
 
     mode_label = "\U0001F916 AI-анализ" if use_llm else "\U0001F4CA Анализ"
 
@@ -1809,10 +1698,7 @@ async def _run_analysis(
         # Данные за прошлый год уже есть — не скачиваем повторно
         prev_cards = cached_prev
         errors = []
-        # Для крупных регионов НЕ сохраняем в user_data (экономия памяти)
-        if not is_large:
-            context.user_data["analytics_prev_cards"] = prev_cards
-            context.user_data["analytics_prev_label"] = prev_label
+        context.user_data["analytics_prev_cards"] = prev_cards
         if status_msg is None:
             status_msg = await _tg_retry(lambda: context.bot.send_message(
                 chat_id=chat_id,
@@ -1867,14 +1753,13 @@ async def _run_analysis(
 
         prev_cards, errors = await _fetch_cards_for_period(
             dat_list_prev, reg_code, "Аналитика", progress_callback=progress,
-            cache_result=not is_large,  # Не кэшируем для крупных регионов
         )
 
-        # Сохраняем количество ДТП за прошлый год до возможной очистки
+        # Сохраняем количество ДТП за прошлый год
         prev_cards_count = len(prev_cards)
 
-        # Кэшируем для повторного использования (только для обычных регионов)
-        if prev_cards and not is_large:
+        # Кэшируем для повторного использования
+        if prev_cards:
             context.user_data["analytics_prev_cards"] = prev_cards
             context.user_data["analytics_prev_label"] = prev_label
 
@@ -1893,8 +1778,7 @@ async def _run_analysis(
     # Считаем метрики
     await status_msg.edit_text(f"{mode_label}: считаю метрики...")
 
-    if current_metrics is None:
-        current_metrics = calculate_metrics(current_cards)
+    current_metrics = calculate_metrics(current_cards)
     previous_metrics = calculate_metrics(prev_cards)
     comparison = compare_metrics(current_metrics, previous_metrics)
 
@@ -1902,29 +1786,7 @@ async def _run_analysis(
     context.user_data["analytics_comparison"] = comparison
     context.user_data["analytics_current_label"] = current_label
     context.user_data["analytics_prev_label"] = prev_label
-
-    # Для крупных регионов: сохраняем сырые карточки prev только если
-    # включён QA-режим (нужны для ответов на вопросы LLM)
-    if not is_large:
-        context.user_data["analytics_prev_cards"] = prev_cards
-
-    # Для крупных регионов: извлекаем raw_supplement из prev_cards
-    # и освобождаем память
-    raw_sup_prev = ""
-    if is_large:
-        if use_llm and LLM_API_KEY:
-            raw_sup_prev = extract_raw_supplement(
-                prev_cards, prev_label, max_cards=50
-            )
-        # Сохраняем количество ДТП за прошлый год
-        prev_cards_count = len(prev_cards)
-        del prev_cards
-        gc.collect()
-        prev_cards = []
-        logger.info(
-            f"Аналитика: карточки прошлого года освобождены "
-            f"({prev_cards_count} ДТП)"
-        )
+    context.user_data["analytics_prev_cards"] = prev_cards
 
     # --- Генерируем контент ---
     llm_summary_text = None
@@ -1936,11 +1798,8 @@ async def _run_analysis(
             )
 
             # Формируем дополнение из сырых карточек
-            if is_large:
-                raw_sup = raw_sup_current + raw_sup_prev
-            else:
-                raw_sup = extract_raw_supplement(current_cards, current_label, max_cards=50)
-                raw_sup += extract_raw_supplement(prev_cards, prev_label, max_cards=50)
+            raw_sup = extract_raw_supplement(current_cards, current_label, max_cards=50)
+            raw_sup += extract_raw_supplement(prev_cards, prev_label, max_cards=50)
 
             # Ищем новости из открытых источников (если включено)
             news_ctx = ""
@@ -1952,12 +1811,7 @@ async def _run_analysis(
             # Рассчитываем очаги ДТП для передачи в LLM
             clusters_ctx = ""
             existing_clusters = context.user_data.get("analytics_clusters")
-            if is_large:
-                # Для крупных регионов пропускаем расчёт очагов —
-                # это требует удержания всех карточек в памяти.
-                logger.info("LLM-анализ: расчёт очагов пропущен (крупный регион)")
-                context.user_data["analytics_clusters"] = []
-            elif existing_clusters:
+            if existing_clusters:
                 # Очаги уже рассчитаны (кнопка «Очаги ДТП»),
                 # используем готовый результат без пересчёта —
                 # пересчёт требует OSM-полигонов и всех карточек в памяти,
@@ -1976,13 +1830,21 @@ async def _run_analysis(
                     )
                     # Используем полигоны из кэша (если есть от «Очаги ДТП»)
                     existing_polygons = context.user_data.get("_settlement_polygons")
-                    clusters, _preclusters = await calculate_concentration_points(
+                    clusters, _preclusters, calc_polygons = await calculate_concentration_points(
                         current_cards,
                         settlement_polygons=existing_polygons,
                     )
                     if clusters:
                         clusters_ctx = format_clusters_for_prompt(clusters, max_clusters=10)
                         context.user_data["analytics_clusters"] = clusters
+                        # Сохраняем полигоны для переиспользования
+                        # (например, если пользователь потом нажмёт «Очаги ДТП")
+                        if calc_polygons:
+                            context.user_data["_settlement_polygons"] = calc_polygons
+                            logger.info(
+                                f"LLM-анализ: полигоны сохранены в кэш "
+                                f"({len(calc_polygons)} полигонов)"
+                            )
                         logger.info(
                             f"LLM-анализ: рассчитано {len(clusters)} очагов "
                             f"для контекста ({len(clusters_ctx)} симв.)"
@@ -2100,24 +1962,20 @@ async def _run_analysis(
     ), "send_document (аналитика)")
 
     # Генерируем и отправляем HTML-отчёт с визуализациями
-    if not is_large:
-        try:
-            await _send_analytics_html(
-                context, chat_id,
-                reg_name=reg_name,
-                current_label=current_label,
-                prev_label=prev_label,
-                current_cards=current_cards,
-                prev_cards=prev_cards,
-            )
-        except Exception as e:
-            logger.warning(f"Не удалось сгенерировать HTML-отчёт аналитики: {e}")
-    else:
-        logger.info("Аналитика: HTML-отчёт пропущен (крупный регион)")
+    try:
+        await _send_analytics_html(
+            context, chat_id,
+            reg_name=reg_name,
+            current_label=current_label,
+            prev_label=prev_label,
+            current_cards=current_cards,
+            prev_cards=prev_cards,
+        )
+    except Exception as e:
+        logger.warning(f"Не удалось сгенерировать HTML-отчёт аналитики: {e}")
 
     # Предлагаем задать вопросы (только если аналитика с ИИ)
-    # Для крупных регионов: QA-режим недоступен (карточки освобождены)
-    if use_llm and LLM_API_KEY and not is_large:
+    if use_llm and LLM_API_KEY:
         context.user_data["qa_mode"] = True
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(
@@ -2178,7 +2036,6 @@ def _clear_analytics_data(user_data: dict) -> None:
         "point_stats_mode", "point_stats_lat", "point_stats_lon", "point_stats_radius",
         "cameras_data", "waiting_camera_file", "waiting_camera_for_map",
         "_settlement_polygons", "_preload_task",
-        "_large_region", "_large_region_count",
     ]:
         user_data.pop(key, None)
 
@@ -2192,24 +2049,6 @@ async def _run_concentration_points(
     (сравнение с прошлым годом) и отправляет Excel-файл.
     """
     chat_id = update.effective_chat.id
-
-    # Для крупных регионов после аналитики: карточки были освобождены
-    # из-за OOM-защиты. Предлагаем повторную выгрузку.
-    is_large = context.user_data.get("_large_region", False)
-    if is_large:
-        current_cards = _get_current_cards(context)
-        if not current_cards:
-            reg_name = context.user_data.get("analytics_reg_name", "")
-            card_count = context.user_data.get("_large_region_count", 0)
-            await update.callback_query.edit_message_text(
-                f"\u26A0\uFE0F Данные по {reg_name} ({card_count} ДТП) "
-                f"были освобождены из памяти для экономии ресурсов.\n\n"
-                f"Для расчёта очагов ДТП необходимы полные карточки.\n"
-                f"Пожалуйста, выполните выгрузку заново (/dtp).\n\n"
-                f"Аналитика (сравнение с прошлым годом) доступна — "
-                f"данные загрузятся автоматически."
-            )
-            return
 
     reg_name = context.user_data.get("analytics_reg_name", "")
     reg_code = context.user_data.get("analytics_reg_code", "")
@@ -2586,34 +2425,11 @@ async def _run_concentration_points(
             + (f", динамика: {prev_label}" if prev_cards else "")
         )
 
-        # Освобождаем память: удаляем камеры и сырые карточки из сессии
+        # Освобождаем память: удаляем камеры из сессии
         context.user_data.pop("cameras_data", None)
 
-        # Для средних/крупных регионов (>4500 ДТП) освобождаем OSM-полигоны
-        # и карточки прошлого года — они больше не нужны, а очаги уже сохранены.
-        # LLM-аналитика использует готовые analytics_clusters из кэша.
-        _card_count = context.user_data.get("_large_region_count") or \
-            len(context.user_data.get("analytics_cards", []))
-        if _card_count > 4500:
-            context.user_data.pop("_settlement_polygons", None)
-            context.user_data.pop("analytics_prev_cards", None)
-            # Инвалидируем прошлый год из data_cache (очаги уже посчитаны)
-            _prev_reg = context.user_data.get("analytics_reg_code")
-            _prev_period = context.user_data.get("analytics_period")
-            if _prev_reg and _prev_period:
-                data_cache.invalidate(
-                    _prev_reg,
-                    [f"{m}.{_prev_period.year - 1}" for m in _prev_period.months],
-                )
-            gc.collect()
-            logger.info(
-                f"Очаги: освобождены полигоны и prev_cards "
-                f"({_card_count} ДТП > 4500)"
-            )
-        else:
-            # Полигоны оставляем для небольших регионов —
-            # они нужны для аналитики с ИИ (пересчёт очагов)
-            gc.collect()
+        # Полигоны OSM оставляем в user_data["_settlement_polygons"]
+        # для переиспользования в AI-анализе (без повторного запроса к OSM).
 
     except Exception as e:
         logger.exception(f"Ошибка расчёта очагов (динамика): {e}")
@@ -3849,6 +3665,8 @@ def _build_app(token: str) -> "Application":
 
 
 def main() -> None:
+    # Запускаем отслеживание аллокаций памяти для диагностики OOM
+    tracemalloc.start(25)  # храним 25 самых больших трассировок
     logger.info("=== GIBDD Telegram Bot запускается ===")
 
     errors = validate_config()
