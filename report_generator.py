@@ -31,6 +31,10 @@ _LIB_DIR = os.path.join(_DATA_DIR, "report_libs")
 _LIB_URLS = {
     "leaflet.css": "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css",
     "leaflet.js": "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js",
+    "leaflet.markercluster.css": "https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css",
+    "leaflet.markercluster.js": "https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js",
+    "leaflet.measure.css": "https://cdnjs.cloudflare.com/ajax/libs/leaflet-measure/3.1.0/leaflet.measure.css",
+    "leaflet.measure.js": "https://cdnjs.cloudflare.com/ajax/libs/leaflet-measure/3.1.0/leaflet.measure.js",
     "echarts.min.js": "https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js",
 }
 
@@ -219,6 +223,38 @@ def _card_popup_html(card: dict) -> str:
     if osv:
         lines.append(f"💡 Освещение: {osv}")
 
+    # Дорожные условия (перекрёсток, переход и т.д.)
+    sdor = dor_usl.get("sdor", []) or []
+    if sdor:
+        lines.append(f"🚦 Дорожные условия: {'; '.join(str(s) for s in sdor)}")
+    obj_dtp = dor_usl.get("obj_dtp", []) or []
+    if obj_dtp:
+        lines.append(f"🏗 Объекты УДС: {'; '.join(str(s) for s in obj_dtp)}")
+
+    # Нарушения ПДД
+    all_npdd = []
+    all_sop_npdd = []
+    for ts in (card.get("ts_info") or []):
+        for uch in (ts.get("ts_uch", []) or []):
+            npdd = uch.get("npdd", []) or []
+            if npdd:
+                all_npdd.extend(str(n) for n in npdd)
+            sop = uch.get("sop_npdd", []) or []
+            if sop:
+                all_sop_npdd.extend(str(n) for n in sop)
+    # Участники без ТС
+    for uch in (card.get("uch_info") or []):
+        npdd = uch.get("npdd", []) or []
+        if npdd:
+            all_npdd.extend(str(n) for n in npdd)
+        sop = uch.get("sop_npdd", []) or []
+        if sop:
+            all_sop_npdd.extend(str(n) for n in sop)
+    if all_npdd:
+        lines.append(f"⚠️ Нарушения: {'; '.join(all_npdd)}")
+    if all_sop_npdd:
+        lines.append(f"📌 Сопутствующие: {'; '.join(all_sop_npdd)}")
+
     return "<br>".join(l for l in lines if l)
 
 
@@ -307,6 +343,20 @@ class ReportGenerator:
             head_parts.append(f"<style>{leaflet_css}</style>")
             leaflet_js = libs.get("leaflet.js", "")
             head_parts.append(f"<script>{leaflet_js}</script>")
+            # MarkerCluster
+            mc_css = libs.get("leaflet.markercluster.css", "")
+            if mc_css:
+                head_parts.append(f"<style>{mc_css}</style>")
+            mc_js = libs.get("leaflet.markercluster.js", "")
+            if mc_js:
+                head_parts.append(f"<script>{mc_js}</script>")
+            # Measure
+            ms_css = libs.get("leaflet.measure.css", "")
+            if ms_css:
+                head_parts.append(f"<style>{ms_css}</style>")
+            ms_js = libs.get("leaflet.measure.js", "")
+            if ms_js:
+                head_parts.append(f"<script>{ms_js}</script>")
 
         if use_echarts:
             echarts_js = libs.get("echarts.min.js", "")
@@ -644,6 +694,14 @@ body {
   .map-container { box-shadow: none; border: 1px solid #ccc; }
   #map { height: 500px; }
   .filter-panel { display: none; }
+}
+.camera-cluster-icon {
+  background: rgba(46, 125, 50, 0.7);
+  border-radius: 50%;
+  width: 36px; height: 36px;
+  display: flex; align-items: center; justify-content: center;
+  color: white; font-weight: 700; font-size: 13px;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.3);
 }
 """
 
@@ -1041,18 +1099,40 @@ var map = L.map('map').setView([{center[0]}, {center[1]}], {zoom});
 
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
     attribution: '&copy; OpenStreetMap contributors',
-    maxZoom: 18,
+    maxZoom: 19,
+}}).addTo(map);
+
+// --- Линейка ---
+L.control.measure({{
+    position: 'topleft',
+    primaryLengthUnit: 'meters',
+    secondaryLengthUnit: 'kilometers',
+    localization: {{
+    }}
 }}).addTo(map);
 
 // --- Данные ---
 var dtpData = {dtp_geojson};
 var cameraDataFull = {camera_markers_js};
 
-// --- Слой ДТП ---
-var dtpLayer = L.layerGroup().addTo(map);
+// --- MarkerCluster для ДТП ---
+var dtpCluster = L.markerClusterGroup({{
+    maxClusterRadius: 40,
+    spiderfyOnMaxZoom: true,
+    showCoverageOnHover: false,
+    iconCreateFunction: function(cluster) {{
+        var count = cluster.getChildCount();
+        var size = count < 10 ? 'small' : count < 100 ? 'medium' : 'large';
+        return L.divIcon({{
+            html: '<div><span>' + count + '</span></div>',
+            className: 'marker-cluster marker-cluster-' + size,
+            iconSize: L.point(40, 40)
+        }});
+    }}
+}});
 
 function renderDtp(data) {{
-    dtpLayer.clearLayers();
+    dtpCluster.clearLayers();
     L.geoJSON(data, {{
         pointToLayer: function(feature, latlng) {{
             return L.circleMarker(latlng, {{
@@ -1066,11 +1146,12 @@ function renderDtp(data) {{
         onEachFeature: function(feature, layer) {{
             layer.bindPopup(feature.properties.popup, {{maxWidth: 320}});
         }}
-    }}).addTo(dtpLayer);
+    }}).addTo(dtpCluster);
 }}
 
 // Первичная отрисовка всех ДТП
 renderDtp(dtpData);
+dtpCluster.addTo(map);
 
 // --- Фильтр ДТП ---
 function applyDtpFilter() {{
@@ -1108,25 +1189,38 @@ document.getElementById('filter_reset').addEventListener('click', function() {{
         dtpData.features.length + ' ДТП';
 }});
 
-// --- Слой камер ---
-var cameraLayer = L.layerGroup();
+// --- Слой камер (кластеризация) ---
 var cameraIcon = L.divIcon({{
     html: '<div style="font-size:18px;text-align:center;line-height:1;">📷</div>',
     iconSize: [24, 24],
     iconAnchor: [12, 12],
     className: ''
 }});
+var cameraCluster = L.markerClusterGroup({{
+    maxClusterRadius: 40,
+    spiderfyOnMaxZoom: true,
+    showCoverageOnHover: false,
+    iconCreateFunction: function(cluster) {{
+        var count = cluster.getChildCount();
+        return L.divIcon({{
+            html: '<div class="camera-cluster-icon"><span>' + count + '</span></div>',
+            className: '',
+            iconSize: L.point(36, 36)
+        }});
+    }}
+}});
 
 function renderCameras(data) {{
-    cameraLayer.clearLayers();
+    cameraCluster.clearLayers();
     data.forEach(function(c) {{
         L.marker([c.lat, c.lon], {{icon: cameraIcon}})
          .bindPopup(c.popup, {{maxWidth: 320}})
-         .addTo(cameraLayer);
+         .addTo(cameraCluster);
     }});
 }}
 
 renderCameras(cameraDataFull);
+cameraCluster.addTo(map);
 
 // --- Множественный выбор моделей камер ---
 function toggleMultiSelect(id) {{
@@ -1165,10 +1259,9 @@ function applyDtpCameraFilter() {{
 }}
 
 // --- Управление слоями ---
-var overlayLayers = {{"ДТП": dtpLayer}};
+var overlayLayers = {{"ДТП": dtpCluster}};
 if ({str(has_cameras).lower()}) {{
-    overlayLayers["Камеры"] = cameraLayer;
-    cameraLayer.addTo(map);
+    overlayLayers["Камеры"] = cameraCluster;
 }}
 L.control.layers({{}}, overlayLayers, {{collapsed: false}}).addTo(map);
 """
@@ -1697,7 +1790,16 @@ var map = L.map('map').setView([{center[0]}, {center[1]}], {zoom});
 
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
     attribution: '&copy; OpenStreetMap contributors',
-    maxZoom: 18,
+    maxZoom: 19,
+}}).addTo(map);
+
+// --- Линейка ---
+L.control.measure({{
+    position: 'topleft',
+    primaryLengthUnit: 'meters',
+    secondaryLengthUnit: 'kilometers',
+    localization: {{
+    }}
 }}).addTo(map);
 
 // --- Алгоритм Грэхема (convex hull) ---
@@ -1738,19 +1840,32 @@ var dtpClusterLayer = L.layerGroup();    // ДТП внутри очагов
 var dtpPreclusterLayer = L.layerGroup(); // ДТП внутри предочагов
 var clusterLayer = L.layerGroup();      // зоны и маркеры очагов
 var preclusterLayer = L.layerGroup();   // зоны и маркеры предочагов
-var cameraLayer = L.layerGroup();
 
-// --- Камеры ---
+// --- Камеры (кластеризация) ---
 var cameraIcon = L.divIcon({{
     html: '<div style="font-size:18px;text-align:center;line-height:1;">📷</div>',
     iconSize: [24, 24], iconAnchor: [12, 12], className: ''
+}});
+var cameraCluster = L.markerClusterGroup({{
+    maxClusterRadius: 40,
+    spiderfyOnMaxZoom: true,
+    showCoverageOnHover: false,
+    iconCreateFunction: function(cluster) {{
+        var count = cluster.getChildCount();
+        return L.divIcon({{
+            html: '<div class="camera-cluster-icon"><span>' + count + '</span></div>',
+            className: '',
+            iconSize: L.point(36, 36)
+        }});
+    }}
 }});
 var cameraDataFull = {camera_markers_js};
 cameraDataFull.forEach(function(c) {{
     L.marker([c.lat, c.lon], {{icon: cameraIcon}})
      .bindPopup(c.popup, {{maxWidth: 320}})
-     .addTo(cameraLayer);
+     .addTo(cameraCluster);
 }});
+cameraCluster.addTo(map);
 
 // --- Функция отрисовки очага/предочага ---
 function drawClusterGroup(data, zoneLayer, dtpLayer, isPre) {{
@@ -1878,17 +1993,17 @@ if (preclusterData.length > 0) {{
     overlayLayers["Предочаги (зоны)"] = preclusterLayer;
     overlayLayers["ДТП в предочагах"] = dtpPreclusterLayer;
 }}
-if ({str(has_cameras).lower()}) overlayLayers["Камеры"] = cameraLayer;
+if ({str(has_cameras).lower()}) overlayLayers["Камеры"] = cameraCluster;
 
 L.control.layers({{}}, overlayLayers, {{collapsed: false}}).addTo(map);
 
 // --- Фильтр камер по модели (множественный выбор) ---
 function renderCameras(data) {{
-    cameraLayer.clearLayers();
+    cameraCluster.clearLayers();
     data.forEach(function(c) {{
         L.marker([c.lat, c.lon], {{icon: cameraIcon}})
          .bindPopup(c.popup, {{maxWidth: 320}})
-         .addTo(cameraLayer);
+         .addTo(cameraCluster);
     }});
 }}
 function toggleMultiSelect(id) {{
@@ -2067,7 +2182,16 @@ var map = L.map('map').setView([{lat}, {lon}], 15);
 
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
     attribution: '&copy; OpenStreetMap contributors',
-    maxZoom: 18,
+    maxZoom: 19,
+}}).addTo(map);
+
+// --- Линейка ---
+L.control.measure({{
+    position: 'topleft',
+    primaryLengthUnit: 'meters',
+    secondaryLengthUnit: 'kilometers',
+    localization: {{
+    }}
 }}).addTo(map);
 
 // --- Точка пользователя ---
@@ -2083,8 +2207,21 @@ L.circle([{lat}, {lon}], {{
     fillOpacity: 0.06, weight: 2, dashArray: '8,4'
 }}).addTo(map);
 
-// --- ДТП текущего периода ---
-var curDtpLayer = L.layerGroup();
+// --- ДТП текущего периода (кластеризация) ---
+var curDtpCluster = L.markerClusterGroup({{
+    maxClusterRadius: 40,
+    spiderfyOnMaxZoom: true,
+    showCoverageOnHover: false,
+    iconCreateFunction: function(cluster) {{
+        var count = cluster.getChildCount();
+        var size = count < 10 ? 'small' : count < 100 ? 'medium' : 'large';
+        return L.divIcon({{
+            html: '<div><span>' + count + '</span></div>',
+            className: 'marker-cluster marker-cluster-' + size,
+            iconSize: L.point(40, 40)
+        }});
+    }}
+}});
 L.geoJSON({dtp_geojson}, {{
     pointToLayer: function(feature, latlng) {{
         return L.circleMarker(latlng, {{
@@ -2095,8 +2232,8 @@ L.geoJSON({dtp_geojson}, {{
     onEachFeature: function(feature, layer) {{
         layer.bindPopup(feature.properties.popup, {{maxWidth: 320}});
     }}
-}}).addTo(curDtpLayer);
-curDtpLayer.addTo(map);
+}}).addTo(curDtpCluster);
+curDtpCluster.addTo(map);
 
 // --- ДТП прошлого периода ---
 var prevDtpLayer = L.layerGroup();
@@ -2114,25 +2251,38 @@ if ({str(has_prev).lower()}) {{
     }}).addTo(prevDtpLayer);
 }}
 
-// --- Камеры ---
-var cameraLayer = L.layerGroup();
+// --- Камеры (кластеризация) ---
 var cameraIcon = L.divIcon({{
     html: '<div style="font-size:18px;text-align:center;line-height:1;">📷</div>',
     iconSize: [24, 24], iconAnchor: [12, 12], className: ''
+}});
+var cameraCluster = L.markerClusterGroup({{
+    maxClusterRadius: 40,
+    spiderfyOnMaxZoom: true,
+    showCoverageOnHover: false,
+    iconCreateFunction: function(cluster) {{
+        var count = cluster.getChildCount();
+        return L.divIcon({{
+            html: '<div class="camera-cluster-icon"><span>' + count + '</span></div>',
+            className: '',
+            iconSize: L.point(36, 36)
+        }});
+    }}
 }});
 var cameraData = {camera_markers_js};
 cameraData.forEach(function(c) {{
     L.marker([c.lat, c.lon], {{icon: cameraIcon}})
      .bindPopup(c.popup + '<br>Расстояние: ' + c.distance_m + ' м', {{maxWidth: 320}})
-     .addTo(cameraLayer);
+     .addTo(cameraCluster);
 }});
+cameraCluster.addTo(map);
 
 // --- Слои ---
 var overlays = {{
-    "ДТП (текущий период)": curDtpLayer
+    "ДТП (текущий период)": curDtpCluster
 }};
 if ({str(has_prev).lower()}) overlays["ДТП (прошлый период)"] = prevDtpLayer;
-if ({str(has_cameras).lower()}) overlays["Камеры"] = cameraLayer;
+if ({str(has_cameras).lower()}) overlays["Камеры"] = cameraCluster;
 
 L.control.layers({{}}, overlays, {{collapsed: false}}).addTo(map);
 
