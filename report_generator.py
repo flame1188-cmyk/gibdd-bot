@@ -1145,8 +1145,9 @@ function renderDtp(data) {{
         }},
         onEachFeature: function(feature, layer) {{
             layer.bindPopup(feature.properties.popup, {{maxWidth: 320}});
+            dtpCluster.addLayer(layer);
         }}
-    }}).addTo(dtpCluster);
+    }});
 }}
 
 // Первичная отрисовка всех ДТП
@@ -2231,8 +2232,9 @@ L.geoJSON({dtp_geojson}, {{
     }},
     onEachFeature: function(feature, layer) {{
         layer.bindPopup(feature.properties.popup, {{maxWidth: 320}});
+        curDtpCluster.addLayer(layer);
     }}
-}}).addTo(curDtpCluster);
+}});
 curDtpCluster.addTo(map);
 
 // --- ДТП прошлого периода ---
