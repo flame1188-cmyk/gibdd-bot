@@ -1127,13 +1127,8 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 # 2) Очищаем user_data (карточки, полигоны, очаги, etc.)
                 _clear_analytics_data(context.user_data)
 
-                # 3) Принудительный сбор мусора
-                _freed = gc.collect()
-                _mem_after = _log_memory("Смена данных: ПАМЯТЬ ПОСЛЕ очистки")
-                logger.info(
-                    f"Смена данных: gc.collect() собрал {_freed} объектов, "
-                    f"RSS ~{_mem_before}->{_mem_after} MB"
-                )
+                # 3) Логируем память после очистки
+                _log_memory("Смена данных: ПАМЯТЬ ПОСЛЕ очистки")
                 regions = _get_regions(context)
                 keyboard = build_region_keyboard(regions, page=0)
                 await _safe_edit(query, "Выберите регион:",
@@ -1354,16 +1349,12 @@ async def _start_fetching(
 
         # Освобождаем байты файлов (уже отправлены)
         del file1_bytes, file2_bytes
-        gc.collect()
 
         # Предлагаем провести анализ
         await _offer_analysis(context, chat_id, reg_name, reg_code, period, all_cards)
 
-        # Для крупных регионов: all_cards не сохранён в user_data (только в data_cache),
-        # поэтому удаляем локальную ссылку чтобы освободить память
-        if len(all_cards) > 6500:
-            del all_cards
-            gc.collect()
+        # all_cards уже сохранены в data_cache и user_data["analytics_cards"],
+        # локальная ссылка выйдет из области видимости сама
 
     except Exception as e:
         logger.exception(f"Ошибка генерации/отправки файлов: {e}")

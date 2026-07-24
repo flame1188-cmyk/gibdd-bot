@@ -288,16 +288,12 @@ def generate_both_files(
     logger.info(f"Excel: Файл 1 готов ({len(file1_bytes)} байт, {t1 - t_start:.1f}с)")
     # Освобождаем память: удаляем промежуточные данные Файла 1
     del file1_data
-    gc.collect()
-    t_gc1 = time.monotonic()
-    logger.info(f"Excel: gc.collect после Файла 1 ({t_gc1 - t1:.1f}с)")
     file2_bytes = generate_file2(file2_data)
     t2 = time.monotonic()
-    logger.info(f"Excel: Файл 2 готов ({len(file2_bytes)} байт, {t2 - t_gc1:.1f}с)")
+    logger.info(f"Excel: Файл 2 готов ({len(file2_bytes)} байт, {t2 - t1:.1f}с)")
     del file2_data
-    gc.collect()
     t_end = time.monotonic()
-    logger.info(f"Excel: оба файла готовы ({t_end - t_start:.1f}с всего, gc={t_gc1 - t1:.1f}с + {t_end - t2:.1f}с)")
+    logger.info(f"Excel: оба файла готовы ({t_end - t_start:.1f}с всего)")
     return file1_bytes, file2_bytes
 
 

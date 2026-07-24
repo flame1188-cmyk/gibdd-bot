@@ -112,7 +112,7 @@ CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
 CACHE_TTL_SECONDS = 24 * 60 * 60  # 24 часа
 
 # In-memory LRU-кэш распарсенных полигонов (избегает повторного парсинга JSON)
-MEMORY_CACHE_MAX = 2  # максимум записей
+MEMORY_CACHE_MAX = 4  # максимум записей (2 bbox × текущий+прошлый год)
 _memory_cache: OrderedDict[str, tuple[float, list]] = OrderedDict()  # bbox → (timestamp, polygons)
 
 # Параметры bbox
@@ -898,7 +898,6 @@ async def fetch_settlement_boundaries(
             del elements
             del tile_polys
             del tile_ids
-            gc.collect()
 
         if progress_callback:
             await progress_callback(
@@ -1261,7 +1260,6 @@ def classify_cards(
                     non_settlement_cards.append(card)
             # Освобождаем дерево
             del tree
-            gc.collect()
         except Exception as e:
             logger.warning(
                 f"STRtree не удалось: {e}, падаем на поцикличную проверку"
@@ -1317,7 +1315,6 @@ def classify_cards(
         # Освобождаем merged/prepared
         del merged
         del prepared
-        gc.collect()
 
     logger.info(
         f"Классификация: {len(settlement_cards)} в НП, "
