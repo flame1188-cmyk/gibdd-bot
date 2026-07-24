@@ -9,6 +9,7 @@
 import gc
 import io
 import logging
+import time
 from typing import Any
 
 from openpyxl import Workbook
@@ -281,14 +282,22 @@ def generate_both_files(
         (file1_bytes, file2_bytes)
     """
     logger.info(f"Генерация Excel: Файл 1 — {len(file1_data)} ДТП, Файл 2 — {len(file2_data)} участников")
+    t_start = time.monotonic()
     file1_bytes = generate_file1(file1_data)
+    t1 = time.monotonic()
+    logger.info(f"Excel: Файл 1 готов ({len(file1_bytes)} байт, {t1 - t_start:.1f}с)")
     # Освобождаем память: удаляем промежуточные данные Файла 1
     del file1_data
     gc.collect()
+    t_gc1 = time.monotonic()
+    logger.info(f"Excel: gc.collect после Файла 1 ({t_gc1 - t1:.1f}с)")
     file2_bytes = generate_file2(file2_data)
+    t2 = time.monotonic()
+    logger.info(f"Excel: Файл 2 готов ({len(file2_bytes)} байт, {t2 - t_gc1:.1f}с)")
     del file2_data
     gc.collect()
-    logger.info(f"Файл 1: {len(file1_bytes)} байт, Файл 2: {len(file2_bytes)} байт")
+    t_end = time.monotonic()
+    logger.info(f"Excel: оба файла готовы ({t_end - t_start:.1f}с всего, gc={t_gc1 - t1:.1f}с + {t_end - t2:.1f}с)")
     return file1_bytes, file2_bytes
 
 
