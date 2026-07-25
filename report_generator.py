@@ -1,8 +1,9 @@
 """
-Генератор самодостаточных HTML-отчётов с картами и графиками.
+Генератор HTML-отчётов с картами и графиками.
 
-Каждый отчёт — один .html файл без внешних зависимостей.
-Библиотеки (Leaflet, ECharts) встраиваются в файл.
+Библиотеки (Leaflet, ECharts, MarkerCluster, Measure) подключаются
+через CDN-ссылки, что существенно уменьшает размер HTML-файла и
+обеспечивает совместимость с мобильными устройствами (iOS Safari).
 
 Типы отчётов:
   - dtp_map:       Карта всех ДТП с попапами (опционально + камеры)
@@ -34,8 +35,8 @@ _LIB_URLS = {
     "leaflet.markercluster.css": "https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css",
     "leaflet.markercluster.default.css": "https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css",
     "leaflet.markercluster.js": "https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js",
-    "leaflet.measure.css": "https://unpkg.com/leaflet-measure@3.1.0/dist/leaflet.measure.css",
-    "leaflet.measure.js": "https://unpkg.com/leaflet-measure@3.1.0/dist/leaflet.measure.js",
+    "leaflet.measure.css": "https://unpkg.com/leaflet-measure@3.1.0/dist/leaflet-measure.css",
+    "leaflet.measure.js": "https://unpkg.com/leaflet-measure@3.1.0/dist/leaflet-measure.js",
     "echarts.min.js": "https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js",
 }
 
@@ -352,8 +353,8 @@ class ReportGenerator:
             head_parts.append('<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">')
             head_parts.append('<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>')
             # Measure
-            head_parts.append('<link rel="stylesheet" href="https://unpkg.com/leaflet-measure@3.1.0/dist/leaflet.measure.css">')
-            head_parts.append('<script src="https://unpkg.com/leaflet-measure@3.1.0/dist/leaflet.measure.js"></script>')
+            head_parts.append('<link rel="stylesheet" href="https://unpkg.com/leaflet-measure@3.1.0/dist/leaflet-measure.css">')
+            head_parts.append('<script src="https://unpkg.com/leaflet-measure@3.1.0/dist/leaflet-measure.js"></script>')
 
         if use_echarts:
             head_parts.append('<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>')
@@ -382,6 +383,17 @@ class ReportGenerator:
   </header>
   {body_content}
 </div>
+<script>
+// Диагностика: проверяем загрузку библиотек
+window.addEventListener('load', function() {{
+    if (typeof L === 'undefined') {{
+        var el = document.createElement('div');
+        el.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#d32f2f;color:#fff;padding:12px 16px;z-index:99999;font-size:14px;text-align:center;';
+        el.textContent = 'Ошибка: библиотека Leaflet не загружена. Откройте файл через Safari с интернет-соединением.';
+        document.body.appendChild(el);
+    }}
+}});
+</script>
 </body>
 </html>"""
 
