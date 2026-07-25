@@ -34,8 +34,8 @@ _LIB_URLS = {
     "leaflet.markercluster.css": "https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css",
     "leaflet.markercluster.default.css": "https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css",
     "leaflet.markercluster.js": "https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js",
-    "leaflet.measure.css": "https://unpkg.com/leaflet-measure@3.1.0/leaflet.measure.css",
-    "leaflet.measure.js": "https://unpkg.com/leaflet-measure@3.1.0/leaflet.measure.js",
+    "leaflet.measure.css": "https://unpkg.com/leaflet-measure@3.1.0/dist/leaflet.measure.css",
+    "leaflet.measure.js": "https://unpkg.com/leaflet-measure@3.1.0/dist/leaflet.measure.js",
     "echarts.min.js": "https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js",
 }
 
@@ -334,37 +334,29 @@ class ReportGenerator:
         use_echarts: bool = False,
         custom_css: str = "",
     ) -> str:
-        """Оборачивает содержимое в полный HTML-документ."""
-        libs = self._libs_loaded()
+        """Оборачивает содержимое в полный HTML-документ.
+
+        Библиотеки подключаются через CDN-ссылки, а не инлайн,
+        чтобы уменьшить размер файла и обеспечить совместимость
+        с мобильными устройствами (iOS Safari не справляется с
+        большими inline-документами).
+        """
 
         head_parts = []
 
         if use_map:
-            leaflet_css = libs.get("leaflet.css", "")
-            head_parts.append(f"<style>{leaflet_css}</style>")
-            leaflet_js = libs.get("leaflet.js", "")
-            head_parts.append(f"<script>{leaflet_js}</script>")
+            head_parts.append('<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">')
+            head_parts.append('<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>')
             # MarkerCluster
-            mc_css = libs.get("leaflet.markercluster.css", "")
-            if mc_css:
-                head_parts.append(f"<style>{mc_css}</style>")
-            mc_def_css = libs.get("leaflet.markercluster.default.css", "")
-            if mc_def_css:
-                head_parts.append(f"<style>{mc_def_css}</style>")
-            mc_js = libs.get("leaflet.markercluster.js", "")
-            if mc_js:
-                head_parts.append(f"<script>{mc_js}</script>")
+            head_parts.append('<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">')
+            head_parts.append('<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">')
+            head_parts.append('<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>')
             # Measure
-            ms_css = libs.get("leaflet.measure.css", "")
-            if ms_css:
-                head_parts.append(f"<style>{ms_css}</style>")
-            ms_js = libs.get("leaflet.measure.js", "")
-            if ms_js:
-                head_parts.append(f"<script>{ms_js}</script>")
+            head_parts.append('<link rel="stylesheet" href="https://unpkg.com/leaflet-measure@3.1.0/dist/leaflet.measure.css">')
+            head_parts.append('<script src="https://unpkg.com/leaflet-measure@3.1.0/dist/leaflet.measure.js"></script>')
 
         if use_echarts:
-            echarts_js = libs.get("echarts.min.js", "")
-            head_parts.append(f"<script>{echarts_js}</script>")
+            head_parts.append('<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>')
 
         now = datetime.now().strftime("%d.%m.%Y %H:%M")
         title = f"ДТП — {self.region_name} — {self.period_label}"
