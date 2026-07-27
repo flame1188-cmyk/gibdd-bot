@@ -118,6 +118,13 @@ def _parse_xml_cards(xml_bytes: bytes) -> list[dict[str, Any]]:
               <m_ts>Fusion</m_ts>
               <ts_uch>...</ts_uch>
             </ts_info>
+            <uchInfo>
+              <k_UCH>Пешеход</k_UCH>
+              <POL>Мужской</POL>
+              <s_T>Раненый</s_T>
+              <NPDD>Нарушение ПДД</NPDD>
+              ...
+            </uchInfo>
           </infoDtp>
           <KTS>1</KTS>
           <KUCH>2</KUCH>
@@ -240,6 +247,35 @@ def _parse_xml_cards(xml_bytes: bytes) -> list[dict[str, Any]]:
             ts_list.append(ts)
 
         card["ts_info"] = ts_list
+
+        # --- uch_info (участники без ТС: пешеходы и др.) ---
+        uch_info_list = []
+        for uch_el in info.findall("uchInfo"):
+            npdd_vals = []
+            sop_npdd_vals = []
+            for npdd_el in uch_el.findall("NPDD"):
+                t = (npdd_el.text or "").strip()
+                if t:
+                    npdd_vals.append(t)
+            for sop_el in uch_el.findall("SOP_NPDD"):
+                t = (sop_el.text or "").strip()
+                if t:
+                    sop_npdd_vals.append(t)
+
+            uch: dict[str, Any] = {
+                "n_uch": _text(uch_el, "n_UCH"),
+                "kt_uch": _text(uch_el, "k_UCH"),
+                "npdd": npdd_vals if npdd_vals else [],
+                "sop_npdd": sop_npdd_vals if sop_npdd_vals else [],
+                "s_sm": _text(uch_el, "s_SM"),
+                "pol": _text(uch_el, "POL"),
+                "s_t": _text(uch_el, "s_T"),
+                "alco": _text(uch_el, "ALCO"),
+                "v_st": _text(uch_el, "v_ST"),
+            }
+            uch_info_list.append(uch)
+        card["uch_info"] = uch_info_list
+
         cards.append(card)
 
     return cards

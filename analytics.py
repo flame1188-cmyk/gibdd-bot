@@ -95,43 +95,27 @@ def _has_alcohol(card: dict) -> bool:
 
 
 def _has_pedestrian(card: dict) -> bool:
-    """Проверяет, есть ли в ДТП пешеход."""
+    """Проверяет, есть ли в ДТП пешеход.
+
+    Два способа:
+    1. По полю uch_info — категория участника «пешеход».
+       Это основной источник (API ГИБДД и web_fallback).
+    2. Fallback по dtpv (вид ДТП) — для карточек, где uch_info
+       отсутствует или не содержит пешехода.
+    """
+    # Способ 1: по участникам без ТС
     uch_list = card.get("uch_info", []) or []
     for uch in uch_list:
         kt = str(uch.get("kt_uch", "")).lower()
         if kt == "пешеход":
             return True
+
+    # Способ 2: fallback по виду ДТП
+    dtpv = str(card.get("dtpv", "")).lower()
+    if "пешеход" in dtpv or "сим" in dtpv:
+        return True
+
     return False
-
-
-CAMERA_FACTOR_KEYWORD = "камерами автоматической фотовидеофиксации"
-
-
-def _has_camera_factor(card: dict) -> bool:
-    """Проверяет, находится ли участок ДТП под контролем камер фотовидеофиксации."""
-    dor_usl = card.get("dor_usl", {}) or {}
-    factor_list = dor_usl.get("factor", []) or []
-    if isinstance(factor_list, list):
-        for f in factor_list:
-            if CAMERA_FACTOR_KEYWORD in str(f).lower():
-                return True
-    return False
-
-
-def _get_camera_status(card: dict) -> str:
-    """
-    Возвращает статус фотовидеофиксации участка.
-    'camera' — камера есть, 'no_camera' — фактор указан без камеры,
-    'unknown' — фактор не указан.
-    """
-    dor_usl = card.get("dor_usl", {}) or {}
-    factor_list = dor_usl.get("factor", []) or []
-    if not isinstance(factor_list, list) or not factor_list:
-        return "unknown"
-    for f in factor_list:
-        if CAMERA_FACTOR_KEYWORD in str(f).lower():
-            return "camera"
-    return "no_camera"
 
 
 def calculate_metrics(cards: list[dict[str, Any]]) -> dict[str, Any]:
@@ -147,18 +131,10 @@ def calculate_metrics(cards: list[dict[str, Any]]) -> dict[str, Any]:
           - pedestrians: ДТП с пешеходами
           - deaths_per_100: погибших на 100 ДТП
           - injured_per_100: раненых на 100 ДТП
-          - by_weekday: {0: count, ...} — ДТП по дням
-          - deaths_by_weekday: {0: count, ...} — погибшие по дням
-          - by_hour: {0: count, ...} — ДТП по часам
-          - deaths_by_hour: {0: count, ...} — погибшие по часам
-          - by_type: {вид: count, ...} — ДТП по видам
-          - deaths_by_type: {вид: count, ...} — погибшие по видам
+          - by_weekday: {0: count, 1: count, ...}
+          - by_hour: {0: count, 1: count, ...}
+          - by_type: {вид_ДТП: count, ...}
           - by_weather: {погода: count, ...}
-          - by_road_z: {значение: count, ...} — ДТП по значению дороги
-          - by_road_z_deaths: {значение: count, ...} — погибшие по значению дороги
-          - camera: {camera_dtp, camera_deaths, camera_injured,
-                    no_camera_dtp, no_camera_deaths, no_camera_injured,
-                    unknown_factor_dtp}
     """
     total = len(cards)
     deaths = 0
@@ -171,31 +147,10 @@ def calculate_metrics(cards: list[dict[str, Any]]) -> dict[str, Any]:
     type_counter = Counter()
     weather_counter = Counter()
 
-    # Счётчики погибших по разрезам
-    weekday_deaths = Counter()
-    hour_deaths = Counter()
-    type_deaths = Counter()
-
-    # Значение дороги
-    road_z_counter = Counter()
-    road_z_deaths = Counter()
-
-    # Фотовидеофиксация
-    camera_dtp = 0
-    camera_deaths = 0
-    camera_injured = 0
-    no_camera_dtp = 0
-    no_camera_deaths = 0
-    no_camera_injured = 0
-    unknown_factor_dtp = 0
-
     for card in cards:
-        card_deaths = _safe_int(card.get("pog"))
-        card_injured = _safe_int(card.get("ran"))
-
         # Погибшие и раненые
-        deaths += card_deaths
-        injured += card_injured
+        deaths += _safe_int(card.get("pog"))
+        injured += _safe_int(card.get("ran"))
 
         # Нетрезвые водители
         if _has_alcohol(card):
@@ -205,23 +160,20 @@ def calculate_metrics(cards: list[dict[str, Any]]) -> dict[str, Any]:
         if _has_pedestrian(card):
             pedestrian_count += 1
 
-        # День недели (+ погибшие)
+        # День недели
         wd = _get_weekday(str(card.get("date_dtp", "")))
         if wd is not None:
             weekday_counter[wd] += 1
-            weekday_deaths[wd] += card_deaths
 
-        # Час (+ погибшие)
+        # Час
         hour = _get_hour(str(card.get("time", "")))
         if hour is not None:
             hour_counter[hour] += 1
-            hour_deaths[hour] += card_deaths
 
-        # Вид ДТП (+ погибшие)
+        # Вид ДТП
         dtp_type = str(card.get("dtpv", "")).strip()
         if dtp_type:
             type_counter[dtp_type] += 1
-            type_deaths[dtp_type] += card_deaths
 
         # Погодные условия
         dor_usl = card.get("dor_usl", {}) or {}
@@ -231,25 +183,6 @@ def calculate_metrics(cards: list[dict[str, Any]]) -> dict[str, Any]:
                 w_str = str(w).strip()
                 if w_str:
                     weather_counter[w_str] += 1
-
-        # Значение дороги (+ погибшие)
-        dor_z = str(card.get("dor_z", "")).strip()
-        if dor_z:
-            road_z_counter[dor_z] += 1
-            road_z_deaths[dor_z] += card_deaths
-
-        # Фотовидеофиксация
-        cam_status = _get_camera_status(card)
-        if cam_status == "camera":
-            camera_dtp += 1
-            camera_deaths += card_deaths
-            camera_injured += card_injured
-        elif cam_status == "no_camera":
-            no_camera_dtp += 1
-            no_camera_deaths += card_deaths
-            no_camera_injured += card_injured
-        else:
-            unknown_factor_dtp += 1
 
     deaths_per_100 = round(deaths / total * 100, 1) if total > 0 else 0
     injured_per_100 = round(injured / total * 100, 1) if total > 0 else 0
@@ -263,23 +196,9 @@ def calculate_metrics(cards: list[dict[str, Any]]) -> dict[str, Any]:
         "deaths_per_100": deaths_per_100,
         "injured_per_100": injured_per_100,
         "by_weekday": dict(weekday_counter),
-        "deaths_by_weekday": dict(weekday_deaths),
         "by_hour": dict(hour_counter),
-        "deaths_by_hour": dict(hour_deaths),
         "by_type": dict(type_counter),
-        "deaths_by_type": dict(type_deaths),
         "by_weather": dict(weather_counter),
-        "by_road_z": dict(road_z_counter),
-        "by_road_z_deaths": dict(road_z_deaths),
-        "camera": {
-            "camera_dtp": camera_dtp,
-            "camera_deaths": camera_deaths,
-            "camera_injured": camera_injured,
-            "no_camera_dtp": no_camera_dtp,
-            "no_camera_deaths": no_camera_deaths,
-            "no_camera_injured": no_camera_injured,
-            "unknown_factor_dtp": unknown_factor_dtp,
-        },
     }
 
 
@@ -349,41 +268,17 @@ def compare_metrics(
         "current": current["by_weekday"],
         "previous": previous["by_weekday"],
     }
-    result["deaths_by_weekday"] = {
-        "current": current["deaths_by_weekday"],
-        "previous": previous["deaths_by_weekday"],
-    }
     result["by_hour"] = {
         "current": current["by_hour"],
         "previous": previous["by_hour"],
-    }
-    result["deaths_by_hour"] = {
-        "current": current["deaths_by_hour"],
-        "previous": previous["deaths_by_hour"],
     }
     result["by_type"] = {
         "current": current["by_type"],
         "previous": previous["by_type"],
     }
-    result["deaths_by_type"] = {
-        "current": current["deaths_by_type"],
-        "previous": previous["deaths_by_type"],
-    }
     result["by_weather"] = {
         "current": current["by_weather"],
         "previous": previous["by_weather"],
-    }
-    result["by_road_z"] = {
-        "current": current["by_road_z"],
-        "previous": previous["by_road_z"],
-    }
-    result["by_road_z_deaths"] = {
-        "current": current["by_road_z_deaths"],
-        "previous": previous["by_road_z_deaths"],
-    }
-    result["camera"] = {
-        "current": current["camera"],
-        "previous": previous["camera"],
     }
 
     return result
@@ -397,20 +292,6 @@ def format_change(value: float) -> str:
         return f"{value}% \u2193"
     else:
         return "0% \u2194"
-
-
-def _format_pct_arrow(new: int, old: int) -> str:
-    """Формирует строку '(+12%\u2191)' для изменения текущего vs предыдущего.
-    Возвращает пустую строку, если предыдущее значение 0."""
-    if old <= 0:
-        return ""
-    change = round((new - old) / old * 100, 0)
-    if change > 0:
-        return f" ({change:+.0f}%\u2191)"
-    elif change < 0:
-        return f" ({change:+.0f}%\u2193)"
-    else:
-        return " (=)"
 
 
 def build_analytics_message(
@@ -470,8 +351,6 @@ def build_analytics_message(
     lines.append("")
     cur_wd = comparison["by_weekday"]["current"]
     prev_wd = comparison["by_weekday"]["previous"]
-    cur_wd_deaths = comparison["deaths_by_weekday"]["current"]
-    prev_wd_deaths = comparison["deaths_by_weekday"]["previous"]
 
     if cur_wd:
         sorted_days = sorted(cur_wd.items(), key=lambda x: x[1], reverse=True)
@@ -484,19 +363,17 @@ def build_analytics_message(
 
         lines.append(f"Пиковый день: <b>{DAY_NAMES.get(peak_day_num, '')}</b> ({peak_day_count} ДТП, {pct_of_avg}% от среднего)")
 
-        # Таблица по дням (ДТП + погибшие с %)
+        # Таблица по дням
         for day_num in range(7):
             day_name = DAY_SHORT[day_num]
             cur = cur_wd.get(day_num, 0)
             prv = prev_wd.get(day_num, 0)
-            cur_d = cur_wd_deaths.get(day_num, 0)
-            prv_d = prev_wd_deaths.get(day_num, 0)
-            dtp_pct = _format_pct_arrow(cur, prv)
-            deaths_pct = _format_pct_arrow(cur_d, prv_d) if cur_d > 0 else ""
-            parts = f"{cur} ДТП{dtp_pct}"
-            if cur_d > 0:
-                parts += f" / {cur_d} погиб.{deaths_pct}"
-            lines.append(f"  {day_name}: {parts}")
+            if prv > 0:
+                change = round((cur - prv) / prv * 100, 1)
+                arrow = "\u2191" if change > 0 else ("\u2193" if change < 0 else "\u2194")
+                lines.append(f"  {day_name}: {cur} ({change:+.0f}%{arrow})")
+            else:
+                lines.append(f"  {day_name}: {cur}")
     else:
         lines.append("Нет данных для анализа по дням недели")
 
@@ -508,8 +385,6 @@ def build_analytics_message(
 
     cur_hour = comparison["by_hour"]["current"]
     prev_hour = comparison["by_hour"]["previous"]
-    cur_hour_deaths = comparison["deaths_by_hour"]["current"]
-    prev_hour_deaths = comparison["deaths_by_hour"]["previous"]
 
     if cur_hour:
         # Группируем по 3-часовым интервалам
@@ -521,56 +396,20 @@ def build_analytics_message(
             intervals.setdefault(interval_key, 0)
             intervals[interval_key] += cur_hour.get(h, 0)
 
-        # Группируем погибшие по интервалам
-        intervals_deaths = {}
-        for h in range(24):
-            interval_start = (h // 3) * 3
-            interval_end = interval_start + 2
-            interval_key = f"{interval_start:02d}-{interval_end:02d}"
-            intervals_deaths.setdefault(interval_key, 0)
-            intervals_deaths[interval_key] += cur_hour_deaths.get(h, 0)
-
         sorted_intervals = sorted(intervals.items(), key=lambda x: x[1], reverse=True)
         peak_interval, peak_count = sorted_intervals[0]
-        peak_deaths = intervals_deaths.get(peak_interval, 0)
 
         total_current = sum(cur_hour.values())
         avg_per_interval = total_current / 8 if total_current > 0 else 0
         pct_of_avg = round(peak_count / avg_per_interval * 100, 0) if avg_per_interval > 0 else 0
 
-        peak_deaths_str = f", {peak_deaths} погиб." if peak_deaths > 0 else ""
-        lines.append(f"Пиковый интервал: <b>{peak_interval}</b> ({peak_count} ДТП{peak_deaths_str}, {pct_of_avg}% от среднего)")
+        lines.append(f"Пиковый интервал: <b>{peak_interval}</b> ({peak_count} ДТП, {pct_of_avg}% от среднего)")
 
-        # Предыдущие интервалы ДТП и погибших для расчёта %
-        prev_intervals = {}
-        for h in range(24):
-            interval_start = (h // 3) * 3
-            interval_end = interval_start + 2
-            interval_key = f"{interval_start:02d}-{interval_end:02d}"
-            prev_intervals.setdefault(interval_key, 0)
-            prev_intervals[interval_key] += prev_hour.get(h, 0)
-
-        prev_intervals_deaths = {}
-        for h in range(24):
-            interval_start = (h // 3) * 3
-            interval_end = interval_start + 2
-            interval_key = f"{interval_start:02d}-{interval_end:02d}"
-            prev_intervals_deaths.setdefault(interval_key, 0)
-            prev_intervals_deaths[interval_key] += prev_hour_deaths.get(h, 0)
-
-        # Таблица по интервалам (ДТП + погибшие с %)
-        for interval_start in range(0, 24, 3):
-            interval_key = f"{interval_start:02d}-{interval_start + 2:02d}"
-            cur = intervals.get(interval_key, 0)
-            prv = prev_intervals.get(interval_key, 0)
-            cur_d = intervals_deaths.get(interval_key, 0)
-            prv_d = prev_intervals_deaths.get(interval_key, 0)
-            dtp_pct = _format_pct_arrow(cur, prv)
-            deaths_pct = _format_pct_arrow(cur_d, prv_d) if cur_d > 0 else ""
-            parts = f"{cur} ДТП{dtp_pct}"
-            if cur_d > 0:
-                parts += f" / {cur_d} погиб.{deaths_pct}"
-            lines.append(f"  {interval_key}: {parts}")
+        # Топ-3 опасных часа
+        sorted_hours = sorted(cur_hour.items(), key=lambda x: x[1], reverse=True)
+        top_hours = sorted_hours[:3]
+        hours_str = ", ".join(f"{h:02d}:00 ({c})" for h, c in top_hours)
+        lines.append(f"Топ-3 часа: {hours_str}")
     else:
         lines.append("Нет данных для анализа по часам")
 
@@ -582,91 +421,19 @@ def build_analytics_message(
 
     cur_type = comparison["by_type"]["current"]
     prev_type = comparison["by_type"]["previous"]
-    cur_type_deaths = comparison["deaths_by_type"]["current"]
-    prev_type_deaths = comparison["deaths_by_type"]["previous"]
 
     if cur_type:
         sorted_types = sorted(cur_type.items(), key=lambda x: x[1], reverse=True)
         for tp_name, tp_count in sorted_types[:7]:
             prv = prev_type.get(tp_name, 0)
-            cur_d = cur_type_deaths.get(tp_name, 0)
-            prv_d = prev_type_deaths.get(tp_name, 0)
-            dtp_pct = _format_pct_arrow(tp_count, prv)
-            deaths_pct = _format_pct_arrow(cur_d, prv_d) if cur_d > 0 else ""
-            parts = f"{tp_count} ДТП{dtp_pct}"
-            if cur_d > 0:
-                parts += f" / {cur_d} погиб.{deaths_pct}"
-            lines.append(f"  {tp_name}: {parts}")
+            if prv > 0:
+                change = round((tp_count - prv) / prv * 100, 1)
+                arrow = "\u2191" if change > 0 else ("\u2193" if change < 0 else "\u2194")
+                lines.append(f"  {tp_name}: {tp_count} ({change:+.0f}%{arrow})")
+            else:
+                lines.append(f"  {tp_name}: {tp_count}")
     else:
         lines.append("Нет данных для анализа по видам ДТП")
-
-    lines.append("")
-
-    # Значение дороги
-    lines.append("<b>\u2500\u2500\u2500 По значению дороги \u2500\u2500\u2500</b>")
-    lines.append("")
-
-    cur_rz = comparison["by_road_z"]["current"]
-    prev_rz = comparison["by_road_z"]["previous"]
-    cur_rz_deaths = comparison["by_road_z_deaths"]["current"]
-    prev_rz_deaths = comparison["by_road_z_deaths"]["previous"]
-
-    if cur_rz:
-        sorted_rz = sorted(cur_rz.items(), key=lambda x: x[1], reverse=True)
-        for rz_name, rz_count in sorted_rz:
-            prv = prev_rz.get(rz_name, 0)
-            cur_d = cur_rz_deaths.get(rz_name, 0)
-            prv_d = prev_rz_deaths.get(rz_name, 0)
-            dtp_pct = _format_pct_arrow(rz_count, prv)
-            deaths_pct = _format_pct_arrow(cur_d, prv_d) if cur_d > 0 else ""
-            parts = f"{rz_count} ДТП{dtp_pct}"
-            if cur_d > 0:
-                parts += f" / {cur_d} погиб.{deaths_pct}"
-            lines.append(f"  {rz_name}: {parts}")
-    else:
-        lines.append("Нет данных о значении дороги")
-
-    lines.append("")
-
-    # Фотовидеофиксация
-    lines.append("<b>\u2500\u2500\u2500 Фотовидеофиксация участков \u2500\u2500\u2500</b>")
-    lines.append("")
-
-    cur_cam = comparison["camera"]["current"]
-    prev_cam = comparison["camera"]["previous"]
-
-    cam_dtp = cur_cam["camera_dtp"]
-    cam_deaths = cur_cam["camera_deaths"]
-    cam_injured = cur_cam["camera_injured"]
-    no_cam_dtp = cur_cam["no_camera_dtp"]
-    no_cam_deaths = cur_cam["no_camera_deaths"]
-    no_cam_injured = cur_cam["no_camera_injured"]
-    unk_dtp = cur_cam["unknown_factor_dtp"]
-
-    known_dtp = cam_dtp + no_cam_dtp
-    camera_pct = round(cam_dtp / known_dtp * 100, 1) if known_dtp > 0 else 0
-
-    prev_cam_dtp = prev_cam["camera_dtp"]
-    prev_no_cam_dtp = prev_cam["no_camera_dtp"]
-    prev_known_dtp = prev_cam_dtp + prev_no_cam_dtp
-    prev_camera_pct = round(prev_cam_dtp / prev_known_dtp * 100, 1) if prev_known_dtp > 0 else 0
-
-    cam_dtp_pct = _format_pct_arrow(cam_dtp, prev_cam_dtp)
-    cam_deaths_pct = _format_pct_arrow(cam_deaths, prev_cam["camera_deaths"]) if cam_deaths > 0 else ""
-    no_cam_dtp_pct = _format_pct_arrow(no_cam_dtp, prev_no_cam_dtp)
-    no_cam_deaths_pct = _format_pct_arrow(no_cam_deaths, prev_cam["no_camera_deaths"]) if no_cam_deaths > 0 else ""
-
-    lines.append(f"С камерами фотовидеофиксации: {cam_dtp} ДТП{cam_dtp_pct}, {cam_deaths} погиб.{cam_deaths_pct}, {cam_injured} ранен.")
-    lines.append(f"Без камер (фактор указан): {no_cam_dtp} ДТП{no_cam_dtp_pct}, {no_cam_deaths} погиб.{no_cam_deaths_pct}, {no_cam_injured} ранен.")
-    if unk_dtp > 0:
-        prev_unk = prev_cam["unknown_factor_dtp"]
-        unk_pct = _format_pct_arrow(unk_dtp, prev_unk)
-        lines.append(f"Фактор не указан: {unk_dtp} ДТП{unk_pct}.")
-    lines.append(f"Доля ДТП с камерами (от участков с указанным фактором): <b>{camera_pct}%</b>")
-    if prev_known_dtp > 0:
-        diff_pct = round(camera_pct - prev_camera_pct, 1)
-        arrow = "\u2191" if diff_pct > 0 else ("\u2193" if diff_pct < 0 else "\u2194")
-        lines.append(f"  (прошлый период: {prev_camera_pct}%, {diff_pct:+.1f}%{arrow})")
 
     lines.append("")
 
@@ -763,7 +530,7 @@ def build_analytics_excel_data(
 
     # По дням недели
     rows.append({
-        "Показатель": "ПО ДНЯМ НЕДЕЛИ (ДТП)",
+        "Показатель": "ПО ДНЯМ НЕДЕЛИ",
         current_label: "",
         previous_label: "",
         "Изменение, %": "",
@@ -798,46 +565,9 @@ def build_analytics_excel_data(
         "Изменение, абс.": "",
     })
 
-    # Погибшие по дням недели
-    rows.append({
-        "Показатель": "ПОГИБШИЕ ПО ДНЯМ НЕДЕЛИ",
-        current_label: "",
-        previous_label: "",
-        "Изменение, %": "",
-        "Изменение, абс.": "",
-    })
-
-    cur_wd_deaths = comparison["deaths_by_weekday"]["current"]
-    prev_wd_deaths = comparison["deaths_by_weekday"]["previous"]
-
-    for day_num in range(7):
-        day_name = DAY_NAMES[day_num]
-        cur = cur_wd_deaths.get(day_num, 0)
-        prv = prev_wd_deaths.get(day_num, 0)
-        if prv > 0:
-            change = round((cur - prv) / prv * 100, 1)
-        else:
-            change = 0
-        rows.append({
-            "Показатель": day_name,
-            current_label: cur,
-            previous_label: prv,
-            "Изменение, %": change,
-            "Изменение, абс.": cur - prv,
-        })
-
-    # Пустая строка-разделитель
-    rows.append({
-        "Показатель": "",
-        current_label: "",
-        previous_label: "",
-        "Изменение, %": "",
-        "Изменение, абс.": "",
-    })
-
     # По часам суток (интервалы по 3 часа)
     rows.append({
-        "Показатель": "ПО ЧАСАМ СУТОК (интервалы 3 ч, ДТП)",
+        "Показатель": "ПО ЧАСАМ СУТОК (интервалы 3 ч)",
         current_label: "",
         previous_label: "",
         "Изменение, %": "",
@@ -874,48 +604,9 @@ def build_analytics_excel_data(
         "Изменение, абс.": "",
     })
 
-    # Погибшие по часам суток
-    rows.append({
-        "Показатель": "ПОГИБШИЕ ПО ЧАСАМ СУТОК (интервалы 3 ч)",
-        current_label: "",
-        previous_label: "",
-        "Изменение, %": "",
-        "Изменение, абс.": "",
-    })
-
-    cur_hour_deaths = comparison["deaths_by_hour"]["current"]
-    prev_hour_deaths = comparison["deaths_by_hour"]["previous"]
-
-    for interval_start in range(0, 24, 3):
-        interval_end = interval_start + 2
-        interval_label = f"{interval_start:02d}:00 - {interval_end:02d}:59"
-
-        cur = sum(cur_hour_deaths.get(h, 0) for h in range(interval_start, interval_start + 3))
-        prv = sum(prev_hour_deaths.get(h, 0) for h in range(interval_start, interval_start + 3))
-        if prv > 0:
-            change = round((cur - prv) / prv * 100, 1)
-        else:
-            change = 0
-        rows.append({
-            "Показатель": interval_label,
-            current_label: cur,
-            previous_label: prv,
-            "Изменение, %": change,
-            "Изменение, абс.": cur - prv,
-        })
-
-    # Пустая строка-разделитель
-    rows.append({
-        "Показатель": "",
-        current_label: "",
-        previous_label: "",
-        "Изменение, %": "",
-        "Изменение, абс.": "",
-    })
-
     # По видам ДТП
     rows.append({
-        "Показатель": "ПО ВИДАМ ДТП (ДТП)",
+        "Показатель": "ПО ВИДАМ ДТП",
         current_label: "",
         previous_label: "",
         "Изменение, %": "",
@@ -942,170 +633,6 @@ def build_analytics_excel_data(
             "Изменение, %": change,
             "Изменение, абс.": cur - prv,
         })
-
-    # Пустая строка-разделитель
-    rows.append({
-        "Показатель": "",
-        current_label: "",
-        previous_label: "",
-        "Изменение, %": "",
-        "Изменение, абс.": "",
-    })
-
-    # Погибшие по видам ДТП
-    rows.append({
-        "Показатель": "ПОГИБШИЕ ПО ВИДАМ ДТП",
-        current_label: "",
-        previous_label: "",
-        "Изменение, %": "",
-        "Изменение, абс.": "",
-    })
-
-    cur_type_deaths = comparison["deaths_by_type"]["current"]
-    prev_type_deaths = comparison["deaths_by_type"]["previous"]
-
-    all_death_types = sorted(set(list(cur_type_deaths.keys()) + list(prev_type_deaths.keys())))
-    sorted_death_types = sorted(all_death_types, key=lambda x: cur_type_deaths.get(x, 0) + prev_type_deaths.get(x, 0), reverse=True)
-
-    for tp_name in sorted_death_types:
-        cur = cur_type_deaths.get(tp_name, 0)
-        prv = prev_type_deaths.get(tp_name, 0)
-        if prv > 0:
-            change = round((cur - prv) / prv * 100, 1)
-        else:
-            change = 0
-        rows.append({
-            "Показатель": tp_name,
-            current_label: cur,
-            previous_label: prv,
-            "Изменение, %": change,
-            "Изменение, абс.": cur - prv,
-        })
-
-    # Пустая строка-разделитель
-    rows.append({
-        "Показатель": "",
-        current_label: "",
-        previous_label: "",
-        "Изменение, %": "",
-        "Изменение, абс.": "",
-    })
-
-    # По значению дороги
-    rows.append({
-        "Показатель": "ПО ЗНАЧЕНИЮ ДОРОГИ (ДТП / погибшие)",
-        current_label: "",
-        previous_label: "",
-        "Изменение, %": "",
-        "Изменение, абс.": "",
-    })
-
-    cur_rz = comparison["by_road_z"]["current"]
-    prev_rz = comparison["by_road_z"]["previous"]
-    cur_rz_deaths = comparison["by_road_z_deaths"]["current"]
-    prev_rz_deaths = comparison["by_road_z_deaths"]["previous"]
-
-    all_rz = sorted(set(list(cur_rz.keys()) + list(prev_rz.keys())))
-    sorted_rz = sorted(all_rz, key=lambda x: cur_rz.get(x, 0) + prev_rz.get(x, 0), reverse=True)
-
-    for rz_name in sorted_rz:
-        cur = cur_rz.get(rz_name, 0)
-        prv = prev_rz.get(rz_name, 0)
-        cur_d = cur_rz_deaths.get(rz_name, 0)
-        prv_d = prev_rz_deaths.get(rz_name, 0)
-        if prv > 0:
-            change = round((cur - prv) / prv * 100, 1)
-        else:
-            change = 0
-        rows.append({
-            "Показатель": f"{rz_name} (ДТП)",
-            current_label: cur,
-            previous_label: prv,
-            "Изменение, %": change,
-            "Изменение, абс.": cur - prv,
-        })
-        rows.append({
-            "Показатель": f"  {rz_name} (погибшие)",
-            current_label: cur_d,
-            previous_label: prv_d,
-            "Изменение, %": round((cur_d - prv_d) / prv_d * 100, 1) if prv_d > 0 else 0,
-            "Изменение, абс.": cur_d - prv_d,
-        })
-
-    # Пустая строка-разделитель
-    rows.append({
-        "Показатель": "",
-        current_label: "",
-        previous_label: "",
-        "Изменение, %": "",
-        "Изменение, абс.": "",
-    })
-
-    # Фотовидеофиксация
-    rows.append({
-        "Показатель": "ФОТОВИДЕОФИКСАЦИЯ УЧАСТКОВ",
-        current_label: "",
-        previous_label: "",
-        "Изменение, %": "",
-        "Изменение, абс.": "",
-    })
-
-    cur_cam = comparison["camera"]["current"]
-    prev_cam = comparison["camera"]["previous"]
-
-    camera_rows = [
-        ("С камерами (ДТП)", "camera_dtp", "no_camera_dtp"),
-        ("Без камер (ДТП)", "no_camera_dtp", "camera_dtp"),
-    ]
-    for row_label, key_cur, _ in camera_rows:
-        cur = cur_cam[key_cur]
-        prv = prev_cam[key_cur]
-        if prv > 0:
-            change = round((cur - prv) / prv * 100, 1)
-        else:
-            change = 0
-        rows.append({
-            "Показатель": row_label,
-            current_label: cur,
-            previous_label: prv,
-            "Изменение, %": change,
-            "Изменение, абс.": cur - prv,
-        })
-
-    # Погибшие/раненые по камерам
-    cam_stats = [
-        ("С камерами (погибшие)", "camera_deaths"),
-        ("С камерами (раненые)", "camera_injured"),
-        ("Без камер (погибшие)", "no_camera_deaths"),
-        ("Без камер (раненые)", "no_camera_injured"),
-    ]
-    for row_label, key in cam_stats:
-        cur = cur_cam[key]
-        prv = prev_cam[key]
-        if prv > 0:
-            change = round((cur - prv) / prv * 100, 1)
-        else:
-            change = 0
-        rows.append({
-            "Показатель": row_label,
-            current_label: cur,
-            previous_label: prv,
-            "Изменение, %": change,
-            "Изменение, абс.": cur - prv,
-        })
-
-    # Доля ДТП с камерами
-    cur_known = cur_cam["camera_dtp"] + cur_cam["no_camera_dtp"]
-    prev_known = prev_cam["camera_dtp"] + prev_cam["no_camera_dtp"]
-    cur_pct = round(cur_cam["camera_dtp"] / cur_known * 100, 1) if cur_known > 0 else 0
-    prev_pct = round(prev_cam["camera_dtp"] / prev_known * 100, 1) if prev_known > 0 else 0
-    rows.append({
-        "Показатель": "Доля ДТП с камерами, %",
-        current_label: cur_pct,
-        previous_label: prev_pct,
-        "Изменение, %": round(cur_pct - prev_pct, 1),
-        "Изменение, абс.": round(cur_pct - prev_pct, 1),
-    })
 
     # Пустая строка-разделитель
     rows.append({
@@ -1223,14 +750,10 @@ def extract_raw_supplement(
       - Нарушения ПДД (статистика, топ-15)
       - Состояние дороги (статистика)
       - Районы/населённые пункты (топ-15)
-      - Значение дороги (федеральная/региональная/местного значения)
-        с разбивкой по ДТП и погибшим
-      - Динамика погибших по дням недели, часам, видам ДТП
-      - Фотовидеофиксация: сравнение ДТП/погибших/раненых
-        на участках с камерами vs без
       - Детали смертельных ДТП
       - Детали ДТП с нетрезвыми
       - Детали ДТП с пешеходами
+      - Контрольные суммы по агрегации
 
     Args:
         cards: Список сырых карточек ДТП
@@ -1288,99 +811,6 @@ def extract_raw_supplement(
         lines.append("\nРайоны/населённые пункты (топ-15):")
         for d, cnt in district_counter.most_common(15):
             lines.append(f"  - {d}: {cnt}")
-
-    # --- Значение дороги (федеральная, региональная, местного значения) ---
-    road_z_counter = Counter()
-    road_z_deaths = Counter()
-    for card in cards:
-        dor_z = str(card.get("dor_z", "")).strip()
-        if dor_z:
-            road_z_counter[dor_z] += 1
-            road_z_deaths[dor_z] += _safe_int(card.get("pog"))
-    if road_z_counter:
-        lines.append("\nЗначение дороги (ДТП / погибшие):")
-        for rz, cnt in road_z_counter.most_common(10):
-            deaths_rz = road_z_deaths.get(rz, 0)
-            lines.append(f"  - {rz}: {cnt} ДТП, {deaths_rz} погибших")
-
-    # --- Динамика погибших по дням недели ---
-    weekday_deaths = Counter()
-    for card in cards:
-        wd = _get_weekday(str(card.get("date_dtp", "")))
-        if wd is not None:
-            weekday_deaths[wd] += _safe_int(card.get("pog"))
-    if weekday_deaths:
-        lines.append("\nПогибшие по дням недели:")
-        for day_num in range(7):
-            d_name = DAY_SHORT[day_num]
-            d_cnt = weekday_deaths.get(day_num, 0)
-            if d_cnt > 0:
-                lines.append(f"  - {d_name}: {d_cnt}")
-
-    # --- Динамика погибших по часам суток (интервалы по 3 часа) ---
-    hour_deaths = Counter()
-    for card in cards:
-        hour = _get_hour(str(card.get("time", "")))
-        if hour is not None:
-            hour_deaths[hour] += _safe_int(card.get("pog"))
-    if hour_deaths:
-        lines.append("\nПогибшие по часам суток (интервалы 3 ч):")
-        for interval_start in range(0, 24, 3):
-            interval_key = f"{interval_start:02d}-{interval_start + 2:02d}"
-            d_total = sum(hour_deaths.get(h, 0) for h in range(interval_start, interval_start + 3))
-            if d_total > 0:
-                lines.append(f"  - {interval_key}: {d_total}")
-
-    # --- Динамика погибших по видам ДТП ---
-    type_deaths = Counter()
-    for card in cards:
-        dtp_type = str(card.get("dtpv", "")).strip()
-        if dtp_type:
-            type_deaths[dtp_type] += _safe_int(card.get("pog"))
-    if type_deaths:
-        lines.append("\nПогибшие по видам ДТП:")
-        for tp, d_cnt in type_deaths.most_common(10):
-            if d_cnt > 0:
-                lines.append(f"  - {tp}: {d_cnt}")
-
-    # --- Участки с фотовидеофиксацией ---
-    camera_dtp = 0
-    camera_deaths = 0
-    camera_injured = 0
-    no_camera_dtp = 0
-    no_camera_deaths = 0
-    no_camera_injured = 0
-    unknown_dtp = 0
-    unknown_deaths = 0
-    unknown_injured = 0
-    for card in cards:
-        pog = _safe_int(card.get("pog"))
-        ran = _safe_int(card.get("ran"))
-        status = _get_camera_status(card)
-        if status == "camera":
-            camera_dtp += 1
-            camera_deaths += pog
-            camera_injured += ran
-        elif status == "no_camera":
-            no_camera_dtp += 1
-            no_camera_deaths += pog
-            no_camera_injured += ran
-        else:
-            unknown_dtp += 1
-            unknown_deaths += pog
-            unknown_injured += ran
-    total_dtp = camera_dtp + no_camera_dtp + unknown_dtp
-    if total_dtp > 0:
-        lines.append("\nФотовидеофиксация участков (ДТП / погибшие / раненые):")
-        lines.append(f"  - С камерами фотовидеофиксации: {camera_dtp} ДТП, {camera_deaths} погибших, {camera_injured} раненых")
-        lines.append(f"  - Без камер (фактор указан): {no_camera_dtp} ДТП, {no_camera_deaths} погибших, {no_camera_injured} раненых")
-        if unknown_dtp > 0:
-            lines.append(f"  - Не указан фактор: {unknown_dtp} ДТП, {unknown_deaths} погибших, {unknown_injured} раненых")
-        # Доля ДТП с камерами от всех с известным фактором
-        known_dtp = camera_dtp + no_camera_dtp
-        if known_dtp > 0:
-            camera_pct = round(camera_dtp / known_dtp * 100, 1)
-            lines.append(f"  - Доля ДТП на участках с камерами (от участков с указанным фактором): {camera_pct}%")
 
     # --- Детали по категории: смертельные, алкоголь, пешеходы ---
     fatal_cards = [c for c in cards if _safe_int(c.get("pog")) > 0]
