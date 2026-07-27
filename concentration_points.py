@@ -66,6 +66,10 @@ SETTLEMENT_OTHER_RADIUS_M = 100
 
 # Окно для дорог с пикетажем в НП (км)
 SETTLEMENT_ROAD_WINDOW_KM = 0.2  # 200 метров
+# Максимальное GPS-расстояние между ДТП в 2-м проходе НП (м).
+# Отсекает карточки с одинаковым dor+piketazh, но географически удалённые
+# (брак данных ГИБДД: dor скопирован из другой карточки).
+SETTLEMENT_ROAD_GPS_MAX_M = 2500  # 2.5 км
 
 # Окно для вне НП с пикетажем (км)
 NON_SETTLEMENT_WINDOW_KM = 1.0
@@ -729,12 +733,6 @@ _overpass_client: httpx.AsyncClient | None = None  # общий HTTP-клиен�
 _overpass_last_request_time: float = 0.0  # время последнего запроса
 
 PLACE_FILTER = "city|town|village|hamlet"
-# Для крупных регионов (>5° по любой стороне) исключаем hamlets —
-# они многочисленны, мелки и не влияют на анализ очагов ДТП.
-PLACE_FILTER_LARGE = "city|town|village"
-
-# Порог «крупного региона» для исключения hamlets
-LARGE_REGION_SPAN = 5.0
 
 
 async def fetch_settlement_boundaries(
@@ -747,10 +745,9 @@ async def fetch_settlement_boundaries(
     Оптимизации памяти (особенно для крупных регионов):
     1. Инкрементальная обработка тайлов — каждый тайл парсится
        в полигоны сразу, сырой JSON удаляется до загрузки следующего.
-    2. Для крупных регионов (>5°) — исключает hamlets из запроса.
-    3. In-memory LRU-кэш — избегает повторного парсинга JSON.
-    4. STRtree вместо unary_union при >2000 полигонов.
-    5. Упрощение полигонов (preserve_topology).
+    2. In-memory LRU-кэш — избегает повторного парсинга JSON.
+    3. STRtree вместо unary_union при >2000 полигонов.
+    4. Упрощение полигонов (preserve_topology).
 
     Returns:
         Список Shapely-полигонов (Polygon или MultiPolygon).
@@ -787,19 +784,6 @@ async def fetch_settlement_boundaries(
     lon_max = min(raw_lon_max, 180.0)
 
     bbox = f"{lat_min},{lon_min},{lat_max},{lon_max}"
-    bbox_span_lat = lat_max - lat_min
-    bbox_span_lon = lon_max - lon_min
-    is_large_region = (
-        bbox_span_lat > LARGE_REGION_SPAN
-        or bbox_span_lon > LARGE_REGION_SPAN
-    )
-    place_filter = PLACE_FILTER_LARGE if is_large_region else PLACE_FILTER
-
-    if is_large_region:
-        logger.info(
-            f"Крупный регион ({bbox_span_lat:.1f}°×{bbox_span_lon:.1f}°): "
-            f"исключаем hamlets из запроса"
-        )
 
     # --- Шаг 1: In-memory кэш ---
     mem_polygons = _memory_cache_get(bbox)
@@ -862,7 +846,7 @@ async def fetch_settlement_boundaries(
         # Запрос к Overpass (используем адаптивный place_filter)
         elements = await _fetch_overpass_parallel(
             tile_bbox, tile_idx, len(tiles),
-            place_filter=place_filter,
+            place_filter=PLACE_FILTER,
         )
         if elements:
             # Сразу парсим в полигоны и освобождаем JSON
@@ -1698,13 +1682,25 @@ def find_settlement_preclusters(
             group_indices = [idx]
             group_cards = [card]
 
+            center_coords = _parse_coords(card)
+
             for j in range(i + 1, len(items_pos)):
                 other_idx, other_card, other_pos = items_pos[j]
                 if other_idx in assigned:
                     continue
-                if other_pos <= window_end:
-                    group_indices.append(other_idx)
-                    group_cards.append(other_card)
+                if other_pos > window_end:
+                    break
+                if center_coords:
+                    other_coords = _parse_coords(other_card)
+                    if other_coords:
+                        gps_dist = haversine_meters(
+                            center_coords[0], center_coords[1],
+                            other_coords[0], other_coords[1],
+                        )
+                        if gps_dist > SETTLEMENT_ROAD_GPS_MAX_M:
+                            continue
+                group_indices.append(other_idx)
+                group_cards.append(other_card)
 
             type_counter = Counter(_get_dtp_type(c) for c in group_cards)
             is_pre, _ = _check_precluster_criteria(type_counter, len(group_cards))
@@ -2001,13 +1997,25 @@ def find_settlement_concentration_points(cards: list[dict]) -> list[dict]:
             group_indices = [idx]
             group_cards = [card]
 
+            center_coords = _parse_coords(card)
+
             for j in range(i + 1, len(items_pos)):
                 other_idx, other_card, other_pos = items_pos[j]
                 if other_idx in assigned:
                     continue
-                if other_pos <= window_end:
-                    group_indices.append(other_idx)
-                    group_cards.append(other_card)
+                if other_pos > window_end:
+                    break
+                if center_coords:
+                    other_coords = _parse_coords(other_card)
+                    if other_coords:
+                        gps_dist = haversine_meters(
+                            center_coords[0], center_coords[1],
+                            other_coords[0], other_coords[1],
+                        )
+                        if gps_dist > SETTLEMENT_ROAD_GPS_MAX_M:
+                            continue
+                group_indices.append(other_idx)
+                group_cards.append(other_card)
 
             type_counter = Counter(_get_dtp_type(c) for c in group_cards)
             is_cluster, _ = _check_cluster_criteria(
