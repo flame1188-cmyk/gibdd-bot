@@ -1,9 +1,10 @@
 """
 Генератор HTML-отчётов с картами и графиками.
 
-Библиотеки (Leaflet, ECharts, MarkerCluster, Measure) подключаются
-через CDN-ссылки, что существенно уменьшает размер HTML-файла и
-обеспечивает совместимость с мобильными устройствами (iOS Safari).
+Библиотеки (Leaflet, MarkerCluster, Measure) встраиваются прямо в файл
+для максимальной совместимости, включая мобильные устройства (iPhone).
+ECharts подключается через CDN, т.к. аналитические отчёты обычно не нужны
+на мобильных устройствах.
 
 Типы отчётов:
   - dtp_map:       Карта всех ДТП с попапами (опционально + камеры)
@@ -35,8 +36,6 @@ _LIB_URLS = {
     "leaflet.markercluster.css": "https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css",
     "leaflet.markercluster.default.css": "https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css",
     "leaflet.markercluster.js": "https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js",
-    "leaflet.measure.css": "https://unpkg.com/leaflet-measure@3.1.0/dist/leaflet-measure.css",
-    "leaflet.measure.js": "https://unpkg.com/leaflet-measure@3.1.0/dist/leaflet-measure.js",
     "echarts.min.js": "https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js",
 }
 
@@ -71,9 +70,14 @@ def _ensure_lib(name: str, url: str) -> str:
     path = os.path.join(_LIB_DIR, name)
 
     if os.path.exists(path):
-        logger.debug(f"report_generator: библиотека из кэша {name}")
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
+        # Если файл пустой — удаляем и скачиваем заново
+        if os.path.getsize(path) == 0:
+            os.remove(path)
+            logger.info(f"report_generator: пустой кэш {name}, удаляем")
+        else:
+            logger.debug(f"report_generator: библиотека из кэша {name}")
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
 
     logger.info(f"report_generator: скачивание {name}...")
     try:
@@ -337,24 +341,29 @@ class ReportGenerator:
     ) -> str:
         """Оборачивает содержимое в полный HTML-документ.
 
-        Библиотеки подключаются через CDN-ссылки, а не инлайн,
-        чтобы уменьшить размер файла и обеспечить совместимость
-        с мобильными устройствами (iOS Safari не справляется с
-        большими inline-документами).
+        Для карт (use_map=True) библиотеки встраиваются инлайн, чтобы
+        файл работал без интернета на всех устройствах, включая iPhone.
+        Для аналитики (ECharts) используется CDN.
         """
+        libs = self._libs_loaded()
 
         head_parts = []
 
         if use_map:
-            head_parts.append('<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">')
-            head_parts.append('<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>')
+            leaflet_css = libs.get("leaflet.css", "")
+            head_parts.append(f"<style>{leaflet_css}</style>")
+            leaflet_js = libs.get("leaflet.js", "")
+            head_parts.append(f"<script>{leaflet_js}</script>")
             # MarkerCluster
-            head_parts.append('<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">')
-            head_parts.append('<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">')
-            head_parts.append('<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>')
-            # Measure
-            head_parts.append('<link rel="stylesheet" href="https://unpkg.com/leaflet-measure@3.1.0/dist/leaflet-measure.css">')
-            head_parts.append('<script src="https://unpkg.com/leaflet-measure@3.1.0/dist/leaflet-measure.js"></script>')
+            mc_css = libs.get("leaflet.markercluster.css", "")
+            if mc_css:
+                head_parts.append(f"<style>{mc_css}</style>")
+            mc_def_css = libs.get("leaflet.markercluster.default.css", "")
+            if mc_def_css:
+                head_parts.append(f"<style>{mc_def_css}</style>")
+            mc_js = libs.get("leaflet.markercluster.js", "")
+            if mc_js:
+                head_parts.append(f"<script>{mc_js}</script>")
 
         if use_echarts:
             head_parts.append('<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>')
@@ -383,17 +392,6 @@ class ReportGenerator:
   </header>
   {body_content}
 </div>
-<script>
-// Диагностика: проверяем загрузку библиотек
-window.addEventListener('load', function() {{
-    if (typeof L === 'undefined') {{
-        var el = document.createElement('div');
-        el.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#d32f2f;color:#fff;padding:12px 16px;z-index:99999;font-size:14px;text-align:center;';
-        el.textContent = 'Ошибка: библиотека Leaflet не загружена. Откройте файл через Safari с интернет-соединением.';
-        document.body.appendChild(el);
-    }}
-}});
-</script>
 </body>
 </html>"""
 
@@ -711,6 +709,15 @@ body {
   color: white; font-weight: 700; font-size: 13px;
   box-shadow: 0 2px 6px rgba(0,0,0,0.3);
 }
+.ruler-tip {
+  background: #d32f2f !important;
+  color: white !important;
+  border: none !important;
+  font-weight: 600;
+  font-size: 12px;
+  padding: 3px 8px;
+}
+.ruler-tip::before { border-top-color: #d32f2f !important; }
 """
 
     @staticmethod
@@ -1110,14 +1117,115 @@ L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
     maxZoom: 19,
 }}).addTo(map);
 
-// --- Линейка ---
-try {{
-    L.control.measure({{
-        position: 'topleft',
-        primaryLengthUnit: 'meters',
-        secondaryLengthUnit: 'kilometers'
+// --- Линейка (собственная реализация без внешних зависимостей) ---
+var rulerActive = false;
+var rulerPoints = [];
+var rulerLine = null;
+var rulerMarkers = [];
+var rulerTooltip = null;
+
+var rulerBtn = L.control({{position: 'topleft'}});
+rulerBtn.onAdd = function() {{
+    var div = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
+    var a = L.DomUtil.create('a', 'ruler-btn', div);
+    a.href = '#';
+    a.title = 'Линейка';
+    a.innerHTML = '📏';
+    a.style.cssText = 'font-size:16px;line-height:26px;text-align:center;display:block;width:26px;height:26px;';
+    L.DomEvent.on(a, 'click', function(e) {{
+        L.DomEvent.preventDefault(e);
+        toggleRuler();
+    }});
+    return div;
+}};
+rulerBtn.addTo(map);
+
+function toggleRuler() {{
+    if (rulerActive) {{
+        stopRuler();
+    }} else {{
+        startRuler();
+    }}
+}}
+
+function startRuler() {{
+    rulerActive = true;
+    rulerPoints = [];
+    map.getContainer().style.cursor = 'crosshair';
+    map.dragging.disable();
+    map.doubleClickZoom.disable();
+}}
+
+function stopRuler() {{
+    rulerActive = false;
+    map.getContainer().style.cursor = '';
+    map.dragging.enable();
+    map.doubleClickZoom.enable();
+}}
+
+function clearRuler() {{
+    rulerPoints = [];
+    if (rulerLine) {{ map.removeLayer(rulerLine); rulerLine = null; }}
+    rulerMarkers.forEach(function(m) {{ map.removeLayer(m); }});
+    rulerMarkers = [];
+    if (rulerTooltip) {{ map.removeLayer(rulerTooltip); rulerTooltip = null; }}
+}}
+
+function formatDist(m) {{
+    if (m < 1000) return Math.round(m) + ' м';
+    return (m / 1000).toFixed(2) + ' км';
+}}
+
+function updateRuler() {{
+    if (rulerLine) map.removeLayer(rulerLine);
+    if (rulerTooltip) map.removeLayer(rulerTooltip);
+    if (rulerPoints.length < 2) return;
+    rulerLine = L.polyline(rulerPoints, {{color: '#d32f2f', weight: 3, dashArray: '6,4'}}).addTo(map);
+    var total = 0;
+    for (var i = 1; i < rulerPoints.length; i++) {{
+        total += rulerPoints[i-1].distanceTo(rulerPoints[i]);
+    }}
+    var last = rulerPoints[rulerPoints.length - 1];
+    rulerTooltip = L.tooltip({{permanent: true, direction: 'top', className: 'ruler-tip'}})
+        .setLatLng(last)
+        .setContent(formatDist(total))
+        .addTo(map);
+}}
+
+map.on('click', function(e) {{
+    if (!rulerActive) return;
+    rulerPoints.push(e.latlng);
+    var m = L.circleMarker(e.latlng, {{
+        radius: 4, color: '#d32f2f', fillColor: '#fff',
+        weight: 2, fillOpacity: 1
     }}).addTo(map);
-}} catch(e) {{ console.warn('Линейка недоступна:', e); }}
+    rulerMarkers.push(m);
+    updateRuler();
+}});
+
+map.on('dblclick', function(e) {{
+    if (!rulerActive) return;
+    L.DomEvent.preventDefault(e);
+    stopRuler();
+}});
+
+// Кнопка очистки
+var clearBtn = L.control({{position: 'topleft'}});
+clearBtn.onAdd = function() {{
+    var div = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
+    var a = L.DomUtil.create('a', 'clear-btn', div);
+    a.href = '#';
+    a.title = 'Очистить линейку';
+    a.innerHTML = '✕';
+    a.style.cssText = 'font-size:14px;line-height:26px;text-align:center;display:block;width:26px;height:26px;color:#d32f2f;';
+    L.DomEvent.on(a, 'click', function(e) {{
+        L.DomEvent.preventDefault(e);
+        clearRuler();
+        stopRuler();
+    }});
+    return div;
+}};
+clearBtn.addTo(map);
 
 // --- Данные ---
 var dtpData = {dtp_geojson};
@@ -1802,14 +1910,115 @@ L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
     maxZoom: 19,
 }}).addTo(map);
 
-// --- Линейка ---
-try {{
-    L.control.measure({{
-        position: 'topleft',
-        primaryLengthUnit: 'meters',
-        secondaryLengthUnit: 'kilometers'
+// --- Линейка (собственная реализация без внешних зависимостей) ---
+var rulerActive = false;
+var rulerPoints = [];
+var rulerLine = null;
+var rulerMarkers = [];
+var rulerTooltip = null;
+
+var rulerBtn = L.control({{position: 'topleft'}});
+rulerBtn.onAdd = function() {{
+    var div = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
+    var a = L.DomUtil.create('a', 'ruler-btn', div);
+    a.href = '#';
+    a.title = 'Линейка';
+    a.innerHTML = '📏';
+    a.style.cssText = 'font-size:16px;line-height:26px;text-align:center;display:block;width:26px;height:26px;';
+    L.DomEvent.on(a, 'click', function(e) {{
+        L.DomEvent.preventDefault(e);
+        toggleRuler();
+    }});
+    return div;
+}};
+rulerBtn.addTo(map);
+
+function toggleRuler() {{
+    if (rulerActive) {{
+        stopRuler();
+    }} else {{
+        startRuler();
+    }}
+}}
+
+function startRuler() {{
+    rulerActive = true;
+    rulerPoints = [];
+    map.getContainer().style.cursor = 'crosshair';
+    map.dragging.disable();
+    map.doubleClickZoom.disable();
+}}
+
+function stopRuler() {{
+    rulerActive = false;
+    map.getContainer().style.cursor = '';
+    map.dragging.enable();
+    map.doubleClickZoom.enable();
+}}
+
+function clearRuler() {{
+    rulerPoints = [];
+    if (rulerLine) {{ map.removeLayer(rulerLine); rulerLine = null; }}
+    rulerMarkers.forEach(function(m) {{ map.removeLayer(m); }});
+    rulerMarkers = [];
+    if (rulerTooltip) {{ map.removeLayer(rulerTooltip); rulerTooltip = null; }}
+}}
+
+function formatDist(m) {{
+    if (m < 1000) return Math.round(m) + ' м';
+    return (m / 1000).toFixed(2) + ' км';
+}}
+
+function updateRuler() {{
+    if (rulerLine) map.removeLayer(rulerLine);
+    if (rulerTooltip) map.removeLayer(rulerTooltip);
+    if (rulerPoints.length < 2) return;
+    rulerLine = L.polyline(rulerPoints, {{color: '#d32f2f', weight: 3, dashArray: '6,4'}}).addTo(map);
+    var total = 0;
+    for (var i = 1; i < rulerPoints.length; i++) {{
+        total += rulerPoints[i-1].distanceTo(rulerPoints[i]);
+    }}
+    var last = rulerPoints[rulerPoints.length - 1];
+    rulerTooltip = L.tooltip({{permanent: true, direction: 'top', className: 'ruler-tip'}})
+        .setLatLng(last)
+        .setContent(formatDist(total))
+        .addTo(map);
+}}
+
+map.on('click', function(e) {{
+    if (!rulerActive) return;
+    rulerPoints.push(e.latlng);
+    var m = L.circleMarker(e.latlng, {{
+        radius: 4, color: '#d32f2f', fillColor: '#fff',
+        weight: 2, fillOpacity: 1
     }}).addTo(map);
-}} catch(e) {{ console.warn('Линейка недоступна:', e); }}
+    rulerMarkers.push(m);
+    updateRuler();
+}});
+
+map.on('dblclick', function(e) {{
+    if (!rulerActive) return;
+    L.DomEvent.preventDefault(e);
+    stopRuler();
+}});
+
+// Кнопка очистки
+var clearBtn = L.control({{position: 'topleft'}});
+clearBtn.onAdd = function() {{
+    var div = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
+    var a = L.DomUtil.create('a', 'clear-btn', div);
+    a.href = '#';
+    a.title = 'Очистить линейку';
+    a.innerHTML = '✕';
+    a.style.cssText = 'font-size:14px;line-height:26px;text-align:center;display:block;width:26px;height:26px;color:#d32f2f;';
+    L.DomEvent.on(a, 'click', function(e) {{
+        L.DomEvent.preventDefault(e);
+        clearRuler();
+        stopRuler();
+    }});
+    return div;
+}};
+clearBtn.addTo(map);
 
 // --- Алгоритм Грэхема (convex hull) ---
 function convexHull(pts) {{
@@ -2194,14 +2403,115 @@ L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
     maxZoom: 19,
 }}).addTo(map);
 
-// --- Линейка ---
-try {{
-    L.control.measure({{
-        position: 'topleft',
-        primaryLengthUnit: 'meters',
-        secondaryLengthUnit: 'kilometers'
+// --- Линейка (собственная реализация без внешних зависимостей) ---
+var rulerActive = false;
+var rulerPoints = [];
+var rulerLine = null;
+var rulerMarkers = [];
+var rulerTooltip = null;
+
+var rulerBtn = L.control({{position: 'topleft'}});
+rulerBtn.onAdd = function() {{
+    var div = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
+    var a = L.DomUtil.create('a', 'ruler-btn', div);
+    a.href = '#';
+    a.title = 'Линейка';
+    a.innerHTML = '📏';
+    a.style.cssText = 'font-size:16px;line-height:26px;text-align:center;display:block;width:26px;height:26px;';
+    L.DomEvent.on(a, 'click', function(e) {{
+        L.DomEvent.preventDefault(e);
+        toggleRuler();
+    }});
+    return div;
+}};
+rulerBtn.addTo(map);
+
+function toggleRuler() {{
+    if (rulerActive) {{
+        stopRuler();
+    }} else {{
+        startRuler();
+    }}
+}}
+
+function startRuler() {{
+    rulerActive = true;
+    rulerPoints = [];
+    map.getContainer().style.cursor = 'crosshair';
+    map.dragging.disable();
+    map.doubleClickZoom.disable();
+}}
+
+function stopRuler() {{
+    rulerActive = false;
+    map.getContainer().style.cursor = '';
+    map.dragging.enable();
+    map.doubleClickZoom.enable();
+}}
+
+function clearRuler() {{
+    rulerPoints = [];
+    if (rulerLine) {{ map.removeLayer(rulerLine); rulerLine = null; }}
+    rulerMarkers.forEach(function(m) {{ map.removeLayer(m); }});
+    rulerMarkers = [];
+    if (rulerTooltip) {{ map.removeLayer(rulerTooltip); rulerTooltip = null; }}
+}}
+
+function formatDist(m) {{
+    if (m < 1000) return Math.round(m) + ' м';
+    return (m / 1000).toFixed(2) + ' км';
+}}
+
+function updateRuler() {{
+    if (rulerLine) map.removeLayer(rulerLine);
+    if (rulerTooltip) map.removeLayer(rulerTooltip);
+    if (rulerPoints.length < 2) return;
+    rulerLine = L.polyline(rulerPoints, {{color: '#d32f2f', weight: 3, dashArray: '6,4'}}).addTo(map);
+    var total = 0;
+    for (var i = 1; i < rulerPoints.length; i++) {{
+        total += rulerPoints[i-1].distanceTo(rulerPoints[i]);
+    }}
+    var last = rulerPoints[rulerPoints.length - 1];
+    rulerTooltip = L.tooltip({{permanent: true, direction: 'top', className: 'ruler-tip'}})
+        .setLatLng(last)
+        .setContent(formatDist(total))
+        .addTo(map);
+}}
+
+map.on('click', function(e) {{
+    if (!rulerActive) return;
+    rulerPoints.push(e.latlng);
+    var m = L.circleMarker(e.latlng, {{
+        radius: 4, color: '#d32f2f', fillColor: '#fff',
+        weight: 2, fillOpacity: 1
     }}).addTo(map);
-}} catch(e) {{ console.warn('Линейка недоступна:', e); }}
+    rulerMarkers.push(m);
+    updateRuler();
+}});
+
+map.on('dblclick', function(e) {{
+    if (!rulerActive) return;
+    L.DomEvent.preventDefault(e);
+    stopRuler();
+}});
+
+// Кнопка очистки
+var clearBtn = L.control({{position: 'topleft'}});
+clearBtn.onAdd = function() {{
+    var div = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
+    var a = L.DomUtil.create('a', 'clear-btn', div);
+    a.href = '#';
+    a.title = 'Очистить линейку';
+    a.innerHTML = '✕';
+    a.style.cssText = 'font-size:14px;line-height:26px;text-align:center;display:block;width:26px;height:26px;color:#d32f2f;';
+    L.DomEvent.on(a, 'click', function(e) {{
+        L.DomEvent.preventDefault(e);
+        clearRuler();
+        stopRuler();
+    }});
+    return div;
+}};
+clearBtn.addTo(map);
 
 // --- Точка пользователя ---
 var userMarker = L.circleMarker([{lat}, {lon}], {{
