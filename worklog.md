@@ -239,3 +239,123 @@ Stage Summary:
 - concentration_points.py: _is_intersection() — исправлен путь к sdor (card → dor_usl → sdor)
 - Без этого исправления весь Pass 1 (перекрёстки) молча не работал — ни одно ДТП
   не классифицировалось как перекрёсток, _is_intersection() всегда возвращала False
+
+---
+Task ID: 9
+Agent: Main Agent
+Task: Улучшения карт (5 функций): popup-инфо, кластеризация, maxZoom, spiderfy, линейка
+
+Work Log:
+- Проанализированы запросы пользователя на улучшения интерактивных HTML-карт в report_generator.py
+- Реализованы 5 функций:
+  1. Popup-информация: в _card_popup_html() добавлены дорожные условия (sdor),
+     объекты УДС (obj_dtp), нарушения ПДД (npdd), сопутствующие нарушения (sop_npdd)
+  2. Кластеризация маркеров: добавлен leaflet.markercluster@1.5.3 (CSS + Default.CSS + JS)
+     - Карта ДТП: dtpCluster = L.markerClusterGroup() для ДТП, cameraCluster для камер
+     - Карта очагов: только cameraCluster (ДТП немного, кластеризация не нужна)
+     - Карта точки: curDtpCluster для ДТП, cameraCluster для камер
+     - Добавлен класс .camera-cluster-icon (зелёный круг для кластеров камер)
+  3. maxZoom: 19 во всех 3 картах (раньше было 18)
+  4. Spiderfy: spiderfyOnMaxZoom: true в каждом markerClusterGroup
+  5. Линейка: см. Task ID 10 (финальная реализация)
+- Добавлены библиотеки в _LIB_URLS: leaflet.markercluster.css, leaflet.markercluster.default.css,
+  leaflet.markercluster.js (исправлены URL с дефисом вместо точки)
+
+Stage Summary:
+- report_generator.py: ~3 JS-шаблона переписаны (_dtp_map_js, _cluster_map_js, _point_map_js)
+- _html_shell(): добавлено внедрение MarkerCluster CSS/JS (inline-встраивание)
+- _base_css(): добавлен класс .camera-cluster-icon
+- 5 новых функций: popup-инфо, кластеризация, maxZoom 19, spiderfy, подготовка для линейки
+
+---
+Task ID: 10
+Agent: Main Agent
+Task: Линейка на карте — собственная реализация без внешних зависимостей
+
+Work Log:
+- Попытка 1: подключён leaflet-measure@3.1.0
+  - cdnjs не хостит пакет → 404
+  - Переключился на unpkg, но URL были с точкой (leaflet.measure.js)
+  - Файлы на CDN оказались с дефисом (leaflet-measure.js), а не точкой
+  - Исправлены URL: leaflet-measure.js / leaflet-measure.css в /dist/
+- Попытка 2: leaflet-measure@3.1.0 загружен, но обнаружена критическая проблема:
+  - Плагин вызывает this._map.panTo(t.getLatLng()) на каждой новой точке измерения
+  - Карта принудительно центрируется, невозможно выставить отрезок
+- Попытка 3 (финальная): написана собственная легковесная линейка на чистом Leaflet API
+  - Кнопка-переключатель 📏 в углу карты (L.control)
+  - Кнопка очистки ✕ рядом
+  - Клик по карте → добавление точки в отрезок (L.circleMarker)
+  - Двойной клик → завершение измерения
+  - Tooltip показывает суммарное расстояние (м / км) над последней точкой
+  - L.polyline с пунктиром соединяет точки
+  - При активной линейке: drag и doubleClickZoom отключены
+  - Подсветка кнопки красным при активном режиме
+- Проблема 1: клик по кнопке линейки засчитывался как первая точка
+  - Решение: L.DomEvent.stopPropagation(e) в обработчиках кнопок
+- Проблема 2: при клике на маркер ДТП/камеры открывался попап, точка не добавлялась
+  - Решение: обработчик map.on('popupopen') — если линейка активна, перехватывает координаты
+    маркера (e.popup._source.getLatLng()), добавляет в отрезок, закрывает попап
+- Добавлены CSS-стили .ruler-tip (красный tooltip)
+- Убран leaflet-measure из _LIB_URLS и _html_shell (минус 2 файла библиотек в HTML)
+- Одинаковая логика во всех 3 картах: _dtp_map_js, _cluster_map_js, _point_map_js
+
+Stage Summary:
+- report_generator.py: ~110 строк JS-кода линейки в каждой из 3 карт
+- Удалены _LIB_URLS записи для leaflet.measure.css / leaflet.measure.js
+- Добавлены CSS-стили .ruler-tip
+- Линейка работает без внешних зависимостей, не смещает карту, поддерживает измерение
+  между маркерами (ДТП/камеры)
+
+---
+Task ID: 11
+Agent: Main Agent
+Task: Оптимизация памяти и совместимость с iOS
+
+Work Log:
+- Память: ослабление искусственных ограничений
+  - bot.py: убраны избыточные gc.collect() (после отправки файлов, при смене данных)
+  - Оставлен один стратегический gc.collect() при смене региона
+  - data_cache.py: _MAX_ENTRIES 50 → 100
+  - concentration_points.py: MEMORY_CACHE_MAX 2 → 4 (2 bbox × текущий+прошлый год)
+  - concentration_points.py: убраны 3 из 4 gc.collect()
+  - excel_generator.py: убраны 2 gc.collect() между генерацией файлов
+- Hamlets: убрано исключение для крупных регионов
+  - Раньше: PLACE_FILTER_LARGE = "city|town|village" (без hamlet) для регионов с span ≥ 5.0°
+  - Теперь: всегда PLACE_FILTER = "city|town|village|hamlet"
+  - Причина: исключение hamlet могло терять данные для формирования очагов в небольших НП
+- iOS совместимость:
+  - Попытка 1: CDN-ссылки (<link>/<script src>) — на iPhone не работало
+    (unpkg может быть недоступен из РФ, или блокируется из file://)
+  - Финальное решение: inline-встраивание библиотек для карт (Leaflet, MarkerCluster);
+    ECharts оставлен на CDN (аналитика обычно не нужна на мобильных)
+  - _ensure_lib(): добавлена автоочистка пустого кэша (0 байт от прошлых 404)
+- Документация для пользователей:
+  - README.md: раздел «Совместимость с мобильными устройствами (iOS)»
+  - Рекомендация: приложение HTML Viewer для iPhone (Quick Look не выполняет JS)
+
+Stage Summary:
+- bot.py, concentration_points.py, data_cache.py, excel_generator.py: убраны gc.collect()
+- concentration_points.py: убран PLACE_FILTER_LARGE / LARGE_REGION_SPAN / is_large_region
+- report_generator.py: _html_shell() возвращает inline-встраивание для карт
+- README.md: добавлен раздел про iOS совместимость
+
+---
+Task ID: 12
+Agent: Main Agent
+Task: Обновление README.md и worklog.md
+
+Work Log:
+- README.md: реорганизован раздел «Возможности»
+  - Подраздел «Основной функционал» (прежние возможности)
+  - Подраздел «Интерактивные HTML-карты» (новый — описание 5 функций карт)
+  - Подраздел «Совместимость с мобильными устройствами (iOS)» (новый — инструкция HTML Viewer)
+- README.md: структура проекта
+  - Добавлен report_generator.py с описанием
+- README.md: структура директории data/
+  - Добавлена поддиректория report_libs/ с описанием кэшируемых библиотек
+- worklog.md: добавлены записи Task ID 9-12 (см. выше)
+
+Stage Summary:
+- README.md: +3 раздела, +1 файл в структуре проекта, +1 поддиректория
+- worklog.md: +4 записи о проделанной работе (карты, линейка, память/iOS, документация)
+
