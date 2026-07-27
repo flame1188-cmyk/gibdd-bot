@@ -1134,6 +1134,7 @@ rulerBtn.onAdd = function() {{
     a.style.cssText = 'font-size:16px;line-height:26px;text-align:center;display:block;width:26px;height:26px;';
     L.DomEvent.on(a, 'click', function(e) {{
         L.DomEvent.preventDefault(e);
+        L.DomEvent.stopPropagation(e);
         toggleRuler();
     }});
     return div;
@@ -1154,6 +1155,9 @@ function startRuler() {{
     map.getContainer().style.cursor = 'crosshair';
     map.dragging.disable();
     map.doubleClickZoom.disable();
+    // Подсветка кнопки
+    var btn = document.querySelector('.ruler-btn');
+    if (btn) btn.style.background = '#d32f2f';
 }}
 
 function stopRuler() {{
@@ -1161,6 +1165,8 @@ function stopRuler() {{
     map.getContainer().style.cursor = '';
     map.dragging.enable();
     map.doubleClickZoom.enable();
+    var btn = document.querySelector('.ruler-btn');
+    if (btn) btn.style.background = '';
 }}
 
 function clearRuler() {{
@@ -1174,6 +1180,16 @@ function clearRuler() {{
 function formatDist(m) {{
     if (m < 1000) return Math.round(m) + ' м';
     return (m / 1000).toFixed(2) + ' км';
+}}
+
+function addRulerPoint(latlng) {{
+    rulerPoints.push(latlng);
+    var m = L.circleMarker(latlng, {{
+        radius: 4, color: '#d32f2f', fillColor: '#fff',
+        weight: 2, fillOpacity: 1
+    }}).addTo(map);
+    rulerMarkers.push(m);
+    updateRuler();
 }}
 
 function updateRuler() {{
@@ -1194,13 +1210,17 @@ function updateRuler() {{
 
 map.on('click', function(e) {{
     if (!rulerActive) return;
-    rulerPoints.push(e.latlng);
-    var m = L.circleMarker(e.latlng, {{
-        radius: 4, color: '#d32f2f', fillColor: '#fff',
-        weight: 2, fillOpacity: 1
-    }}).addTo(map);
-    rulerMarkers.push(m);
-    updateRuler();
+    addRulerPoint(e.latlng);
+}});
+
+// Перехват кликов по маркерам (ДТП/камеры) при активной линейке
+map.on('popupopen', function(e) {{
+    if (!rulerActive) return;
+    var source = e.popup._source;
+    if (source && source.getLatLng) {{
+        addRulerPoint(source.getLatLng());
+    }}
+    map.closePopup(e.popup);
 }});
 
 map.on('dblclick', function(e) {{
@@ -1220,6 +1240,7 @@ clearBtn.onAdd = function() {{
     a.style.cssText = 'font-size:14px;line-height:26px;text-align:center;display:block;width:26px;height:26px;color:#d32f2f;';
     L.DomEvent.on(a, 'click', function(e) {{
         L.DomEvent.preventDefault(e);
+        L.DomEvent.stopPropagation(e);
         clearRuler();
         stopRuler();
     }});
@@ -1927,6 +1948,7 @@ rulerBtn.onAdd = function() {{
     a.style.cssText = 'font-size:16px;line-height:26px;text-align:center;display:block;width:26px;height:26px;';
     L.DomEvent.on(a, 'click', function(e) {{
         L.DomEvent.preventDefault(e);
+        L.DomEvent.stopPropagation(e);
         toggleRuler();
     }});
     return div;
@@ -1947,6 +1969,9 @@ function startRuler() {{
     map.getContainer().style.cursor = 'crosshair';
     map.dragging.disable();
     map.doubleClickZoom.disable();
+    // Подсветка кнопки
+    var btn = document.querySelector('.ruler-btn');
+    if (btn) btn.style.background = '#d32f2f';
 }}
 
 function stopRuler() {{
@@ -1954,6 +1979,8 @@ function stopRuler() {{
     map.getContainer().style.cursor = '';
     map.dragging.enable();
     map.doubleClickZoom.enable();
+    var btn = document.querySelector('.ruler-btn');
+    if (btn) btn.style.background = '';
 }}
 
 function clearRuler() {{
@@ -1967,6 +1994,16 @@ function clearRuler() {{
 function formatDist(m) {{
     if (m < 1000) return Math.round(m) + ' м';
     return (m / 1000).toFixed(2) + ' км';
+}}
+
+function addRulerPoint(latlng) {{
+    rulerPoints.push(latlng);
+    var m = L.circleMarker(latlng, {{
+        radius: 4, color: '#d32f2f', fillColor: '#fff',
+        weight: 2, fillOpacity: 1
+    }}).addTo(map);
+    rulerMarkers.push(m);
+    updateRuler();
 }}
 
 function updateRuler() {{
@@ -1987,13 +2024,17 @@ function updateRuler() {{
 
 map.on('click', function(e) {{
     if (!rulerActive) return;
-    rulerPoints.push(e.latlng);
-    var m = L.circleMarker(e.latlng, {{
-        radius: 4, color: '#d32f2f', fillColor: '#fff',
-        weight: 2, fillOpacity: 1
-    }}).addTo(map);
-    rulerMarkers.push(m);
-    updateRuler();
+    addRulerPoint(e.latlng);
+}});
+
+// Перехват кликов по маркерам (ДТП/камеры) при активной линейке
+map.on('popupopen', function(e) {{
+    if (!rulerActive) return;
+    var source = e.popup._source;
+    if (source && source.getLatLng) {{
+        addRulerPoint(source.getLatLng());
+    }}
+    map.closePopup(e.popup);
 }});
 
 map.on('dblclick', function(e) {{
@@ -2013,6 +2054,7 @@ clearBtn.onAdd = function() {{
     a.style.cssText = 'font-size:14px;line-height:26px;text-align:center;display:block;width:26px;height:26px;color:#d32f2f;';
     L.DomEvent.on(a, 'click', function(e) {{
         L.DomEvent.preventDefault(e);
+        L.DomEvent.stopPropagation(e);
         clearRuler();
         stopRuler();
     }});
@@ -2420,6 +2462,7 @@ rulerBtn.onAdd = function() {{
     a.style.cssText = 'font-size:16px;line-height:26px;text-align:center;display:block;width:26px;height:26px;';
     L.DomEvent.on(a, 'click', function(e) {{
         L.DomEvent.preventDefault(e);
+        L.DomEvent.stopPropagation(e);
         toggleRuler();
     }});
     return div;
@@ -2440,6 +2483,9 @@ function startRuler() {{
     map.getContainer().style.cursor = 'crosshair';
     map.dragging.disable();
     map.doubleClickZoom.disable();
+    // Подсветка кнопки
+    var btn = document.querySelector('.ruler-btn');
+    if (btn) btn.style.background = '#d32f2f';
 }}
 
 function stopRuler() {{
@@ -2447,6 +2493,8 @@ function stopRuler() {{
     map.getContainer().style.cursor = '';
     map.dragging.enable();
     map.doubleClickZoom.enable();
+    var btn = document.querySelector('.ruler-btn');
+    if (btn) btn.style.background = '';
 }}
 
 function clearRuler() {{
@@ -2460,6 +2508,16 @@ function clearRuler() {{
 function formatDist(m) {{
     if (m < 1000) return Math.round(m) + ' м';
     return (m / 1000).toFixed(2) + ' км';
+}}
+
+function addRulerPoint(latlng) {{
+    rulerPoints.push(latlng);
+    var m = L.circleMarker(latlng, {{
+        radius: 4, color: '#d32f2f', fillColor: '#fff',
+        weight: 2, fillOpacity: 1
+    }}).addTo(map);
+    rulerMarkers.push(m);
+    updateRuler();
 }}
 
 function updateRuler() {{
@@ -2480,13 +2538,17 @@ function updateRuler() {{
 
 map.on('click', function(e) {{
     if (!rulerActive) return;
-    rulerPoints.push(e.latlng);
-    var m = L.circleMarker(e.latlng, {{
-        radius: 4, color: '#d32f2f', fillColor: '#fff',
-        weight: 2, fillOpacity: 1
-    }}).addTo(map);
-    rulerMarkers.push(m);
-    updateRuler();
+    addRulerPoint(e.latlng);
+}});
+
+// Перехват кликов по маркерам (ДТП/камеры) при активной линейке
+map.on('popupopen', function(e) {{
+    if (!rulerActive) return;
+    var source = e.popup._source;
+    if (source && source.getLatLng) {{
+        addRulerPoint(source.getLatLng());
+    }}
+    map.closePopup(e.popup);
 }});
 
 map.on('dblclick', function(e) {{
@@ -2506,6 +2568,7 @@ clearBtn.onAdd = function() {{
     a.style.cssText = 'font-size:14px;line-height:26px;text-align:center;display:block;width:26px;height:26px;color:#d32f2f;';
     L.DomEvent.on(a, 'click', function(e) {{
         L.DomEvent.preventDefault(e);
+        L.DomEvent.stopPropagation(e);
         clearRuler();
         stopRuler();
     }});
