@@ -2159,8 +2159,8 @@ function drawClusterGroup(data, zoneLayer, dtpLayer, isPre) {{
         if (pts.length >= 2) {{
             var lineCoords = pts.map(function(p) {{ return [p.lat, p.lon]; }});
             var lineOpts = {{
-                color: isPre ? '#757575' : color,
-                weight: 3, opacity: 0.7
+                color: isPre ? '#757575' : '#000000',
+                weight: 3, opacity: 0.8
             }};
             if (isPre) lineOpts.dashArray = '6,4';
             L.polyline(lineCoords, lineOpts).addTo(zoneLayer);
