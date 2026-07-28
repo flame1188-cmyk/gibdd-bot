@@ -177,6 +177,7 @@ def _parse_xml_cards(xml_bytes: bytes) -> list[dict[str, Any]]:
             "k_uch": _text(tab, "KUCH"),
             "pog": _text(tab, "POG"),
             "ran": _text(tab, "RAN"),
+            "kart_id": _text(tab, "kartId"),
         }
 
         # --- dor_usl (дорожные условия) ---

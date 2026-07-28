@@ -301,6 +301,7 @@ FILE2_COLUMNS = [
     "Время",
     "Вид ДТП",
     "Место",
+    "Населенный пункт",
     "Улица",
     "Дом",
     "Дорога",
@@ -394,6 +395,7 @@ def _parse_participant(
     row["Время"] = _safe_str(card.get("time", ""))
     row["Вид ДТП"] = _safe_str(card.get("dtpv", ""))
     row["Место"] = _safe_str(card.get("district", ""))
+    row["Населенный пункт"] = _safe_str(card.get("np", ""))
     row["Улица"] = _safe_str(card.get("street", ""))
     row["Дом"] = _safe_str(card.get("house", ""))
     row["Дорога"] = _safe_str(card.get("dor", ""))
@@ -449,7 +451,7 @@ def _parse_participant(
     # --- Категория и значение дороги ---
     row["Категория дороги"] = _safe_str(card.get("dor_k", ""))
     row["Значение дороги"] = _safe_str(card.get("dor_z", ""))
-    row["Номер СтатГИБДД"] = _safe_str(card.get("empt_number", ""))
+    row["Номер СтатГИБДД"] = _safe_str(card.get("kart_id", ""))
 
     # --- Данные ТС (если есть — для водителей и пассажиров) ---
     if vehicle is not None:
