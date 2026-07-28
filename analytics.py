@@ -883,3 +883,319 @@ def extract_raw_supplement(
     text = "\n".join(lines)
     logger.info(f"Raw supplement для LLM ({label}): {len(cards)} карточек, {len(text)} символов")
     return text
+
+
+# ========================
+# Кросс-таблицы для расширенного промпта (бесплатный метод)
+# ========================
+
+def _get_all_participants(card: dict) -> list[dict]:
+    """
+    Извлекает всех участников ДТП с привязкой к данным ТС.
+    Возвращает список словарей:
+      {kt_uch, s_t, npdd, sop_npdd, v_st, alco, safety_belt, pol, t_ts, vehicle}
+    """
+    participants = []
+    ts_list = card.get("ts_info", []) or []
+    for vehicle in ts_list:
+        ts_uch_list = vehicle.get("ts_uch", []) or []
+        for uch in ts_uch_list:
+            participants.append({
+                "kt_uch": str(uch.get("kt_uch", "")).strip(),
+                "s_t": str(uch.get("s_t", "")).strip(),
+                "npdd": uch.get("npdd") or [],
+                "sop_npdd": uch.get("sop_npdd") or [],
+                "v_st": str(uch.get("v_st", "")).strip(),
+                "alco": str(uch.get("alco", "")).strip(),
+                "safety_belt": str(uch.get("safety_belt", "")).strip(),
+                "pol": str(uch.get("pol", "")).strip(),
+                "t_ts": str(vehicle.get("t_ts", "")).strip(),
+                "vehicle": vehicle,
+            })
+    uch_list = card.get("uch_info", []) or []
+    for uch in uch_list:
+        participants.append({
+            "kt_uch": str(uch.get("kt_uch", "")).strip(),
+            "s_t": str(uch.get("s_t", "")).strip(),
+            "npdd": uch.get("npdd") or [],
+            "sop_npdd": uch.get("sop_npdd") or [],
+            "v_st": "",
+            "alco": "",
+            "safety_belt": "",
+            "pol": str(uch.get("pol", "")).strip(),
+            "t_ts": "",
+            "vehicle": None,
+        })
+    return participants
+
+
+def _classify_experience(st_val: str) -> str:
+    """Группирует стаж водителя: 0-2, 3-5, 6-10, 10+, нет данных."""
+    if not st_val or st_val in ("", "95", "96", "0"):
+        return "не указан"
+    try:
+        years = int(float(st_val))
+        if years <= 2:
+            return "0-2 года"
+        elif years <= 5:
+            return "3-5 лет"
+        elif years <= 10:
+            return "6-10 лет"
+        else:
+            return "10+ лет"
+    except (ValueError, TypeError):
+        return "не указан"
+
+
+def _classify_hour_3(h: int | None) -> str:
+    """Группирует часы в 3-часовые интервалы."""
+    if h is None:
+        return "не указано"
+    start = (h // 3) * 3
+    end = start + 2
+    return f"{start:02d}:00-{end:02d}:59"
+
+
+def _is_alcohol_dtp(card: dict) -> bool:
+    """Есть ли в ДТП нетрезвый водитель."""
+    return _has_alcohol(card)
+
+
+def _has_pedestrian_dtp(card: dict) -> bool:
+    """Есть ли в ДТП пешеход."""
+    return _has_pedestrian(card)
+
+
+def _get_violations(uch: dict) -> list[str]:
+    """Извлекает все нарушения ПДД (непосредственные + сопутствующие)."""
+    result = []
+    for v in (uch.get("npdd") or []):
+        v_str = str(v).strip()
+        if v_str and v_str != "Нет нарушений":
+            result.append(v_str)
+    for v in (uch.get("sop_npdd") or []):
+        v_str = str(v).strip()
+        if v_str and v_str != "Нет нарушений":
+            result.append(v_str)
+    return result
+
+
+def calculate_cross_tables(cards: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Строит кросс-таблицы по карточкам ДТП для расширенного анализа.
+
+    Возвращает словарь с кросс-таблицами:
+      - hour_x_severity: {interval: {dtp, deaths, injured}}
+      - weekday_x_severity: {day_name: {dtp, deaths, injured}}
+      - experience_x_severity: {group: {participants, deaths, injured, unhurt}}
+      - experience_x_violations: {group: Counter(violation)}
+      - vehicle_type_x_severity: {type: {participants, deaths, injured, unhurt}}
+      - road_value_x_severity: {value: {dtp, deaths, injured}}
+      - weather_x_dtp_type: {weather: Counter(dtp_type)}
+      - lighting_x_pedestrian_share: {lighting: {dtp_with_ped, total_dtp}}
+      - belt_x_severity: {belt_status: {participants, deaths, injured, unhurt}}
+      - alcohol_x_weekday: {"да"/"нет": Counter(weekday_num)}
+      - alcohol_x_hour: {"да"/"нет": Counter(hour_interval)}
+      - gender_x_severity: {gender: {participants, deaths, injured, unhurt}}
+      - participant_category_x_severity: {category: {participants, deaths, injured, unhurt}}
+      - dtp_type_x_severity: {type: {dtp, deaths, injured}}
+      - road_value_x_dtp_type: {road_value: Counter(dtp_type)}
+      - weather_x_severity: {weather: {dtp, deaths, injured}}
+      - lighting_x_severity: {lighting: {dtp, deaths, injured}}
+      - month_x_severity: {month: {dtp, deaths, injured}}
+    """
+    # Инициализация всех таблиц
+    hour_x_severity: dict[str, dict] = {}
+    weekday_x_severity: dict[str, dict] = {}
+    experience_x_severity: dict[str, dict] = {}
+    experience_x_violations: dict[str, Counter] = {}
+    vehicle_type_x_severity: dict[str, dict] = {}
+    road_value_x_severity: dict[str, dict] = {}
+    weather_x_dtp_type: dict[str, Counter] = {}
+    lighting_x_pedestrian_share: dict[str, dict] = {}
+    belt_x_severity: dict[str, dict] = {}
+    alcohol_x_weekday: dict[str, Counter] = {}
+    alcohol_x_hour: dict[str, Counter] = {}
+    gender_x_severity: dict[str, dict] = {}
+    participant_category_x_severity: dict[str, dict] = {}
+    dtp_type_x_severity: dict[str, dict] = {}
+    road_value_x_dtp_type: dict[str, Counter] = {}
+    weather_x_severity: dict[str, dict] = {}
+    lighting_x_severity: dict[str, dict] = {}
+    month_x_severity: dict[str, dict] = {}
+
+    def _add_severity(table: dict, key: str, deaths: int, injured: int, count: int = 1):
+        if key not in table:
+            table[key] = {"dtp": 0, "deaths": 0, "injured": 0}
+        table[key]["dtp"] += count
+        table[key]["deaths"] += deaths
+        table[key]["injured"] += injured
+
+    def _add_part_severity(table: dict, key: str, severity: str, count: int = 1):
+        if key not in table:
+            table[key] = {"participants": 0, "deaths": 0, "injured": 0, "unhurt": 0}
+        table[key]["participants"] += count
+        s_lower = severity.lower()
+        if s_lower in ("погиб", "гибель"):
+            table[key]["deaths"] += count
+        elif s_lower in ("ранен", "ранение"):
+            table[key]["injured"] += count
+        else:
+            table[key]["unhurt"] += count
+
+    for card in cards:
+        deaths = _safe_int(card.get("pog"))
+        injured = _safe_int(card.get("ran"))
+        dtp_type = str(card.get("dtpv", "")).strip()
+        hour = _get_hour(str(card.get("time", "")))
+        hour_interval = _classify_hour_3(hour)
+        wd_num = _get_weekday(str(card.get("date_dtp", "")))
+        wd_name = DAY_NAMES.get(wd_num, str(wd_num)) if wd_num is not None else "не указан"
+        has_ped = _has_pedestrian_dtp(card)
+        has_alc = _is_alcohol_dtp(card)
+
+        # Погода
+        dor_usl = card.get("dor_usl", {}) or {}
+        weather_list = dor_usl.get("spog", []) or []
+        weather_str = "; ".join(str(w).strip() for w in weather_list if str(w).strip()) or "не указана"
+
+        # Освещение
+        lighting = str(dor_usl.get("osv", "")).strip() or "не указано"
+
+        # Значение дороги
+        road_value = str(card.get("dor_z", "")).strip() or "не указано"
+
+        # Месяц
+        date_str = str(card.get("date_dtp", "")).strip()
+        month_str = "не указан"
+        if date_str:
+            try:
+                from datetime import datetime
+                month_num = datetime.strptime(date_str[:10], "%d.%m.%Y").month
+                month_names_ru = {
+                    1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
+                    5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
+                    9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
+                }
+                month_str = month_names_ru.get(month_num, str(month_num))
+            except (ValueError, IndexError):
+                pass
+
+        # 1. Час × тяжесть
+        _add_severity(hour_x_severity, hour_interval, deaths, injured)
+
+        # 2. День недели × тяжесть
+        _add_severity(weekday_x_severity, wd_name, deaths, injured)
+
+        # 13. Вид ДТП × тяжесть
+        if dtp_type:
+            _add_severity(dtp_type_x_severity, dtp_type, deaths, injured)
+
+        # 6. Значение дороги × тяжесть
+        _add_severity(road_value_x_severity, road_value, deaths, injured)
+
+        # 15. Погода × тяжесть
+        for w in weather_list:
+            w_str = str(w).strip()
+            if w_str:
+                _add_severity(weather_x_severity, w_str, deaths, injured)
+
+        # 16. Освещение × тяжесть
+        _add_severity(lighting_x_severity, lighting, deaths, injured)
+
+        # 17. Месяц × тяжесть
+        _add_severity(month_x_severity, month_str, deaths, injured)
+
+        # 7. Погода × вид ДТП
+        for w in weather_list:
+            w_str = str(w).strip()
+            if w_str and dtp_type:
+                if w_str not in weather_x_dtp_type:
+                    weather_x_dtp_type[w_str] = Counter()
+                weather_x_dtp_type[w_str][dtp_type] += 1
+
+        # 8. Освещение × доля пешеходов
+        _light_key = lighting
+        if _light_key not in lighting_x_pedestrian_share:
+            lighting_x_pedestrian_share[_light_key] = {"dtp_with_ped": 0, "total_dtp": 0}
+        lighting_x_pedestrian_share[_light_key]["total_dtp"] += 1
+        if has_ped:
+            lighting_x_pedestrian_share[_light_key]["dtp_with_ped"] += 1
+
+        # 14. Значение дороги × вид ДТП
+        if dtp_type:
+            if road_value not in road_value_x_dtp_type:
+                road_value_x_dtp_type[road_value] = Counter()
+            road_value_x_dtp_type[road_value][dtp_type] += 1
+
+        # 10. Опьянение × день недели
+        _alc_key = "да" if has_alc else "нет"
+        if _alc_key not in alcohol_x_weekday:
+            alcohol_x_weekday[_alc_key] = Counter()
+        if wd_num is not None:
+            alcohol_x_weekday[_alc_key][wd_num] += 1
+
+        # 11. Опьянение × час
+        if _alc_key not in alcohol_x_hour:
+            alcohol_x_hour[_alc_key] = Counter()
+        alcohol_x_hour[_alc_key][hour_interval] += 1
+
+        # Обработка участников
+        all_parts = _get_all_participants(card)
+        for uch in all_parts:
+            kt = uch["kt_uch"].lower()
+            s_t = uch["s_t"]
+            pol = uch["pol"].strip() or "не указан"
+            v_st = uch["v_st"]
+            t_ts = uch["t_ts"].strip()
+            belt = uch["safety_belt"].strip() or "не указан"
+            exp_group = _classify_experience(v_st)
+            violations = _get_violations(uch)
+
+            # 3. Стаж × тяжесть
+            if exp_group != "не указан" and kt == "водитель":
+                _add_part_severity(experience_x_severity, exp_group, s_t)
+
+            # 4. Стаж × нарушения
+            if exp_group != "не указан" and kt == "водитель":
+                if exp_group not in experience_x_violations:
+                    experience_x_violations[exp_group] = Counter()
+                for v in violations:
+                    experience_x_violations[exp_group][v] += 1
+
+            # 5. Тип ТС × тяжесть
+            if t_ts:
+                _add_part_severity(vehicle_type_x_severity, t_ts, s_t)
+
+            # 9. Ремень × тяжесть
+            if uch["vehicle"] is not None:  # только в ТС
+                _add_part_severity(belt_x_severity, belt, s_t)
+
+            # 12. Пол × тяжесть
+            if pol != "не указан":
+                _add_part_severity(gender_x_severity, pol, s_t)
+
+            # Категория участника × тяжесть
+            if kt:
+                _add_part_severity(participant_category_x_severity, kt, s_t)
+
+    return {
+        "hour_x_severity": hour_x_severity,
+        "weekday_x_severity": weekday_x_severity,
+        "experience_x_severity": experience_x_severity,
+        "experience_x_violations": experience_x_violations,
+        "vehicle_type_x_severity": vehicle_type_x_severity,
+        "road_value_x_severity": road_value_x_severity,
+        "weather_x_dtp_type": weather_x_dtp_type,
+        "lighting_x_pedestrian_share": lighting_x_pedestrian_share,
+        "belt_x_severity": belt_x_severity,
+        "alcohol_x_weekday": alcohol_x_weekday,
+        "alcohol_x_hour": alcohol_x_hour,
+        "gender_x_severity": gender_x_severity,
+        "participant_category_x_severity": participant_category_x_severity,
+        "dtp_type_x_severity": dtp_type_x_severity,
+        "road_value_x_dtp_type": road_value_x_dtp_type,
+        "weather_x_severity": weather_x_severity,
+        "lighting_x_severity": lighting_x_severity,
+        "month_x_severity": month_x_severity,
+    }

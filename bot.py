@@ -1899,6 +1899,25 @@ async def _run_analysis(
                 f"⏳ Обычно занимает 15-30 секунд."
             )
 
+            # Кросс-таблицы для бесплатного метода (GLM)
+            cross_tables_ctx = ""
+            if llm_provider == "free" and current_cards:
+                try:
+                    from analytics import calculate_cross_tables
+                    current_cross = calculate_cross_tables(current_cards)
+                    prev_cross = None
+                    if prev_cards:
+                        prev_cross = calculate_cross_tables(prev_cards)
+                    from llm_analyzer import format_cross_tables_for_prompt
+                    cross_tables_ctx = format_cross_tables_for_prompt(
+                        current_cross, prev_cross, current_label, prev_label,
+                    )
+                    logger.info(
+                        f"Кросс-таблицы для GLM: {len(cross_tables_ctx)} символов"
+                    )
+                except Exception as e:
+                    logger.warning(f"Не удалось построить кросс-таблицы: {e}")
+
             llm_summary_text = await get_ai_summary(
                 comparison=comparison,
                 reg_name=reg_name,
@@ -1907,6 +1926,7 @@ async def _run_analysis(
                 raw_supplement=raw_sup,
                 news_context=news_ctx,
                 clusters_context=clusters_ctx,
+                cross_tables_context=cross_tables_ctx,
                 provider=llm_provider,
                 current_cards=current_cards if llm_provider == "paid" else None,
                 prev_cards=prev_cards if llm_provider == "paid" else None,
@@ -3180,6 +3200,22 @@ async def _handle_analytics_question(
             raw_sup = extract_raw_supplement(current_cards, current_label, max_cards=15)
             raw_sup += extract_raw_supplement(prev_cards, prev_label, max_cards=15)
 
+        # Кросс-таблицы для бесплатного метода (GLM)
+        cross_tables_ctx = ""
+        if llm_provider == "free" and current_cards:
+            try:
+                from analytics import calculate_cross_tables
+                current_cross = calculate_cross_tables(current_cards)
+                prev_cross = None
+                if prev_cards:
+                    prev_cross = calculate_cross_tables(prev_cards)
+                from llm_analyzer import format_cross_tables_for_prompt
+                cross_tables_ctx = format_cross_tables_for_prompt(
+                    current_cross, prev_cross, current_label, prev_label,
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось построить кросс-таблицы для Q&A: {e}")
+
         answer = await get_ai_answer(
             question=question,
             comparison=comparison,
@@ -3191,6 +3227,7 @@ async def _handle_analytics_question(
             clusters_context=format_clusters_for_prompt(
                 context.user_data.get("analytics_clusters", [])
             ),
+            cross_tables_context=cross_tables_ctx,
             provider=llm_provider,
         )
 

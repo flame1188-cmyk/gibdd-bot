@@ -152,20 +152,28 @@ SYSTEM_PROMPT = (
     "с 15-летним опытом работы в ГИБДД и МВД России. "
     "Твоя специализация — статистический анализ ДТП, выявление тенденций "
     "и разработка рекомендаций по повышению безопасности.\n\n"
+    "Тебе предоставлены: агрегированные метрики (основные показатели, "
+    "распределения по дням, часам, видам ДТП, погоде) и кросс-таблицы — "
+    "перекрёстные распределения, показывающие связи между факторами.\n\n"
+    "Кросс-таблицы позволяют выявлять корреляции, которые не видны "
+    "в плоских агрегатах: например, как время суток влияет на тяжесть последствий, "
+    "какой стаж водителей наиболее опасен, как значение дороги (федеральная/региональная/муниципальная) "
+    "коррелирует с аварийностью.\n\n"
     "Правила:\n"
     "1. Опирайся ТОЛЬКО на предоставленные цифры — не выдумывай данные\n"
     "2. Указывай конкретные цифры и проценты из данных\n"
     "3. Выделяй ключевые тенденции (рост/снижение) и их масштаб\n"
-    "4. Предлагай возможные причины выявленных изменений\n"
-    "5. Давай конкретные рекомендации по повышению безопасности\n"
-    "6. Если предоставлены очаги концентрации ДТП — обязательно используй их "
+    "4. Используй кросс-таблицы для выявления корреляций между факторами\n"
+    "5. Предлагай возможные причины выявленных изменений\n"
+    "6. Давай конкретные рекомендации по повышению безопасности\n"
+    "7. Если предоставлены очаги концентрации ДТП — обязательно используй их "
     "в анализе: выдели наиболее опасные участки, оцени тяжесть последствий, "
     "рекомендуй приоритетные мероприятия для конкретных очагов\n"
-    "7. Пиши на русском языке, профессиональным но понятным стилем\n"
-    "8. Структурируй ответ: выводы, причины, рекомендации\n"
-    "9. Если данных недостаточно для вывода — так и скажи\n"
-    "10. Не используй эмодзи и markdown-форматирование\n"
-    "11. Объём ответа: 3-5 абзацев для резюме, 2-4 абзаца для ответа на вопрос"
+    "8. Пиши на русском языке, профессиональным но понятным стилем\n"
+    "9. Структурируй ответ: выводы, причины, рекомендации\n"
+    "10. Если данных недостаточно для вывода — так и скажи\n"
+    "11. Не используй эмодзи и markdown-форматирование\n"
+    "12. Объём ответа: 3-5 абзацев для резюме, 2-4 абзаца для ответа на вопрос"
 )
 
 
@@ -195,7 +203,9 @@ SYSTEM_PROMPT_PAID = (
     "должно быть подкреплено конкретным значением из данных. Если ты не можешь "
     "точно посчитать — не пиши число, пиши качественно.\n"
     "3. Не повторяй одну и ту же информацию в разных разделах. "
-    "Каждый раздел должен содержать уникальную информацию.\n"
+    "Каждый раздел должен содержать уникальную информацию. "
+    "Каждая тема (например, 'пешеходы', 'алкоголь', 'скорость') "
+    "должна упоминаться не более чем в 2 разделах.\n"
     "4. Структурируй ответ по разделам с заголовками (без markdown, без эмодзи).\n"
     "5. Пиши на русском языке, профессиональным но понятным стилем.\n"
     "6. Не дублируй раздел «Очаги ДТП» — упомяни их один раз в соответствующем разделе.\n\n"
@@ -208,6 +218,8 @@ SYSTEM_PROMPT_PAID = (
     "   - Погодные условия и виды ДТП\n"
     "   - Тип транспортного средства и тяжесть\n"
     "   - Освещение и вид ДТП\n"
+    "   - Значение дороги (федеральные, региональные, муниципальные) и "
+    "доля ДТП/погибших/раненых по каждой категории\n"
     "   - Опьянение и время суток/день недели\n"
     "   - Использование ремня безопасности и тяжесть последствий\n"
     "   Для каждой корреляции приведи конкретные числа из данных.\n"
@@ -218,12 +230,21 @@ SYSTEM_PROMPT_PAID = (
     "   - Доли категорий участников (водители/пешеходы/пассажиры) с числами\n"
     "   - Доля нетрезвых водителей с числом случаев\n"
     "4. ПАТТЕРНЫ И АНОМАЛИИ — типичные комбинации факторов в ДТП, "
-    "нетипичные случаи, сезонные и временные закономерности.\n"
+    "нетипичные случаи, сезонные и временные закономерности. "
+    "ПРАВИЛО РЕПРЕЗЕНТАТИВНОСТИ: если ты приводишь конкретный пример ДТП "
+    "для иллюстрации паттерна, он должен быть репрезентативным. "
+    "Не обобщай по единичному случаю. Для вывода нужно не менее 3 "
+    "подтверждающих примеров из данных. Если примеров меньше — "
+    "сформулируй вывод как предположение (возможно, может указывать).\n"
     "5. ПРОГНОЗ РИСКОВ — где вероятен рост аварийности, какие факторы "
     "усиливают риск, наиболее опасные локации. Только на основе выявленных паттернов.\n"
     "6. РЕКОМЕНДАЦИИ — НЕ БОЛЕЕ 5 конкретных мер. Каждая рекомендация должна содержать:\n"
     "   - Конкретную проблему (из данных)\n"
-    "   - Конкретную меру (не общие слова типа «усилить контроль»)\n"
+    "   - Конкретную меру (не общие слова типа «усилить контроль»). "
+    "Категорически запрещено указывать конкретные модели, бренды, "
+    "ГОСТы или артикулы оборудования (не пиши «Т7», «ЮМЗ», «ГОСТ 50597-2017» и т.п.). "
+    "Пиши тип оборудования обобщённо: светофор с кнопкой вызова, "
+    "тросовое ограждение, камера фотовидеофиксации, лежачий полицейский и т.д.\n"
     "   - Конкретную локацию (дорогу, перекрёсток, населённый пункт из данных)\n"
     "   Качество важнее количества. Никаких шаблонных фраз.\n\n"
     "7. Если предоставлены очаги концентрации ДТП — проанализируй их один раз: "
@@ -592,6 +613,298 @@ def format_clusters_for_prompt(
     return "\n".join(lines)
 
 
+def format_cross_tables_for_prompt(
+    current_cross: dict[str, Any],
+    prev_cross: dict[str, Any] | None = None,
+    current_label: str = "текущий",
+    prev_label: str = "предыдущий",
+) -> str:
+    """
+    Форматирует кросс-таблицы в компактный текст для промпта LLM.
+
+    Каждая таблица — это компактный блок вида:
+      НАЗВАНИЕ:
+      строка1: кол1 | кол2 | кол3
+      строка2: ...
+
+    Args:
+        current_cross: Кросс-таблицы текущего периода (из calculate_cross_tables)
+        prev_cross: Кросс-таблицы предыдущего периода (опционально)
+        current_label: Подпись текущего периода
+        prev_label: Подпись предыдущего периода
+    """
+    from collections import Counter
+
+    lines = []
+    lines.append("КРОСС-ТАБЛИЦЫ:")
+    lines.append("")
+
+    def _fmt_severity_table(
+        title: str,
+        cur_table: dict[str, dict],
+        prev_table: dict[str, dict] | None = None,
+        sort_key: str = "dtp",
+        max_rows: int = 15,
+    ) -> list[str]:
+        """Форматирует таблицу {key: {dtp, deaths, injured}}."""
+        rows = []
+        rows.append(f"  {title}:")
+        rows.append(f"  {'Категория':<20} | {'ДТП':>5} | {'Погибло':>7} | {'Ранено':>6}")
+        if prev_table:
+            rows[-1] += f" | {'ДТП было':>8} | {'Измен.':>7}"
+        rows.append(f"  {'-'*20}-+-{'-'*5}-+-{'-'*7}-+-{'-'*6}")
+        if prev_table:
+            rows[-1] += f"-+-{'-'*8}-+-{'-'*7}"
+
+        sorted_keys = sorted(
+            cur_table.keys(),
+            key=lambda k: cur_table[k].get(sort_key, 0),
+            reverse=True,
+        )[:max_rows]
+
+        for key in sorted_keys:
+            c = cur_table[key]
+            dtp_c = c.get("dtp", 0)
+            deaths_c = c.get("deaths", 0)
+            injured_c = c.get("injured", 0)
+            line = f"  {key:<20} | {dtp_c:>5} | {deaths_c:>7} | {injured_c:>6}"
+
+            if prev_table and key in prev_table:
+                p = prev_table[key]
+                dtp_p = p.get("dtp", 0)
+                change = _format_change(round((dtp_c - dtp_p) / dtp_p * 100, 1)) if dtp_p > 0 else "новое"
+                line += f" | {dtp_p:>8} | {change:>7}"
+            rows.append(line)
+
+        rows.append("")
+        return rows
+
+    def _fmt_part_severity_table(
+        title: str,
+        cur_table: dict[str, dict],
+        max_rows: int = 10,
+    ) -> list[str]:
+        """Форматирует таблицу {key: {participants, deaths, injured, unhurt}}."""
+        rows = []
+        rows.append(f"  {title}:")
+        rows.append(f"  {'Категория':<20} | {'Всего':>5} | {'Погибло':>7} | {'Ранено':>6} | {'Без послед.':>11}")
+        rows.append(f"  {'-'*20}-+-{'-'*5}-+-{'-'*7}-+-{'-'*6}-+-{'-'*11}")
+
+        sorted_keys = sorted(
+            cur_table.keys(),
+            key=lambda k: cur_table[k].get("participants", 0),
+            reverse=True,
+        )[:max_rows]
+
+        for key in sorted_keys:
+            c = cur_table[key]
+            total = c.get("participants", 0)
+            deaths = c.get("deaths", 0)
+            injured = c.get("injured", 0)
+            unhurt = c.get("unhurt", 0)
+            rows.append(
+                f"  {key:<20} | {total:>5} | {deaths:>7} | {injured:>6} | {unhurt:>11}"
+            )
+        rows.append("")
+        return rows
+
+    def _fmt_counter_table(
+        title: str,
+        cur_counter: dict[str, Counter],
+        max_rows: int = 8,
+        max_cols: int = 5,
+    ) -> list[str]:
+        """Форматирует таблицу {key: Counter(values)}."""
+        rows = []
+        rows.append(f"  {title}:")
+
+        sorted_keys = sorted(
+            cur_counter.keys(),
+            key=lambda k: sum(cur_counter[k].values()),
+            reverse=True,
+        )[:max_rows]
+
+        for key in sorted_keys:
+            top_items = cur_counter[key].most_common(max_cols)
+            items_str = ", ".join(f"{v} ({cnt})" for v, cnt in top_items)
+            rows.append(f"    {key}: {items_str}")
+        rows.append("")
+        return rows
+
+    def _fmt_lighting_ped_table(
+        title: str,
+        cur_table: dict[str, dict],
+    ) -> list[str]:
+        """Форматирует таблицу {lighting: {dtp_with_ped, total_dtp}}."""
+        rows = []
+        rows.append(f"  {title}:")
+        rows.append(f"  {'Освещение':<25} | {'Всего ДТП':>9} | {'С пешеходами':>13} | {'Доля, %':>7}")
+        rows.append(f"  {'-'*25}-+-{'-'*9}-+-{'-'*13}-+-{'-'*7}")
+
+        sorted_keys = sorted(
+            cur_table.keys(),
+            key=lambda k: cur_table[k].get("total_dtp", 0),
+            reverse=True,
+        )
+
+        for key in sorted_keys:
+            c = cur_table[key]
+            total = c.get("total_dtp", 0)
+            ped = c.get("dtp_with_ped", 0)
+            share = round(ped / total * 100, 1) if total > 0 else 0
+            rows.append(
+                f"  {key:<25} | {total:>9} | {ped:>13} | {share:>6.1f}%"
+            )
+        rows.append("")
+        return rows
+
+    def _fmt_alcohol_dist_table(
+        title: str,
+        cur_counter: dict[str, Counter],
+        prev_counter: dict[str, Counter] | None = None,
+        label_type: str = "weekday",
+    ) -> list[str]:
+        """Форматирует распределение опьянения по дням/часам."""
+        rows = []
+        rows.append(f"  {title}:")
+
+        day_names = {
+            0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт", 4: "Пт", 5: "Сб", 6: "Вс",
+        }
+        alc_data = cur_counter.get("да", Counter())
+
+        if label_type == "weekday":
+            # Заголовок
+            header = "     "
+            for d in range(7):
+                header += f" | {day_names[d]:>5}"
+            rows.append(header)
+            rows.append(f"  Алкоголь{'-' * (len(header) - 10)}")
+            vals = "     "
+            for d in range(7):
+                vals += f" | {alc_data.get(d, 0):>5}"
+            rows.append(vals)
+        else:
+            # По 3-часовым интервалам
+            sorted_intervals = sorted(alc_data.keys())
+            for interval in sorted_intervals:
+                rows.append(f"    {interval}: {alc_data[interval]}")
+
+        rows.append("")
+        return rows
+
+    # 1. Час × тяжесть
+    prev_h = prev_cross.get("hour_x_severity") if prev_cross else None
+    lines.extend(_fmt_severity_table(
+        "Время суток × тяжесть", current_cross["hour_x_severity"], prev_h, max_rows=8,
+    ))
+
+    # 2. День недели × тяжесть
+    prev_w = prev_cross.get("weekday_x_severity") if prev_cross else None
+    lines.extend(_fmt_severity_table(
+        "День недели × тяжесть", current_cross["weekday_x_severity"], prev_w, max_rows=7,
+    ))
+
+    # 3. Стаж × тяжесть (участники)
+    lines.extend(_fmt_part_severity_table(
+        "Стаж водителя × тяжесть последствий",
+        current_cross["experience_x_severity"],
+    ))
+
+    # 4. Стаж × топ-нарушения
+    lines.extend(_fmt_counter_table(
+        "Стаж водителя × типы нарушений ПДД",
+        current_cross["experience_x_violations"],
+    ))
+
+    # 5. Тип ТС × тяжесть
+    lines.extend(_fmt_part_severity_table(
+        "Тип транспортного средства × тяжесть последствий",
+        current_cross["vehicle_type_x_severity"],
+    ))
+
+    # 6. Значение дороги × тяжесть
+    prev_rv = prev_cross.get("road_value_x_severity") if prev_cross else None
+    lines.extend(_fmt_severity_table(
+        "Значение дороги × тяжесть (Федеральные/Региональные/Муниципальные)",
+        current_cross["road_value_x_severity"], prev_rv, max_rows=5,
+    ))
+
+    # 7. Погода × вид ДТП
+    lines.extend(_fmt_counter_table(
+        "Погодные условия × вид ДТП",
+        current_cross["weather_x_dtp_type"],
+    ))
+
+    # 8. Освещение × доля пешеходных ДТП
+    lines.extend(_fmt_lighting_ped_table(
+        "Освещение × доля ДТП с пешеходами",
+        current_cross["lighting_x_pedestrian_share"],
+    ))
+
+    # 9. Ремень безопасности × тяжесть
+    lines.extend(_fmt_part_severity_table(
+        "Ремень безопасности × тяжесть последствий",
+        current_cross["belt_x_severity"],
+    ))
+
+    # 10. Опьянение × день недели
+    prev_aw = prev_cross.get("alcohol_x_weekday") if prev_cross else None
+    lines.extend(_fmt_alcohol_dist_table(
+        "Опьянение × день недели",
+        current_cross["alcohol_x_weekday"], prev_aw, "weekday",
+    ))
+
+    # 11. Опьянение × час
+    prev_ah = prev_cross.get("alcohol_x_hour") if prev_cross else None
+    lines.extend(_fmt_alcohol_dist_table(
+        "Опьянение × время суток",
+        current_cross["alcohol_x_hour"], prev_ah, "hour",
+    ))
+
+    # 12. Пол × тяжесть
+    lines.extend(_fmt_part_severity_table(
+        "Пол участника × тяжесть последствий",
+        current_cross["gender_x_severity"],
+    ))
+
+    # 13. Категория участника × тяжесть
+    lines.extend(_fmt_part_severity_table(
+        "Категория участника × тяжесть последствий",
+        current_cross["participant_category_x_severity"],
+    ))
+
+    # 14. Вид ДТП × тяжесть
+    prev_dt = prev_cross.get("dtp_type_x_severity") if prev_cross else None
+    lines.extend(_fmt_severity_table(
+        "Вид ДТП × тяжесть",
+        current_cross["dtp_type_x_severity"], prev_dt, max_rows=10,
+    ))
+
+    # 15. Погода × тяжесть
+    prev_ws = prev_cross.get("weather_x_severity") if prev_cross else None
+    lines.extend(_fmt_severity_table(
+        "Погодные условия × тяжесть",
+        current_cross["weather_x_severity"], prev_ws, max_rows=8,
+    ))
+
+    # 16. Освещение × тяжесть
+    prev_ls = prev_cross.get("lighting_x_severity") if prev_cross else None
+    lines.extend(_fmt_severity_table(
+        "Освещение × тяжесть",
+        current_cross["lighting_x_severity"], prev_ls, max_rows=5,
+    ))
+
+    # 17. Месяц × тяжесть
+    prev_ms = prev_cross.get("month_x_severity") if prev_cross else None
+    lines.extend(_fmt_severity_table(
+        "Месяц × тяжесть",
+        current_cross["month_x_severity"], prev_ms, max_rows=12, sort_key="deaths",
+    ))
+
+    return "\n".join(lines)
+
+
 def format_metrics_for_prompt(
     comparison: dict[str, Any],
     reg_name: str,
@@ -725,6 +1038,7 @@ def build_summary_prompt(
     raw_supplement: str = "",
     news_context: str = "",
     clusters_context: str = "",
+    cross_tables_context: str = "",
 ) -> str:
     """Создаёт промпт для генерации аналитического резюме."""
     metrics_text = format_metrics_for_prompt(
@@ -738,6 +1052,14 @@ def build_summary_prompt(
         f"3. Возможные причины изменений\n"
         f"4. Рекомендации по повышению безопасности дорожного движения"
     )
+    if cross_tables_context:
+        prompt += (
+            f"\n\n{cross_tables_context}\n\n"
+            f"Используй кросс-таблицы для выявления скрытых корреляций: "
+            f"как время суток влияет на тяжесть, какой стаж водителей наиболее опасен, "
+            f"как погода и освещение коррелируют с видами ДТП, "
+            f"как значение дороги (федеральная/региональная/муниципальная) влияет на аварийность."
+        )
     if clusters_context:
         prompt += (
             f"\n\n{clusters_context}\n\n"
@@ -840,6 +1162,7 @@ def build_question_prompt(
     raw_supplement: str = "",
     news_context: str = "",
     clusters_context: str = "",
+    cross_tables_context: str = "",
 ) -> str:
     """Создаёт промпт для ответа на вопрос пользователя."""
     metrics_text = format_metrics_for_prompt(
@@ -851,6 +1174,8 @@ def build_question_prompt(
         f"Ответь на вопрос, опираясь на приведённые данные. "
         f"Если данных недостаточно — так и скажи."
     )
+    if cross_tables_context:
+        prompt += f"\n\n{cross_tables_context}"
     if clusters_context:
         prompt += f"\n\n{clusters_context}"
     if raw_supplement:
@@ -1151,6 +1476,7 @@ async def get_ai_summary(
     raw_supplement: str = "",
     news_context: str = "",
     clusters_context: str = "",
+    cross_tables_context: str = "",
     provider: LLMProvider = "free",
     current_cards: list[dict[str, Any]] | None = None,
     prev_cards: list[dict[str, Any]] | None = None,
@@ -1158,13 +1484,14 @@ async def get_ai_summary(
     """
     Генерирует аналитическое резюме с помощью LLM.
 
-    Для бесплатного метода (free): использует агрегированные метрики + raw_supplement.
+    Для бесплатного метода (free): использует агрегированные метрики + кросс-таблицы.
     Для платного метода (paid): использует полные данные участников (Файл 2).
 
     Args:
         raw_supplement: Дополнительные данные из сырых карточек ДТП
         news_context: Новостной контекст из открытых источников
         clusters_context: Данные об очагах концентрации ДТП
+        cross_tables_context: Кросс-таблицы для бесплатного метода
         provider: "free" (ZhipuAI/GLM) или "paid" (OpenAI-совместимый)
         current_cards: Сырые карточки текущего периода (для платного метода)
         prev_cards: Сырые карточки предыдущего периода (для платного метода)
@@ -1199,12 +1526,13 @@ async def get_ai_summary(
         )
         return await ask_llm(user_message=prompt, provider=provider)
     else:
-        # Бесплатный метод: агрегированные метрики + raw_supplement
+        # Бесплатный метод: агрегированные метрики + кросс-таблицы
         prompt = build_summary_prompt(
             comparison, reg_name, current_label, prev_label,
             raw_supplement=raw_supplement,
             news_context=news_context,
             clusters_context=clusters_context,
+            cross_tables_context=cross_tables_context,
         )
         return await ask_llm(user_message=prompt, provider=provider)
 
@@ -1218,6 +1546,7 @@ async def get_ai_answer(
     raw_supplement: str = "",
     news_context: str = "",
     clusters_context: str = "",
+    cross_tables_context: str = "",
     provider: LLMProvider = "free",
 ) -> str:
     """
@@ -1227,6 +1556,7 @@ async def get_ai_answer(
         raw_supplement: Дополнительные данные из сырых карточек ДТП
         news_context: Новостной контекст из открытых источников
         clusters_context: Данные об очагах концентрации ДТП
+        cross_tables_context: Кросс-таблицы для бесплатного метода
         provider: "free" (ZhipuAI/GLM) или "paid" (OpenAI-совместимый)
 
     Returns:
@@ -1237,5 +1567,6 @@ async def get_ai_answer(
         raw_supplement=raw_supplement,
         news_context=news_context,
         clusters_context=clusters_context,
+        cross_tables_context=cross_tables_context,
     )
     return await ask_llm(user_message=prompt, provider=provider)
