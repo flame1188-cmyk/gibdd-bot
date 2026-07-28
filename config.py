@@ -36,17 +36,40 @@ HTTPS_PROXY: str = os.getenv("HTTPS_PROXY", "")
 
 
 # ========================
-# LLM (нейросеть для анализа)
+# LLM — бесплатный (ZhipuAI / GLM)
 # ========================
 # API-ключ для ZhipuAI (GLM). Получить: https://open.bigmodel.cn
-# Если не задан — функция "Анализ с ИИ" будет недоступна
+# Если не задан — кнопка "Анализ с ИИ" будет недоступна
 LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
 
 # Модель LLM (по умолчанию glm-4.7-flash — бесплатная, безлимитная, 200K контекст)
 # Другие бесплатные: glm-4.5-flash, glm-4-flash-250414
-# Платные: glm-5v-turbo, glm-5.1 (имеют строгие rate limits)
 LLM_MODEL: str = os.getenv("LLM_MODEL", "glm-4.7-flash")
 
+
+# ========================
+# LLM — платный (OpenAI-совместимый агрегатор, напр. AItunnel)
+# ========================
+# API-ключ для платного LLM-провайдера (AItunnel, OpenRouter и т.д.)
+# Если не задан — опция "Полный (платный)" не будет показываться
+LLM_PAID_API_KEY: str = os.getenv("LLM_PAID_API_KEY", "")
+
+# URL API платного провайдера (без /chat/completions — добавляется автоматически)
+# Примеры:
+#   AItunnel:  https://api.aitunnel.ru/v1
+#   OpenRouter: https://openrouter.ai/api/v1
+LLM_PAID_API_URL: str = os.getenv("LLM_PAID_API_URL", "https://api.aitunnel.ru/v1")
+
+# Модель платного LLM
+# Примеры:
+#   AItunnel:   deepseek-v4-flash, deepseek-v3, gpt-4o, claude-4-sonnet
+#   OpenRouter: google/gemini-2.5-flash, deepseek/deepseek-chat
+LLM_PAID_MODEL: str = os.getenv("LLM_PAID_MODEL", "deepseek-v4-flash")
+
+
+# ========================
+# Общие настройки LLM
+# ========================
 # Включать ли поиск новостей из открытых источников (Google News RSS + DuckDuckGo)
 # Если "false" — нейросеть будет анализировать только данные stat.gibdd.ru
 ENABLE_NEWS_SEARCH: bool = os.getenv("ENABLE_NEWS_SEARCH", "true").lower() == "true"

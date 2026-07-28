@@ -1,8 +1,9 @@
 """
-Модуль интеграции с LLM (GLM) для текстового анализа данных ДТП.
+Модуль интеграции с LLM для текстового анализа данных ДТП.
 
-Использует ZhipuAI API (https://open.bigmodel.cn) напрямую через httpx.
-Никаких дополнительных зависимостей не требуется.
+Поддерживает два провайдера:
+  1. Бесплатный: ZhipuAI (GLM) — https://open.bigmodel.cn
+  2. Платный: любой OpenAI-совместимый агрегатор (AItunnel, OpenRouter и др.)
 
 Функционал:
   1. Генерация аналитического резюме по метрикам ДТП
@@ -13,37 +14,68 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
-from config import LLM_API_KEY, LLM_MODEL
+from config import (
+    LLM_API_KEY, LLM_MODEL,
+    LLM_PAID_API_KEY, LLM_PAID_API_URL, LLM_PAID_MODEL,
+)
 
 logger = logging.getLogger(__name__)
 
 ZHIPU_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 
-# Персистентный HTTP-клиент для ZhipuAI (connection pooling)
-_llm_client: httpx.AsyncClient | None = None
+# Тип провайдера: "free" (ZhipuAI/GLM) или "paid" (OpenAI-совместимый)
+LLMProvider = Literal["free", "paid"]
+
+# Персистентные HTTP-клиенты (connection pooling)
+_free_llm_client: httpx.AsyncClient | None = None
+_paid_llm_client: httpx.AsyncClient | None = None
 
 
-def _get_llm_client() -> httpx.AsyncClient:
+def _get_free_llm_client() -> httpx.AsyncClient:
     """Возвращает переиспользуемый httpx-клиент для ZhipuAI API."""
-    global _llm_client
-    if _llm_client is None or _llm_client.is_closed:
-        # 300с = 5 мин: GLM-4.7-Flash с большими промптами (30-40K симв.)
-        # может обрабатывать дольше стандартных 3 минут
-        _llm_client = httpx.AsyncClient(timeout=300)
+    global _free_llm_client
+    if _free_llm_client is None or _free_llm_client.is_closed:
+        _free_llm_client = httpx.AsyncClient(timeout=300)
         logger.info("Создан новый HTTP-клиент для LLM (ZhipuAI)")
-    return _llm_client
+    return _free_llm_client
+
+
+def _get_paid_llm_client() -> httpx.AsyncClient:
+    """Возвращает переиспользуемый httpx-клиент для платного провайдера."""
+    global _paid_llm_client
+    if _paid_llm_client is None or _paid_llm_client.is_closed:
+        # 600с = 10 мин: модели с 1M контекстом могут обрабатывать дольше
+        _paid_llm_client = httpx.AsyncClient(timeout=600)
+        logger.info("Создан новый HTTP-клиент для LLM (платный)")
+    return _paid_llm_client
+
+
+# Для обратной совместимости
+_get_llm_client = _get_free_llm_client
 
 
 async def close_llm_client() -> None:
-    """Закрывает HTTP-клиент ZhipuAI."""
-    global _llm_client
-    if _llm_client is not None and not _llm_client.is_closed:
-        await _llm_client.aclose()
-        _llm_client = None
+    """Закрывает все HTTP-клиенты LLM."""
+    global _free_llm_client, _paid_llm_client
+    for client_var in [_free_llm_client, _paid_llm_client]:
+        if client_var is not None and not client_var.is_closed:
+            await client_var.aclose()
+    _free_llm_client = None
+    _paid_llm_client = None
+
+
+def is_paid_llm_available() -> bool:
+    """Проверяет, настроен ли платный LLM-провайдер."""
+    return bool(LLM_PAID_API_KEY and LLM_PAID_API_URL)
+
+
+def is_any_llm_available() -> bool:
+    """Проверяет, доступен ли хотя бы один LLM-провайдер."""
+    return bool(LLM_API_KEY) or is_paid_llm_available()
 
 # ============================================================
 # Глобальный rate limiter — минимальный интервал между ЛЮБЫМИ LLM-вызовами
@@ -377,9 +409,13 @@ async def ask_llm(
     user_message: str,
     system_prompt: str | None = None,
     max_retries: int = 5,
+    provider: LLMProvider = "free",
 ) -> str:
     """
-    Отправляет запрос к GLM API и возвращает текстовый ответ.
+    Отправляет запрос к LLM и возвращает текстовый ответ.
+    Поддерживает два провайдера: бесплатный (ZhipuAI/GLM) и платный
+    (OpenAI-совместимый агрегатор, напр. AItunnel).
+
     При 429 (Too Many Requests) и 5xx (Server Error) автоматически
     повторяет с задержкой.
 
@@ -387,14 +423,34 @@ async def ask_llm(
         user_message: Текст запроса пользователя
         system_prompt: Системный промпт (если None — используется стандартный)
         max_retries: Максимальное число повторных попыток при 429/5xx
+        provider: "free" (ZhipuAI/GLM) или "paid" (OpenAI-совместимый)
 
     Returns:
         Текст ответа от модели
 
     Raises:
-        ValueError: если LLM_API_KEY не задан
+        ValueError: если API-ключ не задан
         httpx.HTTPStatusError: при ошибке HTTP (кроме 429 после всех попыток)
     """
+    if provider == "paid":
+        return await _ask_paid_llm(
+            user_message=user_message,
+            system_prompt=system_prompt,
+            max_retries=max_retries,
+        )
+    return await _ask_free_llm(
+        user_message=user_message,
+        system_prompt=system_prompt,
+        max_retries=max_retries,
+    )
+
+
+async def _ask_free_llm(
+    user_message: str,
+    system_prompt: str | None = None,
+    max_retries: int = 5,
+) -> str:
+    """Запрос к бесплатному провайдеру (ZhipuAI / GLM)."""
     if not LLM_API_KEY:
         raise ValueError(
             "LLM_API_KEY не задан. Добавьте его в .env файл. "
@@ -419,7 +475,75 @@ async def ask_llm(
         "Content-Type": "application/json",
     }
 
-    # --- Глобальный rate limiter: ждём, если с предыдущего вызова прошло мало времени ---
+    return await _do_llm_request(
+        api_url=ZHIPU_API_URL,
+        headers=headers,
+        payload=payload,
+        model_name=LLM_MODEL,
+        prompt_len=len(user_message),
+        max_retries=max_retries,
+        client_getter=_get_free_llm_client,
+    )
+
+
+async def _ask_paid_llm(
+    user_message: str,
+    system_prompt: str | None = None,
+    max_retries: int = 5,
+) -> str:
+    """Запрос к платному провайдеру (OpenAI-совместимый API)."""
+    if not LLM_PAID_API_KEY:
+        raise ValueError(
+            "LLM_PAID_API_KEY не задан. Добавьте его в .env файл."
+        )
+
+    if system_prompt is None:
+        system_prompt = SYSTEM_PROMPT
+
+    # Формируем URL (убираем trailing slash, добавляем /chat/completions)
+    base_url = LLM_PAID_API_URL.rstrip("/")
+    api_url = f"{base_url}/chat/completions"
+
+    payload = {
+        "model": LLM_PAID_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 8192,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {LLM_PAID_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    return await _do_llm_request(
+        api_url=api_url,
+        headers=headers,
+        payload=payload,
+        model_name=LLM_PAID_MODEL,
+        prompt_len=len(user_message),
+        max_retries=max_retries,
+        client_getter=_get_paid_llm_client,
+    )
+
+
+async def _do_llm_request(
+    api_url: str,
+    headers: dict,
+    payload: dict,
+    model_name: str,
+    prompt_len: int,
+    max_retries: int,
+    client_getter,
+) -> str:
+    """
+    Универсная функция выполнения HTTP-запроса к LLM API.
+    Обрабатывает ретраи при 429, 5xx и таймаутах, парсит ответ.
+    """
+    # --- Глобальный rate limiter ---
     global _last_llm_call_time
     now = time.monotonic()
     elapsed_since_last = now - _last_llm_call_time
@@ -428,29 +552,26 @@ async def ask_llm(
         logger.info(f"Rate limiter: ждём {cooldown:.0f} сек между LLM-вызовами...")
         await asyncio.sleep(cooldown)
 
-    logger.info(f"LLM запрос: модель={LLM_MODEL}, длина промпта={len(user_message)} символов")
+    logger.info(f"LLM запрос: модель={model_name}, url={api_url}, длина промпта={prompt_len} символов")
 
-    # Фоллбэк-задержки при 429 (если нет заголовка Retry-After)
     retry_delays = [30, 60, 90, 120, 150]
 
     for attempt in range(max_retries + 1):
         try:
-            client = _get_llm_client()
+            client = client_getter()
             response = await client.post(
-                ZHIPU_API_URL,
+                api_url,
                 headers=headers,
                 json=payload,
             )
 
             if response.status_code == 429:
                 if attempt < max_retries:
-                    # Пытаемся прочитать точное время ожидания из заголовка
                     retry_after = (
                         response.headers.get("Retry-After")
                         or response.headers.get("retry-after")
                     )
                     if not retry_after:
-                        # ZhipuAI может вернуть задержку в JSON-теле
                         try:
                             body = response.json()
                             retry_after = str(body.get("retry_after") or body.get("wait") or "")
@@ -458,13 +579,12 @@ async def ask_llm(
                             pass
                     if retry_after:
                         try:
-                            wait = int(float(retry_after)) + 5  # +5 сек запас
+                            wait = int(float(retry_after)) + 5
                         except (ValueError, TypeError):
                             wait = retry_delays[attempt]
                     else:
                         wait = retry_delays[attempt]
 
-                    # Минимум 30 сек, даже если Retry-After маленький
                     wait = max(wait, 30)
 
                     logger.warning(
@@ -482,7 +602,6 @@ async def ask_llm(
                         response=response,
                     )
 
-            # Проверяем статус ответа
             if response.status_code >= 500:
                 if attempt < max_retries:
                     wait = retry_delays[attempt]
@@ -493,25 +612,19 @@ async def ask_llm(
                     )
                     await asyncio.sleep(wait)
                     continue
-                # Все попытки исчерпаны — пробрасываем ошибку
                 response.raise_for_status()
 
-            # Для 4xx и 2xx — стандартная проверка
             response.raise_for_status()
-
-            # Успешный запрос — обновляем время последнего вызова
             _last_llm_call_time = time.monotonic()
-            break  # Выходим из цикла ретраев
+            break
 
         except httpx.HTTPStatusError:
             raise
         except httpx.TimeoutException:
             if attempt < max_retries:
-                # После таймаута ZhipuAI может быть перегружен —
-                # увеличиваем паузу с каждой попыткой
                 wait = retry_delays[min(attempt, len(retry_delays) - 1)]
                 logger.warning(
-                    f"LLM таймаут (>{300//60} мин). "
+                    f"LLM таймаут. "
                     f"Попытка {attempt + 1}/{max_retries}, "
                     f"ожидание {wait} сек..."
                 )
@@ -525,11 +638,10 @@ async def ask_llm(
         logger.error(f"LLM вернул невалидный JSON: {e}")
         raise ValueError(f"LLM вернул невалидный ответ") from e
 
-    # Диагностика: логируем структуру ответа (без полного content для экономии)
+    # Логирование структуры ответа
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(f"LLM полный ответ: {json.dumps(data, ensure_ascii=False)[:500]}")
     else:
-        # Даже на INFO логируем ключи и структуру choices
         choices = data.get("choices") or [{}]
         choice = choices[0].get("message", {})
         content_preview = str(choice.get("content", ""))[:100]
@@ -553,11 +665,8 @@ async def ask_llm(
             f"LLM вернул пустой content, но есть reasoning_content ({len(reasoning)} симв.). "
             f"Пытаюсь извлечь ответ..."
         )
-        # reasoning_content обычно содержит цепочку мыслей + итоговый ответ в конце.
-        # Ищем последний осмысленный абзац как ответ.
         paragraphs = [p.strip() for p in reasoning.split("\n") if p.strip()]
         if paragraphs:
-            # Берём последние абзацы (обычно итог там)
             content = "\n".join(paragraphs[-5:]) if len(paragraphs) > 5 else "\n".join(paragraphs)
             logger.info(f"Извлечён ответ из reasoning: {len(content)} симв.")
 
@@ -583,6 +692,7 @@ async def get_ai_summary(
     raw_supplement: str = "",
     news_context: str = "",
     clusters_context: str = "",
+    provider: LLMProvider = "free",
 ) -> str:
     """
     Генерирует аналитическое резюме с помощью LLM.
@@ -591,6 +701,7 @@ async def get_ai_summary(
         raw_supplement: Дополнительные данные из сырых карточек ДТП
         news_context: Новостной контекст из открытых источников
         clusters_context: Данные об очагах концентрации ДТП
+        provider: "free" (ZhipuAI/GLM) или "paid" (OpenAI-совместимый)
 
     Returns:
         Текст резюме от нейросети
@@ -601,7 +712,7 @@ async def get_ai_summary(
         news_context=news_context,
         clusters_context=clusters_context,
     )
-    return await ask_llm(user_message=prompt)
+    return await ask_llm(user_message=prompt, provider=provider)
 
 
 async def get_ai_answer(
@@ -613,6 +724,7 @@ async def get_ai_answer(
     raw_supplement: str = "",
     news_context: str = "",
     clusters_context: str = "",
+    provider: LLMProvider = "free",
 ) -> str:
     """
     Отвечает на вопрос пользователя по данным с помощью LLM.
@@ -621,6 +733,7 @@ async def get_ai_answer(
         raw_supplement: Дополнительные данные из сырых карточек ДТП
         news_context: Новостной контекст из открытых источников
         clusters_context: Данные об очагах концентрации ДТП
+        provider: "free" (ZhipuAI/GLM) или "paid" (OpenAI-совместимый)
 
     Returns:
         Текст ответа от нейросети
@@ -631,4 +744,4 @@ async def get_ai_answer(
         news_context=news_context,
         clusters_context=clusters_context,
     )
-    return await ask_llm(user_message=prompt)
+    return await ask_llm(user_message=prompt, provider=provider)

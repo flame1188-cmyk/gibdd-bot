@@ -35,6 +35,8 @@ from telegram.ext import (
 )
 
 from config import validate_config, ALLOWED_USER_IDS, LLM_API_KEY, ENABLE_NEWS_SEARCH
+from config import LLM_PAID_API_KEY as _PAID_KEY
+from llm_analyzer import is_paid_llm_available, is_any_llm_available
 
 # ========================
 # Утилита ретрая Telegram API
@@ -938,9 +940,43 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 await _run_analysis(update, context, use_llm=False)
                 return
 
-            # --- Запрос аналитики (с ИИ) ---
+            # --- Запрос аналитики (с ИИ) — прямой вызов для бесплатного ---
             if data == "do_analytics_ai":
-                await _run_analysis(update, context, use_llm=True)
+                await _run_analysis(update, context, use_llm=True, llm_provider="free")
+                return
+
+            # --- Выбор метода ИИ (бесплатный vs платный) ---
+            if data == "choose_ai_method":
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "\U0001F490 Бесплатный (GLM, ограниченный)",
+                        callback_data="do_analytics_ai",
+                    )],
+                    [InlineKeyboardButton(
+                        "\U0001F3AF Полный (DeepSeek, 1M контекст)",
+                        callback_data="do_analytics_ai_paid",
+                    )],
+                    [InlineKeyboardButton(
+                        "\u21A9\uFE0F Назад",
+                        callback_data="back_to_menu",
+                    )],
+                ])
+                await _safe_edit(
+                    query,
+                    "Выберите метод анализа:\n\n"
+                    "\U0001F490 <b>Бесплатный</b> — GLM-4.7-Flash (200K контекст)\n"
+                    "Агрегированные данные + очаги + новости\n\n"
+                    "\U0001F3AF <b>Полный</b> — DeepSeek V4 Flash (1M контекст)\n"
+                    "Полные данные участников, нарушений, погодных условий\n"
+                    "и дорожной обстановки по каждому ДТП",
+                    reply_markup=keyboard,
+                    description="выбор метода ИИ",
+                )
+                return
+
+            # --- Запрос аналитики (с ИИ, платный метод) ---
+            if data == "do_analytics_ai_paid":
+                await _run_analysis(update, context, use_llm=True, llm_provider="paid")
                 return
 
             # --- Расчёт очагов ДТП ---
@@ -1139,7 +1175,7 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             if data == "back_to_menu":
                 # Сбрасываем временные флаги режимов, но НЕ удаляем данные
                 for key in [
-                    "qa_mode", "point_stats_mode",
+                    "qa_mode", "qa_llm_provider", "point_stats_mode",
                     "waiting_camera_file", "waiting_camera_for_map",
                 ]:
                     context.user_data.pop(key, None)
@@ -1471,11 +1507,20 @@ def _build_menu_keyboard(
         callback_data="do_analytics",
     )])
 
-    if LLM_API_KEY:
-        buttons.append([InlineKeyboardButton(
-            f"\U0001F916 Анализ с ИИ ({prev_label})",
-            callback_data="do_analytics_ai",
-        )])
+    # Кнопка "Анализ с ИИ" — доступна если есть любой LLM (бесплатный или платный)
+    if is_any_llm_available():
+        if is_paid_llm_available():
+            # Есть оба провайдера — покажем подменю выбора
+            buttons.append([InlineKeyboardButton(
+                f"\U0001F916 Анализ с ИИ ({prev_label})",
+                callback_data="choose_ai_method",
+            )])
+        else:
+            # Только бесплатный — сразу запускаем
+            buttons.append([InlineKeyboardButton(
+                f"\U0001F916 Анализ с ИИ ({prev_label})",
+                callback_data="do_analytics_ai",
+            )])
 
     buttons.append([InlineKeyboardButton(
         "\U0001F525 Очаги ДТП",
@@ -1496,31 +1541,30 @@ def _build_menu_keyboard(
 
     keyboard = InlineKeyboardMarkup(buttons)
 
-    if LLM_API_KEY:
-        text = (
-            f"\u2705 Данные: <b>{reg_name}</b> — {period.label}\n"
-            f"ДТП: {card_count}\n\n"
-            f"Выберите действие:\n\n"
-            f"\U0001F4CA <b>Без ИИ</b> — математический анализ (таблицы, проценты)\n"
-            f"\U0001F916 <b>С ИИ</b> — анализ + резюме от нейросети\n"
-            f"\U0001F525 <b>Очаги ДТП</b> — места концентрации аварийности\n"
-            f"\U0001F4CD <b>По точке</b> — статистика ДТП по координатам\n"
-            f"\U0001F5FA <b>HTML-карта</b> — интерактивная карта всех ДТП\n"
-            f"\U0001F504 <b>Сменить данные</b> — новая выгрузка\n\n"
-            f"Или /dtp для новой выгрузки."
-        )
-    else:
-        text = (
-            f"\u2705 Данные: <b>{reg_name}</b> — {period.label}\n"
-            f"ДТП: {card_count}\n\n"
-            f"Выберите действие:\n\n"
-            f"\U0001F4CA <b>Без ИИ</b> — математический анализ (таблицы, проценты)\n"
-            f"\U0001F525 <b>Очаги ДТП</b> — места концентрации аварийности\n"
-            f"\U0001F4CD <b>По точке</b> — статистика ДТП по координатам\n"
-            f"\U0001F5FA <b>HTML-карта</b> — интерактивная карта всех ДТП\n"
-            f"\U0001F504 <b>Сменить данные</b> — новая выгрузка\n\n"
-            f"Или /dtp для новой выгрузки."
-        )
+    text = (
+        f"\u2705 Данные: <b>{reg_name}</b> — {period.label}\n"
+        f"ДТП: {card_count}\n\n"
+        f"Выберите действие:\n\n"
+        f"\U0001F4CA <b>Без ИИ</b> — математический анализ (таблицы, проценты)\n"
+    )
+
+    if is_any_llm_available():
+        if is_paid_llm_available():
+            text += (
+                f"\U0001F916 <b>С ИИ</b> — анализ нейросетью (бесплатный или полный)\n"
+            )
+        else:
+            text += (
+                f"\U0001F916 <b>С ИИ</b> — анализ + резюме от нейросети\n"
+            )
+
+    text += (
+        f"\U0001F525 <b>Очаги ДТП</b> — места концентрации аварийности\n"
+        f"\U0001F4CD <b>По точке</b> — статистика ДТП по координатам\n"
+        f"\U0001F5FA <b>HTML-карта</b> — интерактивная карта всех ДТП\n"
+        f"\U0001F504 <b>Сменить данные</b> — новая выгрузка\n\n"
+        f"Или /dtp для новой выгрузки."
+    )
 
     return text, keyboard
 
@@ -1609,12 +1653,14 @@ async def _run_analysis(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     use_llm: bool = False,
+    llm_provider: str = "free",
 ) -> None:
     """
     Выполняет сравнительный анализ текущего периода с прошлым годом.
 
     Args:
-        use_llm: Если True — после расчёта метрик запрашивает резюме у GLM
+        use_llm: Если True — после расчёта метрик запрашивает резюме у LLM
+        llm_provider: "free" (ZhipuAI/GLM) или "paid" (OpenAI-совместимый)
     """
     chat_id = update.effective_chat.id
 
@@ -1777,10 +1823,17 @@ async def _run_analysis(
     # --- Генерируем контент ---
     llm_summary_text = None
 
-    if use_llm and LLM_API_KEY:
+    # Проверяем, что запрошенный провайдер доступен
+    llm_available = (
+        (llm_provider == "free" and LLM_API_KEY)
+        or (llm_provider == "paid" and is_paid_llm_available())
+    )
+
+    if use_llm and llm_available:
         try:
+            provider_label = "DeepSeek (полный)" if llm_provider == "paid" else "GLM (бесплатный)"
             await status_msg.edit_text(
-                f"{mode_label}: собираю данные и ищу новости..."
+                f"{mode_label}: собираю данные для {provider_label}..."
             )
 
             # Формируем дополнение из сырых карточек
@@ -1854,6 +1907,7 @@ async def _run_analysis(
                 raw_supplement=raw_sup,
                 news_context=news_ctx,
                 clusters_context=clusters_ctx,
+                provider=llm_provider,
             )
         except Exception as e:
             logger.error(f"Ошибка LLM: {e}")
@@ -1963,8 +2017,9 @@ async def _run_analysis(
         logger.warning(f"Не удалось сгенерировать HTML-отчёт аналитики: {e}")
 
     # Предлагаем задать вопросы (только если аналитика с ИИ)
-    if use_llm and LLM_API_KEY:
+    if use_llm and llm_available:
         context.user_data["qa_mode"] = True
+        context.user_data["qa_llm_provider"] = llm_provider
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(
                 "\u21A9\uFE0F В меню",
@@ -2020,7 +2075,7 @@ def _clear_analytics_data(user_data: dict) -> None:
         "analytics_period", "analytics_cards", "analytics_comparison",
         "analytics_current_label", "analytics_prev_label",
         "analytics_prev_cards", "analytics_clusters",
-        "analytics_news_context", "qa_mode",
+        "analytics_news_context", "qa_mode", "qa_llm_provider",
         "point_stats_mode", "point_stats_lat", "point_stats_lon", "point_stats_radius",
         "cameras_data", "waiting_camera_file", "waiting_camera_for_map",
         "_settlement_polygons", "_preload_task",
@@ -3099,6 +3154,7 @@ async def _handle_analytics_question(
     reg_name: str,
     current_label: str,
     prev_label: str,
+    llm_provider: str = "free",
 ) -> None:
     """
     Обрабатывает вопрос пользователя по данным аналитики.
@@ -3133,6 +3189,7 @@ async def _handle_analytics_question(
             clusters_context=format_clusters_for_prompt(
                 context.user_data.get("analytics_clusters", [])
             ),
+            provider=llm_provider,
         )
 
         # Удаляем индикатор
@@ -3498,16 +3555,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     # --- Режим вопрос-ответ по данным аналитики ---
-    if context.user_data.get("qa_mode") and LLM_API_KEY:
+    if context.user_data.get("qa_mode") and is_any_llm_available():
         comparison = context.user_data.get("analytics_comparison")
         reg_name = context.user_data.get("analytics_reg_name", "")
         current_label = context.user_data.get("analytics_current_label", "")
         prev_label = context.user_data.get("analytics_prev_label", "")
+        qa_provider = context.user_data.get("qa_llm_provider", "free")
 
         if comparison:
             await _handle_analytics_question(
                 update, context, user_text,
                 comparison, reg_name, current_label, prev_label,
+                llm_provider=qa_provider,
             )
             return
 
