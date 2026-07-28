@@ -3237,6 +3237,18 @@ async def _handle_analytics_question(
         except Exception:
             pass
 
+        # Клавиатура с кнопками «В меню» / «Завершить»
+        qa_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "\u21A9\uFE0F В меню",
+                callback_data="back_to_menu",
+            )],
+            [InlineKeyboardButton(
+                "\u274C Завершить",
+                callback_data="end_qa",
+            )],
+        ])
+
         # Отправляем ответ (экранируем и вопрос, и ответ LLM)
         # Fallback: если HTML-парсинг ломается — отправляем без форматирования
         try:
@@ -3247,6 +3259,7 @@ async def _handle_analytics_question(
                     f"{html_mod.escape(answer)}"
                 ),
                 parse_mode="HTML",
+                reply_markup=qa_keyboard,
             )
         except Exception:
             # HTML-парсер Telegram не смог обработать — отправляем plain text
@@ -3254,6 +3267,7 @@ async def _handle_analytics_question(
                 context.bot, chat_id,
                 text=f"\U0001F916 Вопрос: {question}\n\n{answer}",
                 parse_mode=None,
+                reply_markup=qa_keyboard,
             )
 
     except Exception as e:
