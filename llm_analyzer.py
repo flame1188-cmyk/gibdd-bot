@@ -3,7 +3,9 @@
 
 Поддерживает два провайдера:
   1. Бесплатный: ZhipuAI (GLM) — https://open.bigmodel.cn
+     - Агрегированные метрики + выборка сырых карточек
   2. Платный: любой OpenAI-совместимый агрегатор (AItunnel, OpenRouter и др.)
+     - Полные данные участников (Файл 2) в CSV-формате
 
 Функционал:
   1. Генерация аналитического резюме по метрикам ДТП
@@ -11,6 +13,8 @@
 """
 
 import asyncio
+import csv
+import io
 import json
 import logging
 import time
@@ -33,6 +37,49 @@ LLMProvider = Literal["free", "paid"]
 # Персистентные HTTP-клиенты (connection pooling)
 _free_llm_client: httpx.AsyncClient | None = None
 _paid_llm_client: httpx.AsyncClient | None = None
+
+# ============================================================
+# Столбцы Файла 2 (участники) для полного промпта платного метода
+# ============================================================
+# Максимальный размер данных для LLM (символов).
+# DeepSeek V4 Flash: 1M токенов ≈ ~3-4M символов.
+# Ставим лимит ниже с запасом, чтобы уместить промпт + ответ.
+_FULL_DATA_MAX_CHARS = 2_000_000  # ~2 млн символов ≈ 500K токенов данных
+
+# Столбцы, которые нужно извлечь из Файла 2 для LLM (32 из 73).
+# Порядок соответствует логической группировке для анализа.
+_FULL_DATA_COLUMNS = [
+    "Дата",
+    "Время",
+    "Вид ДТП",
+    "Место",
+    "Населенный пункт",
+    "Улица",
+    "Дорога",
+    "Километр",
+    "Метр",
+    "Широта",
+    "Долгота",
+    "Погибло",
+    "Ранено",
+    "НДУ",
+    "Объекты УДС на месте",
+    "Объекты УДС вблизи",
+    "Факторы, влияющие на режим движения",
+    "Состояние проезжей части",
+    "Состояние погоды",
+    "Освещение",
+    "Значение дороги",
+    "Тип ТС",
+    "Категория",
+    "Пол",
+    "Тяжесть последствий",
+    "Непосредственные нарушения ПДД",
+    "Сопутствующие нарушения ПДД",
+    "Стаж(лет)",
+    "Результат МО",
+    "Пристёгнут",
+]
 
 
 def _get_free_llm_client() -> httpx.AsyncClient:
@@ -107,6 +154,223 @@ SYSTEM_PROMPT = (
     "10. Не используй эмодзи и markdown-форматирование\n"
     "11. Объём ответа: 3-5 абзацев для резюме, 2-4 абзаца для ответа на вопрос"
 )
+
+
+# ============================================================
+# Расширенный системный промпт для платного метода (полные данные)
+# ============================================================
+
+SYSTEM_PROMPT_PAID = (
+    "Ты — старший эксперт-аналитик в области безопасности дорожного движения "
+    "с 15-летним опытом работы в ГИБДД, МВД России и научно-исследовательских "
+    "центрах БДД. Ты специализируешься на глубинном статистическом анализе ДТП, "
+    "выявлении скрытых корреляций, паттернов и аномалий.\n\n"
+    "Тебе предоставлены полные данные по каждому участнику ДТП. "
+    "Каждое ДТП может порождать несколько строк (по числу участников).\n\n"
+    "Правила:\n"
+    "1. Опирайся ТОЛЬКО на предоставленные данные — не выдумывай цифры\n"
+    "2. Указывай конкретные цифры и проценты\n"
+    "3. Структурируй ответ по разделам с заголовками\n"
+    "4. Пиши на русском языке, профессиональным но понятным стилем\n"
+    "5. Не используй эмодзи и markdown-форматирование\n\n"
+    "ВАЖНО — дублирование данных:\n"
+    "Столбцы «Погибло» и «Ранено» содержат данные на уровне ДТП, а не участника. "
+    "Одно ДТП может давать несколько строк (по числу участников), поэтому эти "
+    "значения дублируются. При подсчёте общего числа погибших/раненых считай "
+    "каждое уникальное значение столбца «Вид ДТП» + «Дата» + «Время» один раз.\n\n"
+    "Анализ должен включать:\n"
+    "1. ОБЩАЯ ОЦЕНКА ДИНАМИКИ — сравнение текущего и предыдущего периода, "
+    "рост/снижение ключевых показателей\n"
+    "2. КОРРЕЛЯЦИИ — взаимосвязи между факторами:\n"
+    "   - Время суток и тяжесть последствий\n"
+    "   - Стаж водителя и нарушения ПДД\n"
+    "   - Погодные условия и виды ДТП\n"
+    "   - Тип транспортного средства и тяжесть\n"
+    "   - Освещение и вид ДТП\n"
+    "   - Опьянение и время суток/день недели\n"
+    "   - Использование ремня безопасности и тяжесть последствий\n"
+    "   - Объекты УДС (светофоры, знаки, переходы) и виды ДТП\n"
+    "3. ПАТТЕРНЫ И АНОМАЛИИ — типичные комбинации факторов в ДТП, "
+    "нетипичные случаи, сезонные и временные закономерности\n"
+    "4. ПРОФИЛИРОВАНИЕ УЧАСТНИКОВ — какие категории участников наиболее "
+    "уязвимы, какие нарушения характерны для разных групп, "
+    "влияет ли пол и стаж на тяжесть последствий\n"
+    "5. ПРОГНОЗ РИСКОВ — где вероятен рост аварийности, какие факторы "
+    "усиливают риск, наиболее опасные локации\n"
+    "6. РЕКОМЕНДАЦИИ — конкретные меры по снижению аварийности с учётом "
+    "выявленных паттернов и корреляций\n\n"
+    "7. Если предоставлены очаги концентрации ДТП — обязательно включи их "
+    "в анализ: оцени наиболее опасные участки, причины концентрации, "
+    "рекомендуй конкретные мероприятия для каждого топ-очага\n\n"
+    "8. Если предоставлен новостной контекст — используй для подтверждения "
+    "статистики и упоминания реальных событий. "
+    "Если новость противоречит статистике — укажи на это.\n\n"
+    "Объём ответа: развёрнутый анализ, 8-15 абзацев с конкретными данными."
+)
+
+
+# ============================================================
+# Форматирование полных данных для платного промпта
+# ============================================================
+
+def format_full_data_as_csv(
+    cards: list[dict[str, Any]],
+    label: str,
+) -> str:
+    """
+    Формирует полные данные участников (Файл 2) в CSV-формате
+    для передачи в LLM в платном методе.
+
+    Берёт только _FULL_DATA_COLUMNS (30 аналитически значимых столбцов).
+    Если данных слишком много — сэмплирует: сначала все смертельные/алкогольные/
+    пешеходные ДТП целиком, затем случайная выборка до лимита.
+
+    Args:
+        cards: Список сырых карточек ДТП
+        label: Подпись периода (например "I полугодие 2026")
+
+    Returns:
+        CSV-текст с заголовком и строками данных
+    """
+    if not cards:
+        return f"\nПОЛНЫЕ ДАННЫЕ УЧАСТНИКОВ ({label}): нет данных\n"
+
+    # Импортируем здесь, чтобы избежать циклического импорта на уровне модуля
+    from gibdd_parser import build_file2_data
+
+    # Строим полный Файл 2 (все строки, все столбцы)
+    all_rows = build_file2_data(cards)
+    all_columns = list(all_rows[0].keys()) if all_rows else []
+
+    # Определяем индексы нужных столбцов
+    col_indices = []
+    for col_name in _FULL_DATA_COLUMNS:
+        if col_name in all_columns:
+            col_indices.append(all_columns.index(col_name))
+        else:
+            col_indices.append(None)
+
+    # Фильтруем строки: берём только нужные столбцы
+    filtered_rows = []
+    for row in all_rows:
+        values = list(row.values())
+        filtered = []
+        for idx in col_indices:
+            if idx is not None:
+                filtered.append(str(values[idx]).strip())
+            else:
+                filtered.append("")
+        filtered_rows.append(filtered)
+
+    # Проверяем общий размер
+    header_line = "; ".join(_FULL_DATA_COLUMNS)
+    data_lines = [f"{header_line}"]
+    for row in filtered_rows:
+        data_lines.append("; ".join(row))
+
+    full_text = "\n".join(data_lines)
+    total_chars = len(full_text)
+
+    # Если вписываемся в лимит — отдаём всё
+    if total_chars <= _FULL_DATA_MAX_CHARS:
+        logger.info(
+            f"Полные данные для LLM ({label}): "
+            f"{len(cards)} ДТП, {len(filtered_rows)} участников, "
+            f"{total_chars} символов"
+        )
+        return f"\nПОЛНЫЕ ДАННЫЕ УЧАСТНИКОВ ({label}, {len(filtered_rows)} строк):\n{full_text}"
+
+    # Не вписываемся — сэмплируем
+    import random
+    random.seed(42)  # воспроизводимость
+
+    logger.info(
+        f"Полные данные для LLM ({label}): {total_chars} символов — "
+        f"превышает лимит {_FULL_DATA_MAX_CHARS}, применяем сэмплинг"
+    )
+
+    # Размечаем ДТП: смертельные, алкогольные, пешеходные — включаем целиком
+    # Для этого нужно вернуться к карточкам и понять, какие строки важны
+    from collections import Counter
+
+    # Группируем строки по "Дата+Время+Вид ДТП" (ключ ДТП)
+    def _dtp_key(row_list):
+        # Ключ из первых 3 значений: Дата, Время, Вид ДТП
+        return (row_list[0], row_list[1], row_list[2]) if len(row_list) >= 3 else ""
+
+    # Определяем приоритетные ДТП
+    priority_keys = set()
+    for i, row in enumerate(filtered_rows):
+        dtp_key = _dtp_key(row)
+        pog = row[11]   # Погибло
+        ran = row[12]   # Ранено
+        result_mo = row[27]  # Результат МО
+        category = row[21]  # Категория участника
+
+        # Смертельные ДТП
+        if pog and pog not in ("", "0"):
+            priority_keys.add(dtp_key)
+        # ДТП с нетрезвыми участниками
+        if result_mo and result_mo.lower() == "да":
+            priority_keys.add(dtp_key)
+        # ДТП с пешеходами
+        if category and "пешеход" in category.lower():
+            priority_keys.add(dtp_key)
+
+    # Разделяем строки на приоритетные и остальные
+    priority_rows = []
+    other_rows = []
+    for row in filtered_rows:
+        if _dtp_key(row) in priority_keys:
+            priority_rows.append(row)
+        else:
+            other_rows.append(row)
+
+    # Считаем размер приоритетных
+    priority_text = "\n".join(
+        [header_line] + ["; ".join(r) for r in priority_rows]
+    )
+    remaining_chars = _FULL_DATA_MAX_CHARS - len(header_line) - 100  # запас
+
+    if len(priority_text) > remaining_chars:
+        # Даже приоритетные не вмещаются — берём только их
+        logger.warning(
+            f"Полные данные ({label}): приоритетные строки "
+            f"({len(priority_rows)}) не вмещаются, обрезаем"
+        )
+        # Обрезаем до лимита
+        lines = priority_text.split("\n")
+        result_lines = [lines[0]]
+        current_size = len(lines[0])
+        for line in lines[1:]:
+            if current_size + len(line) + 1 > _FULL_DATA_MAX_CHARS:
+                break
+            result_lines.append(line)
+            current_size += len(line) + 1
+        full_text = "\n".join(result_lines)
+        return f"\nПОЛНЫЕ ДАННЫЕ УЧАСТНИКОВ ({label}, сэмплинг, {len(result_lines)-1} строк):\n{full_text}"
+
+    # Добавляем случайные строки из остальных до лимита
+    space_left = remaining_chars - len(priority_text)
+    avg_row_chars = sum(len("; ".join(r)) for r in other_rows[:100]) / min(len(other_rows), 100) if other_rows else 100
+    sample_size = max(1, int(space_left / max(avg_row_chars, 1)))
+    sampled_others = random.sample(other_rows, min(sample_size, len(other_rows))) if other_rows else []
+
+    all_sampled = priority_rows + sampled_others
+    # Сортируем по дате/времени для логичности
+    all_sampled.sort(key=lambda r: (r[0], r[1]))
+
+    result_lines = [header_line] + ["; ".join(r) for r in all_sampled]
+    full_text = "\n".join(result_lines)
+
+    logger.info(
+        f"Полные данные ({label}): сэмплинг — "
+        f"приоритетных {len(priority_rows)}, "
+        f"случайных {len(sampled_others)}, "
+        f"итого {len(all_sampled)} строк, "
+        f"{len(full_text)} символов"
+    )
+    return f"\nПОЛНЫЕ ДАННЫЕ УЧАСТНИКОВ ({label}, сэмплинг, {len(all_sampled)} строк):\n{full_text}"
 
 
 # ============================================================
@@ -372,6 +636,78 @@ def build_summary_prompt(
     return prompt
 
 
+def build_paid_summary_prompt(
+    comparison: dict[str, Any],
+    reg_name: str,
+    current_label: str,
+    prev_label: str,
+    current_full_data: str = "",
+    prev_full_data: str = "",
+    news_context: str = "",
+    clusters_context: str = "",
+) -> str:
+    """
+    Создаёт промпт для генерации глубокого аналитического резюме
+    в платном методе (полные данные участников).
+
+    Структура промпта:
+      1. Агрегированные метрики (сводка за оба периода)
+      2. Полные данные участников (текущий период)
+      3. Полные данные участников (предыдущий период)
+      4. Очаги концентрации ДТП
+      5. Новостной контекст
+      6. Инструкция по анализу
+    """
+    # 1. Агрегированные метрики
+    metrics_text = format_metrics_for_prompt(
+        comparison, reg_name, current_label, prev_label,
+    )
+
+    parts = []
+
+    parts.append(
+        f"{metrics_text}\n\n"
+        f"Выше приведена сводная статистика по двум периодам. "
+        f"Далее следуют полные данные по каждому участнику ДТП "
+        f"(каждая строка = один участник, одно ДТП может иметь несколько строк)."
+    )
+
+    # 2. Полные данные текущего периода
+    if current_full_data:
+        parts.append(current_full_data)
+
+    # 3. Полные данные предыдущего периода
+    if prev_full_data:
+        parts.append(prev_full_data)
+
+    # 4. Очаги концентрации
+    if clusters_context:
+        parts.append(
+            f"\n{clusters_context}\n\n"
+            f"Обрати особое внимание на очаги ДТП: выдели наиболее опасные участки, "
+            f"проанализируй причины концентрации, предложи конкретные мероприятия "
+            f"для каждого из топ-очагов."
+        )
+
+    # 5. Новости
+    if news_context:
+        parts.append(
+            f"\n{news_context}\n\n"
+            f"Примечание: используй новостной контекст для подтверждения "
+            f"статистических данных и упоминания реальных событий. "
+            f"Если новость противоречит статистике — укажи на это."
+        )
+
+    # 6. Инструкция
+    parts.append(
+        "\nНа основе полных данных проведи глубокий аналитический анализ "
+        "по разделам, указанным в системном промпте: динамика, корреляции, "
+        "паттерны, профилирование участников, прогноз рисков, рекомендации."
+    )
+
+    return "\n\n".join(parts)
+
+
 def build_question_prompt(
     question: str,
     comparison: dict[str, Any],
@@ -498,7 +834,7 @@ async def _ask_paid_llm(
         )
 
     if system_prompt is None:
-        system_prompt = SYSTEM_PROMPT
+        system_prompt = SYSTEM_PROMPT_PAID
 
     # Формируем URL (убираем trailing slash, добавляем /chat/completions)
     base_url = LLM_PAID_API_URL.rstrip("/")
@@ -693,26 +1029,56 @@ async def get_ai_summary(
     news_context: str = "",
     clusters_context: str = "",
     provider: LLMProvider = "free",
+    current_cards: list[dict[str, Any]] | None = None,
+    prev_cards: list[dict[str, Any]] | None = None,
 ) -> str:
     """
     Генерирует аналитическое резюме с помощью LLM.
+
+    Для бесплатного метода (free): использует агрегированные метрики + raw_supplement.
+    Для платного метода (paid): использует полные данные участников (Файл 2).
 
     Args:
         raw_supplement: Дополнительные данные из сырых карточек ДТП
         news_context: Новостной контекст из открытых источников
         clusters_context: Данные об очагах концентрации ДТП
         provider: "free" (ZhipuAI/GLM) или "paid" (OpenAI-совместимый)
+        current_cards: Сырые карточки текущего периода (для платного метода)
+        prev_cards: Сырые карточки предыдущего периода (для платного метода)
 
     Returns:
         Текст резюме от нейросети
     """
-    prompt = build_summary_prompt(
-        comparison, reg_name, current_label, prev_label,
-        raw_supplement=raw_supplement,
-        news_context=news_context,
-        clusters_context=clusters_context,
-    )
-    return await ask_llm(user_message=prompt, provider=provider)
+    if provider == "paid" and current_cards is not None:
+        # Платный метод: формируем полный набор данных
+        logger.info(
+            f"Платный метод: формирую полные данные для LLM "
+            f"(текущий: {len(current_cards)} ДТП, "
+            f"прошлый: {len(prev_cards) if prev_cards else 0} ДТП)"
+        )
+
+        current_full_data = format_full_data_as_csv(current_cards, current_label)
+        prev_full_data = ""
+        if prev_cards:
+            prev_full_data = format_full_data_as_csv(prev_cards, prev_label)
+
+        prompt = build_paid_summary_prompt(
+            comparison, reg_name, current_label, prev_label,
+            current_full_data=current_full_data,
+            prev_full_data=prev_full_data,
+            news_context=news_context,
+            clusters_context=clusters_context,
+        )
+        return await ask_llm(user_message=prompt, provider=provider)
+    else:
+        # Бесплатный метод: агрегированные метрики + raw_supplement
+        prompt = build_summary_prompt(
+            comparison, reg_name, current_label, prev_label,
+            raw_supplement=raw_supplement,
+            news_context=news_context,
+            clusters_context=clusters_context,
+        )
+        return await ask_llm(user_message=prompt, provider=provider)
 
 
 async def get_ai_answer(

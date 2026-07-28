@@ -1908,6 +1908,8 @@ async def _run_analysis(
                 news_context=news_ctx,
                 clusters_context=clusters_ctx,
                 provider=llm_provider,
+                current_cards=current_cards if llm_provider == "paid" else None,
+                prev_cards=prev_cards if llm_provider == "paid" else None,
             )
         except Exception as e:
             logger.error(f"Ошибка LLM: {e}")
