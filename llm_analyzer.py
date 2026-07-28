@@ -39,16 +39,17 @@ _free_llm_client: httpx.AsyncClient | None = None
 _paid_llm_client: httpx.AsyncClient | None = None
 
 # ============================================================
-# Столбцы Файла 2 (участники) для полного промпта платного метода
+# Двухуровневый формат данных для полного промпта платного метода
 # ============================================================
-# Максимальный размер данных для LLM (символов).
+# Максимальный размер данных для LLM (символов, на ОДИН период).
 # DeepSeek V4 Flash: 1M токенов ≈ ~3-4M символов.
-# Ставим лимит ниже с запасом, чтобы уместить промпт + ответ.
-_FULL_DATA_MAX_CHARS = 2_000_000  # ~2 млн символов ≈ 500K токенов данных
+# Мы отправляем полные данные только за текущий период,
+# предыдущий покрывается агрегированными метриками.
+# Лимит оставляет место для: системный промпт + метрики + очаги + новости + ответ.
+_FULL_DATA_MAX_CHARS = 1_000_000  # ~1 млн символов ≈ 250K токенов данных
 
-# Столбцы, которые нужно извлечь из Файла 2 для LLM (32 из 73).
-# Порядок соответствует логической группировке для анализа.
-_FULL_DATA_COLUMNS = [
+# --- Столбцы уровня ДТП (печатается 1 раз на ДТП) ---
+_DTP_LEVEL_COLUMNS = [
     "Дата",
     "Время",
     "Вид ДТП",
@@ -64,12 +65,15 @@ _FULL_DATA_COLUMNS = [
     "Ранено",
     "НДУ",
     "Объекты УДС на месте",
-    "Объекты УДС вблизи",
     "Факторы, влияющие на режим движения",
     "Состояние проезжей части",
     "Состояние погоды",
     "Освещение",
     "Значение дороги",
+]
+
+# --- Столбцы уровня участника (печатается для каждого участника) ---
+_PARTICIPANT_LEVEL_COLUMNS = [
     "Тип ТС",
     "Категория",
     "Пол",
@@ -80,6 +84,17 @@ _FULL_DATA_COLUMNS = [
     "Результат МО",
     "Пристёгнут",
 ]
+
+# Значения, которые считаются «шумом» и заменяются на пустую строку.
+# Логика: отсутствие записи = отсутствие дефекта/нарушения.
+_NOISE_VALUES = frozenset({
+    # Недостатки УДС
+    "Не установлены",
+    # Факторы режима движения
+    "Сведения отсутствуют",
+    # Нарушения ПДД
+    "Нет нарушений",
+})
 
 
 def _get_free_llm_client() -> httpx.AsyncClient:
@@ -165,19 +180,21 @@ SYSTEM_PROMPT_PAID = (
     "с 15-летним опытом работы в ГИБДД, МВД России и научно-исследовательских "
     "центрах БДД. Ты специализируешься на глубинном статистическом анализе ДТП, "
     "выявлении скрытых корреляций, паттернов и аномалий.\n\n"
-    "Тебе предоставлены полные данные по каждому участнику ДТП. "
-    "Каждое ДТП может порождать несколько строк (по числу участников).\n\n"
+    "Тебе предоставлены полные данные по каждому участнику ДТП за текущий период "
+    "и агрегированная сводная статистика за предыдущий период.\n\n"
+    "Формат данных — двухуровневый:\n"
+    "  [ДТП] — данные о ДТП (печатается 1 раз): дата, время, вид, место, дорога, "
+    "погибло, ранено, дорожные условия, погода и т.д.\n"
+    "  [Уч.N] — данные об участнике (каждый отдельной строкой): тип ТС, категория, "
+    "пол, тяжесть последствий, нарушения ПДД, стаж, опьянение, ремень безопасности.\n"
+    "Одно ДТП = одна строка [ДТП] + одна или несколько строк [Уч.N].\n"
+    "Пустое поле означает отсутствие данных (нет недостатков УДС, нет нарушений и т.д.).\n\n"
     "Правила:\n"
     "1. Опирайся ТОЛЬКО на предоставленные данные — не выдумывай цифры\n"
     "2. Указывай конкретные цифры и проценты\n"
     "3. Структурируй ответ по разделам с заголовками\n"
     "4. Пиши на русском языке, профессиональным но понятным стилем\n"
     "5. Не используй эмодзи и markdown-форматирование\n\n"
-    "ВАЖНО — дублирование данных:\n"
-    "Столбцы «Погибло» и «Ранено» содержат данные на уровне ДТП, а не участника. "
-    "Одно ДТП может давать несколько строк (по числу участников), поэтому эти "
-    "значения дублируются. При подсчёте общего числа погибших/раненых считай "
-    "каждое уникальное значение столбца «Вид ДТП» + «Дата» + «Время» один раз.\n\n"
     "Анализ должен включать:\n"
     "1. ОБЩАЯ ОЦЕНКА ДИНАМИКИ — сравнение текущего и предыдущего периода, "
     "рост/снижение ключевых показателей\n"
@@ -213,24 +230,65 @@ SYSTEM_PROMPT_PAID = (
 # Форматирование полных данных для платного промпта
 # ============================================================
 
+def _clean_noise(value: str) -> str:
+    """Заменяет шумовые значения ("Не установлены", "Сведения отсутствуют",
+    "Нет нарушений") на пустую строку для сокращения промпта."""
+    v = value.strip()
+    return "" if v in _NOISE_VALUES else v
+
+
+def _format_dtp_block(
+    dtp_fields: list[str],
+    dtp_col_names: list[str],
+) -> str:
+    """Формирует одну строку уровня ДТП: [ДТП] Дата; Время; Вид ДТП; ..."""
+    cleaned = [_clean_noise(v) for v in dtp_fields]
+    return "[ДТП] " + "; ".join(cleaned)
+
+
+def _format_uch_block(
+    uch_fields: list[str],
+    uch_col_names: list[str],
+    participant_num: int,
+) -> str:
+    """Формирует одну строку уровня участника: [Уч.N] Тип ТС; Категория; ..."""
+    cleaned = [_clean_noise(v) for v in uch_fields]
+    return f"[Уч.{participant_num}] " + "; ".join(cleaned)
+
+
 def format_full_data_as_csv(
     cards: list[dict[str, Any]],
     label: str,
 ) -> str:
     """
-    Формирует полные данные участников (Файл 2) в CSV-формате
+    Формирует полные данные участников (Файл 2) в двухуровневом формате
     для передачи в LLM в платном методе.
 
-    Берёт только _FULL_DATA_COLUMNS (30 аналитически значимых столбцов).
-    Если данных слишком много — сэмплирует: сначала все смертельные/алкогольные/
-    пешеходные ДТП целиком, затем случайная выборка до лимита.
+    Формат:
+      [ДТП] Дата; Время; Вид ДТП; Место; ...  (столбцы уровня ДТП, 1 раз)
+      [Уч.1] Тип ТС; Категория; Пол; ...      (столбцы уровня участника)
+      [Уч.2] Тип ТС; Категория; Пол; ...
+      [ДТП] ...
+
+    Преимущества перед плоским CSV:
+      - DTP-поля не дублируются для каждого участника (экономия ~40-50%)
+      - Структура «одно ДТП → несколько участников» очевидна для LLM
+
+    Очистка шумовых значений:
+      - «Не установлены» (НДУ) → пусто
+      - «Сведения отсутствуют» (Факторы) → пусто
+      - «Нет нарушений» (ПДД) → пусто
+
+    Сэмплинг при превышении лимита:
+      - Приоритетные ДТП (смертельные/алкогольные/пешеходные) целиком
+      - Остальные — случайная выборка до лимита
 
     Args:
         cards: Список сырых карточек ДТП
         label: Подпись периода (например "I полугодие 2026")
 
     Returns:
-        CSV-текст с заголовком и строками данных
+        Текст в двухуровневом формате для вставки в промпт
     """
     if not cards:
         return f"\nПОЛНЫЕ ДАННЫЕ УЧАСТНИКОВ ({label}): нет данных\n"
@@ -242,45 +300,112 @@ def format_full_data_as_csv(
     all_rows = build_file2_data(cards)
     all_columns = list(all_rows[0].keys()) if all_rows else []
 
-    # Определяем индексы нужных столбцов
-    col_indices = []
-    for col_name in _FULL_DATA_COLUMNS:
+    # Предваряем вычисляем индексы для столбцов обоих уровней
+    dtp_indices = []
+    for col_name in _DTP_LEVEL_COLUMNS:
         if col_name in all_columns:
-            col_indices.append(all_columns.index(col_name))
+            dtp_indices.append(all_columns.index(col_name))
         else:
-            col_indices.append(None)
+            dtp_indices.append(None)
 
-    # Фильтруем строки: берём только нужные столбцы
-    filtered_rows = []
-    for row in all_rows:
-        values = list(row.values())
-        filtered = []
-        for idx in col_indices:
-            if idx is not None:
-                filtered.append(str(values[idx]).strip())
-            else:
-                filtered.append("")
-        filtered_rows.append(filtered)
+    uch_indices = []
+    for col_name in _PARTICIPANT_LEVEL_COLUMNS:
+        if col_name in all_columns:
+            uch_indices.append(all_columns.index(col_name))
+        else:
+            uch_indices.append(None)
 
-    # Проверяем общий размер
-    header_line = "; ".join(_FULL_DATA_COLUMNS)
-    data_lines = [f"{header_line}"]
-    for row in filtered_rows:
-        data_lines.append("; ".join(row))
+    # === Этап 1: Группируем строки по ДТП ===
+    # Ключ ДТП: Дата + Время + Вид ДТП (эти 3 поля уникально идентифицируют ДТП)
+    def _extract_values(row_dict: dict, indices: list[int | None]) -> list[str]:
+        values = list(row_dict.values())
+        return [str(values[i]).strip() if i is not None else "" for i in indices]
 
-    full_text = "\n".join(data_lines)
+    # Группируем: список из (dtp_fields, [uch_fields], dtp_key, card_idx)
+    dtp_groups: list[dict] = []
+    dtp_key_to_group: dict[tuple, int] = {}
+
+    for row_idx, row in enumerate(all_rows):
+        row_values = list(row.values())
+        # Ключ из Дата + Время + Вид ДТП
+        dtp_key = (row_values[2], row_values[3], row_values[4]) if len(row_values) > 4 else ("")
+
+        if dtp_key in dtp_key_to_group:
+            group_idx = dtp_key_to_group[dtp_key]
+            uch_fields = _extract_values(row, uch_indices)
+            dtp_groups[group_idx]["participants"].append(uch_fields)
+        else:
+            dtp_fields = _extract_values(row, dtp_indices)
+            uch_fields = _extract_values(row, uch_indices)
+            group_idx = len(dtp_groups)
+            dtp_key_to_group[dtp_key] = group_idx
+            dtp_groups.append({
+                "dtp_key": dtp_key,
+                "dtp_fields": dtp_fields,
+                "participants": [uch_fields],
+            })
+
+    # === Этап 2: Размечаем приоритетные ДТП ===
+    # Индексы внутри _DTP_LEVEL_COLUMNS:
+    #   Погибло = index 11 ("Погибло" в _DTP_LEVEL_COLUMNS)
+    #   Ранено  = index 12 ("Ранено" в _DTP_LEVEL_COLUMNS)
+    # Индексы внутри _PARTICIPANT_LEVEL_COLUMNS:
+    #   Результат МО = index 7 ("Результат МО" в _PARTICIPANT_LEVEL_COLUMNS)
+    #   Категория   = index 1 ("Категория" в _PARTICIPANT_LEVEL_COLUMNS)
+    POG_IDX = _DTP_LEVEL_COLUMNS.index("Погибло")
+    RAN_IDX = _DTP_LEVEL_COLUMNS.index("Ранено")
+    MO_IDX = _PARTICIPANT_LEVEL_COLUMNS.index("Результат МО")
+    CAT_IDX = _PARTICIPANT_LEVEL_COLUMNS.index("Категория")
+
+    priority_indices: set[int] = set()
+    for g_idx, group in enumerate(dtp_groups):
+        pog = group["dtp_fields"][POG_IDX]
+        # Смертельные ДТП
+        if pog and pog not in ("", "0"):
+            priority_indices.add(g_idx)
+            continue
+        # ДТП с нетрезвыми или пешеходами — проверяем участников
+        for uch in group["participants"]:
+            result_mo = uch[MO_IDX]
+            category = uch[CAT_IDX]
+            if result_mo and result_mo.lower() == "да":
+                priority_indices.add(g_idx)
+                break
+            if category and "пешеход" in category.lower():
+                priority_indices.add(g_idx)
+                break
+
+    # === Этап 3: Формируем текстовый блок ===
+    def _group_to_lines(group: dict) -> list[str]:
+        lines = [_format_dtp_block(group["dtp_fields"], _DTP_LEVEL_COLUMNS)]
+        for p_idx, uch in enumerate(group["participants"], 1):
+            lines.append(_format_uch_block(uch, _PARTICIPANT_LEVEL_COLUMNS, p_idx))
+        return lines
+
+    # Считаем общий размер
+    header = f"Формат: [ДТП] = данные ДТП; [Уч.N] = данные участника N\n"
+    header += f"Столбцы ДТП: {'; '.join(_DTP_LEVEL_COLUMNS)}\n"
+    header += f"Столбцы участников: {'; '.join(_PARTICIPANT_LEVEL_COLUMNS)}\n"
+
+    all_lines = []
+    total_participants = 0
+    for group in dtp_groups:
+        all_lines.extend(_group_to_lines(group))
+        total_participants += len(group["participants"])
+
+    full_text = header + "\n".join(all_lines)
     total_chars = len(full_text)
 
     # Если вписываемся в лимит — отдаём всё
     if total_chars <= _FULL_DATA_MAX_CHARS:
         logger.info(
             f"Полные данные для LLM ({label}): "
-            f"{len(cards)} ДТП, {len(filtered_rows)} участников, "
-            f"{total_chars} символов"
+            f"{len(dtp_groups)} ДТП, {total_participants} участников, "
+            f"{total_chars} символов (двухуровневый формат)"
         )
-        return f"\nПОЛНЫЕ ДАННЫЕ УЧАСТНИКОВ ({label}, {len(filtered_rows)} строк):\n{full_text}"
+        return f"\nПОЛНЫЕ ДАННЫЕ УЧАСТНИКОВ ({label}, {len(dtp_groups)} ДТП, {total_participants} участников):\n{full_text}"
 
-    # Не вписываемся — сэмплируем
+    # === Этап 4: Сэмплинг ===
     import random
     random.seed(42)  # воспроизводимость
 
@@ -289,58 +414,27 @@ def format_full_data_as_csv(
         f"превышает лимит {_FULL_DATA_MAX_CHARS}, применяем сэмплинг"
     )
 
-    # Размечаем ДТП: смертельные, алкогольные, пешеходные — включаем целиком
-    # Для этого нужно вернуться к карточкам и понять, какие строки важны
-    from collections import Counter
+    # Разделяем на приоритетные и остальные
+    priority_groups = [g for i, g in enumerate(dtp_groups) if i in priority_indices]
+    other_groups = [g for i, g in enumerate(dtp_groups) if i not in priority_indices]
 
-    # Группируем строки по "Дата+Время+Вид ДТП" (ключ ДТП)
-    def _dtp_key(row_list):
-        # Ключ из первых 3 значений: Дата, Время, Вид ДТП
-        return (row_list[0], row_list[1], row_list[2]) if len(row_list) >= 3 else ""
+    # Считаем размер приоритетных (включая заголовок)
+    priority_lines = []
+    priority_participants = 0
+    for group in priority_groups:
+        priority_lines.extend(_group_to_lines(group))
+        priority_participants += len(group["participants"])
+    priority_text = header + "\n".join(priority_lines)
+    remaining_chars = _FULL_DATA_MAX_CHARS - len(header) - 100  # запас
 
-    # Определяем приоритетные ДТП
-    priority_keys = set()
-    for i, row in enumerate(filtered_rows):
-        dtp_key = _dtp_key(row)
-        pog = row[11]   # Погибло
-        ran = row[12]   # Ранено
-        result_mo = row[27]  # Результат МО
-        category = row[21]  # Категория участника
-
-        # Смертельные ДТП
-        if pog and pog not in ("", "0"):
-            priority_keys.add(dtp_key)
-        # ДТП с нетрезвыми участниками
-        if result_mo and result_mo.lower() == "да":
-            priority_keys.add(dtp_key)
-        # ДТП с пешеходами
-        if category and "пешеход" in category.lower():
-            priority_keys.add(dtp_key)
-
-    # Разделяем строки на приоритетные и остальные
-    priority_rows = []
-    other_rows = []
-    for row in filtered_rows:
-        if _dtp_key(row) in priority_keys:
-            priority_rows.append(row)
-        else:
-            other_rows.append(row)
-
-    # Считаем размер приоритетных
-    priority_text = "\n".join(
-        [header_line] + ["; ".join(r) for r in priority_rows]
-    )
-    remaining_chars = _FULL_DATA_MAX_CHARS - len(header_line) - 100  # запас
-
-    if len(priority_text) > remaining_chars:
+    if len(priority_text) > _FULL_DATA_MAX_CHARS:
         # Даже приоритетные не вмещаются — берём только их
         logger.warning(
-            f"Полные данные ({label}): приоритетные строки "
-            f"({len(priority_rows)}) не вмещаются, обрезаем"
+            f"Полные данные ({label}): приоритетные ДТП "
+            f"({len(priority_groups)}) не вмещаются, обрезаем"
         )
-        # Обрезаем до лимита
         lines = priority_text.split("\n")
-        result_lines = [lines[0]]
+        result_lines = [lines[0]]  # заголовок
         current_size = len(lines[0])
         for line in lines[1:]:
             if current_size + len(line) + 1 > _FULL_DATA_MAX_CHARS:
@@ -348,29 +442,37 @@ def format_full_data_as_csv(
             result_lines.append(line)
             current_size += len(line) + 1
         full_text = "\n".join(result_lines)
-        return f"\nПОЛНЫЕ ДАННЫЕ УЧАСТНИКОВ ({label}, сэмплинг, {len(result_lines)-1} строк):\n{full_text}"
+        return f"\nПОЛНЫЕ ДАННЫЕ УЧАСТНИКОВ ({label}, сэмплинг, {len(priority_groups)} ДТП):\n{full_text}"
 
-    # Добавляем случайные строки из остальных до лимита
+    # Добавляем случайные ДТП из остальных до лимита
     space_left = remaining_chars - len(priority_text)
-    avg_row_chars = sum(len("; ".join(r)) for r in other_rows[:100]) / min(len(other_rows), 100) if other_rows else 100
-    sample_size = max(1, int(space_left / max(avg_row_chars, 1)))
-    sampled_others = random.sample(other_rows, min(sample_size, len(other_rows))) if other_rows else []
+    # Средний размер одной группы ДТП (в символах)
+    avg_group_chars = sum(
+        len("\n".join(_group_to_lines(g))) + 1
+        for g in other_groups[:100]
+    ) / min(len(other_groups), 100) if other_groups else 200
+    sample_size = max(1, int(space_left / max(avg_group_chars, 1)))
+    sampled_others = random.sample(other_groups, min(sample_size, len(other_groups))) if other_groups else []
 
-    all_sampled = priority_rows + sampled_others
-    # Сортируем по дате/времени для логичности
-    all_sampled.sort(key=lambda r: (r[0], r[1]))
+    # Объединяем: приоритетные + случайные, сортируем по дате/времени
+    all_sampled = priority_groups + sampled_others
+    all_sampled.sort(key=lambda g: (g["dtp_fields"][0], g["dtp_fields"][1]))  # Дата, Время
 
-    result_lines = [header_line] + ["; ".join(r) for r in all_sampled]
-    full_text = "\n".join(result_lines)
+    result_lines = []
+    sampled_participants = 0
+    for group in all_sampled:
+        result_lines.extend(_group_to_lines(group))
+        sampled_participants += len(group["participants"])
+    full_text = header + "\n".join(result_lines)
 
     logger.info(
         f"Полные данные ({label}): сэмплинг — "
-        f"приоритетных {len(priority_rows)}, "
-        f"случайных {len(sampled_others)}, "
-        f"итого {len(all_sampled)} строк, "
+        f"приоритетных ДТП {len(priority_groups)}, "
+        f"случайных ДТП {len(sampled_others)}, "
+        f"итого {len(all_sampled)} ДТП, {sampled_participants} участников, "
         f"{len(full_text)} символов"
     )
-    return f"\nПОЛНЫЕ ДАННЫЕ УЧАСТНИКОВ ({label}, сэмплинг, {len(all_sampled)} строк):\n{full_text}"
+    return f"\nПОЛНЫЕ ДАННЫЕ УЧАСТНИКОВ ({label}, сэмплинг, {len(all_sampled)} ДТП, {sampled_participants} участников):\n{full_text}"
 
 
 # ============================================================
@@ -667,9 +769,10 @@ def build_paid_summary_prompt(
 
     parts.append(
         f"{metrics_text}\n\n"
-        f"Выше приведена сводная статистика по двум периодам. "
+        f"Выше приведена сводная статистика по двум периодам (текущий и предыдущий). "
         f"Далее следуют полные данные по каждому участнику ДТП "
-        f"(каждая строка = один участник, одно ДТП может иметь несколько строк)."
+        f"только за текущий период в двухуровневом формате: "
+        f"[ДТП] — общие данные ДТП, [Уч.N] — данные участника."
     )
 
     # 2. Полные данные текущего периода
@@ -1058,14 +1161,18 @@ async def get_ai_summary(
         )
 
         current_full_data = format_full_data_as_csv(current_cards, current_label)
-        prev_full_data = ""
-        if prev_cards:
-            prev_full_data = format_full_data_as_csv(prev_cards, prev_label)
+        # Предыдущий период не отправляем полными данными —
+        # он уже покрыт агрегированными метриками в format_metrics_for_prompt.
+        # Это экономит ~50% контекста.
+        logger.info(
+            f"Платный метод: данные текущего = {len(current_full_data)} симв., "
+            f"предыдущий период — только агрегированные метрики"
+        )
 
         prompt = build_paid_summary_prompt(
             comparison, reg_name, current_label, prev_label,
             current_full_data=current_full_data,
-            prev_full_data=prev_full_data,
+            prev_full_data="",
             news_context=news_context,
             clusters_context=clusters_context,
         )
