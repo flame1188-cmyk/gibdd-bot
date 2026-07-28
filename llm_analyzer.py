@@ -46,7 +46,7 @@ _paid_llm_client: httpx.AsyncClient | None = None
 # Мы отправляем полные данные только за текущий период,
 # предыдущий покрывается агрегированными метриками.
 # Лимит оставляет место для: системный промпт + метрики + очаги + новости + ответ.
-_FULL_DATA_MAX_CHARS = 1_000_000  # ~1 млн символов ≈ 250K токенов данных
+_FULL_DATA_MAX_CHARS = 3_500_000  # ~3.5 млн символов (DeepSeek V4 Flash: 1M токенов ≈ 3-4M симв., сэмплинг отключён)
 
 # --- Столбцы уровня ДТП (печатается 1 раз на ДТП) ---
 _DTP_LEVEL_COLUMNS = [
@@ -241,8 +241,12 @@ def _format_dtp_block(
     dtp_fields: list[str],
     dtp_col_names: list[str],
 ) -> str:
-    """Формирует одну строку уровня ДТП: [ДТП] Дата; Время; Вид ДТП; ..."""
+    """Формирует одну строку уровня ДТП: [ДТП] Дата; Время; Вид ДТП; ...
+    Замыкающие пустые поля обрезаются для экономии."""
     cleaned = [_clean_noise(v) for v in dtp_fields]
+    # Обрезаем замыкающие пустые поля
+    while cleaned and cleaned[-1].strip() == "":
+        cleaned.pop()
     return "[ДТП] " + "; ".join(cleaned)
 
 
@@ -251,8 +255,12 @@ def _format_uch_block(
     uch_col_names: list[str],
     participant_num: int,
 ) -> str:
-    """Формирует одну строку уровня участника: [Уч.N] Тип ТС; Категория; ..."""
+    """Формирует одну строку уровня участника: [Уч.N] Тип ТС; Категория; ...
+    Замыкающие пустые поля обрезаются для экономии."""
     cleaned = [_clean_noise(v) for v in uch_fields]
+    # Обрезаем замыкающие пустые поля
+    while cleaned and cleaned[-1].strip() == "":
+        cleaned.pop()
     return f"[Уч.{participant_num}] " + "; ".join(cleaned)
 
 
@@ -771,8 +779,9 @@ def build_paid_summary_prompt(
         f"{metrics_text}\n\n"
         f"Выше приведена сводная статистика по двум периодам (текущий и предыдущий). "
         f"Далее следуют полные данные по каждому участнику ДТП "
-        f"только за текущий период в двухуровневом формате: "
-        f"[ДТП] — общие данные ДТП, [Уч.N] — данные участника."
+        f"за оба периода в двухуровневом формате: "
+        f"[ДТП] — общие данные ДТП, [Уч.N] — данные участника. "
+        f"Сравни оба периода по всем измерениям: нарушения, стаж, типы ТС, погода, время и т.д."
     )
 
     # 2. Полные данные текущего периода
@@ -1161,18 +1170,19 @@ async def get_ai_summary(
         )
 
         current_full_data = format_full_data_as_csv(current_cards, current_label)
-        # Предыдущий период не отправляем полными данными —
-        # он уже покрыт агрегированными метриками в format_metrics_for_prompt.
-        # Это экономит ~50% контекста.
+        # Предыдущий период — тоже полные данные для глубокого сравнения
+        prev_full_data = ""
+        if prev_cards:
+            prev_full_data = format_full_data_as_csv(prev_cards, prev_label)
         logger.info(
             f"Платный метод: данные текущего = {len(current_full_data)} симв., "
-            f"предыдущий период — только агрегированные метрики"
+            f"предыдущего = {len(prev_full_data)} символ."
         )
 
         prompt = build_paid_summary_prompt(
             comparison, reg_name, current_label, prev_label,
             current_full_data=current_full_data,
-            prev_full_data="",
+            prev_full_data=prev_full_data,
             news_context=news_context,
             clusters_context=clusters_context,
         )
