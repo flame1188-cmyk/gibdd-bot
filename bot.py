@@ -3521,6 +3521,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _start_fetching(fake_query, context, period)
         return
 
+    # --- Режим вопрос-ответ по данным аналитики ---
+    # Проверяем ДО частичного парсинга региона, иначе find_region() может
+    # ложно сработать на словах вопроса (порог совпадения всего 30 баллов).
+    if context.user_data.get("qa_mode") and is_any_llm_available():
+        comparison = context.user_data.get("analytics_comparison")
+        reg_name = context.user_data.get("analytics_reg_name", "")
+        current_label = context.user_data.get("analytics_current_label", "")
+        prev_label = context.user_data.get("analytics_prev_label", "")
+        qa_provider = context.user_data.get("qa_llm_provider", "free")
+
+        if comparison:
+            await _handle_analytics_question(
+                update, context, user_text,
+                comparison, reg_name, current_label, prev_label,
+                llm_provider=qa_provider,
+            )
+            return
+
     # Не удалось распознать полностью — пробуем частичный парсинг
     regions = await _load_regions_if_needed(context)
 
@@ -3555,22 +3573,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Или используйте /dtp для выбора через кнопки."
         )
         return
-
-    # --- Режим вопрос-ответ по данным аналитики ---
-    if context.user_data.get("qa_mode") and is_any_llm_available():
-        comparison = context.user_data.get("analytics_comparison")
-        reg_name = context.user_data.get("analytics_reg_name", "")
-        current_label = context.user_data.get("analytics_current_label", "")
-        prev_label = context.user_data.get("analytics_prev_label", "")
-        qa_provider = context.user_data.get("qa_llm_provider", "free")
-
-        if comparison:
-            await _handle_analytics_question(
-                update, context, user_text,
-                comparison, reg_name, current_label, prev_label,
-                llm_provider=qa_provider,
-            )
-            return
 
     # Ничего не распознано — подсказка
     await update.message.reply_text(
