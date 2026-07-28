@@ -1441,18 +1441,22 @@ async def _do_llm_request(
 
     message = data["choices"][0]["message"]
     content = message.get("content", "") or ""
-    reasoning = message.get("reasoning_content", "") or ""
 
-    # Если content пустой — пробуем извлечь ответ из reasoning_content
+    # reasoning_content — формат GLM/ZhipuAI
+    # reasoning — формат DeepSeek (AItunnel)
+    reasoning = (message.get("reasoning_content", "") or "") or (message.get("reasoning", "") or "")
+    reasoning_source = "reasoning_content" if message.get("reasoning_content") else ("reasoning" if message.get("reasoning") else "")
+
+    # Если content пустой — пробуем извлечь ответ из reasoning/reasoning_content
     if not content and reasoning:
         logger.warning(
-            f"LLM вернул пустой content, но есть reasoning_content ({len(reasoning)} симв.). "
+            f"LLM вернул пустой content, но есть {reasoning_source} ({len(reasoning)} симв.). "
             f"Пытаюсь извлечь ответ..."
         )
         paragraphs = [p.strip() for p in reasoning.split("\n") if p.strip()]
         if paragraphs:
             content = "\n".join(paragraphs[-5:]) if len(paragraphs) > 5 else "\n".join(paragraphs)
-            logger.info(f"Извлечён ответ из reasoning: {len(content)} симв.")
+            logger.info(f"Извлечён ответ из {reasoning_source}: {len(content)} симв.")
 
     if not content:
         msg_keys = list(message.keys())
