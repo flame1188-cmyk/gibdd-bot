@@ -127,13 +127,17 @@ def parse_card_to_row(card: dict[str, Any]) -> dict[str, str]:
 
     # --- Поля верхнего уровня карточки (не вложенные) ---
     simple_fields = [
-        "empt_number", "date_dtp", "time", "coord_w", "coord_l",
+        "empt_number", "kart_id", "date_dtp", "time", "coord_w", "coord_l",
         "dtpv", "k_ts", "k_uch", "pog", "ran", "s_dtp",
         "district", "house", "km", "m", "np", "street",
         "dor", "dor_z", "dor_k", "k_ul",
     ]
     for field in simple_fields:
         row[field] = _safe_str(card.get(field, ""))
+
+    # Если empt_number пустой — используем kart_id как номер ДТП
+    if not row["empt_number"]:
+        row["empt_number"] = _safe_str(card.get("kart_id", ""))
 
     # --- dor_usl (условия дороги) ---
     dor_usl = card.get("dor_usl", {}) or {}
@@ -273,6 +277,13 @@ def build_file1_data(cards: list[dict[str, Any]]) -> list[dict[str, str]]:
 
     rows = []
     for idx, card in enumerate(cards, start=1):
+        # Отладка: логируем первую карточку
+        if idx == 1:
+            logger.info(
+                f"build_file1_data: card keys={list(card.keys())[:20]}, "
+                f"empt_number={card.get('empt_number', '<MISSING>')!r}, "
+                f"kart_id={card.get('kart_id', '<MISSING>')!r}"
+            )
         raw_row = parse_card_to_row(card)
 
         # Пересобираем словарь с правильными ключами (названия колонок)
@@ -451,7 +462,7 @@ def _parse_participant(
     # --- Категория и значение дороги ---
     row["Категория дороги"] = _safe_str(card.get("dor_k", ""))
     row["Значение дороги"] = _safe_str(card.get("dor_z", ""))
-    row["Номер СтатГИБДД"] = _safe_str(card.get("empt_number", ""))
+    row["Номер СтатГИБДД"] = _safe_str(card.get("kart_id", ""))
 
     # --- Данные ТС (если есть — для водителей и пассажиров) ---
     if vehicle is not None:
