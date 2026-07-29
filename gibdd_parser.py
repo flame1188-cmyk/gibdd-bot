@@ -458,7 +458,7 @@ def _parse_participant(
     # --- Категория и значение дороги ---
     row["Категория дороги"] = _safe_str(card.get("dor_k", ""))
     row["Значение дороги"] = _safe_str(card.get("dor_z", ""))
-    row["Номер СтатГИБДД"] = _safe_str(card.get("kart_id", ""))
+    row["Номер СтатГИБДД"] = _safe_str(card.get("empt_number", ""))
 
     # --- Данные ТС (если есть — для водителей и пассажиров) ---
     if vehicle is not None:
