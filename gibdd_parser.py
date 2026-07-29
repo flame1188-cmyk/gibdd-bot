@@ -60,7 +60,7 @@ def _decimal_to_dms(decimal_str: str) -> tuple[str, str, str]:
 
 # Маппинг полей API → названия колонок Excel (файл 1)
 FILE1_COLUMNS = [
-    ("empt_number", "Номер ДТП"),
+    ("kart_id", "Номер ДТП"),
     ("date_dtp", "Дата ДТП"),
     ("time", "Время ДТП"),
     ("coord_w", "Широта"),
@@ -390,7 +390,7 @@ def _parse_participant(
 
     # --- Общие поля ДТП ---
     row["№"] = str(row_number)
-    row["Номер"] = _safe_str(card.get("empt_number", ""))
+    row["Номер"] = _safe_str(card.get("kart_id", ""))
     row["Дата"] = _safe_str(card.get("date_dtp", ""))
     row["Время"] = _safe_str(card.get("time", ""))
     row["Вид ДТП"] = _safe_str(card.get("dtpv", ""))
@@ -451,7 +451,7 @@ def _parse_participant(
     # --- Категория и значение дороги ---
     row["Категория дороги"] = _safe_str(card.get("dor_k", ""))
     row["Значение дороги"] = _safe_str(card.get("dor_z", ""))
-    row["Номер СтатГИБДД"] = _safe_str(card.get("kart_id", ""))
+    row["Номер СтатГИБДД"] = _safe_str(card.get("empt_number", ""))
 
     # --- Данные ТС (если есть — для водителей и пассажиров) ---
     if vehicle is not None:
