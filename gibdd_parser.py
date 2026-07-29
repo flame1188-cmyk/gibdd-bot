@@ -135,10 +135,6 @@ def parse_card_to_row(card: dict[str, Any]) -> dict[str, str]:
     for field in simple_fields:
         row[field] = _safe_str(card.get(field, ""))
 
-    # Если empt_number пустой — используем kart_id как номер ДТП
-    if not row["empt_number"]:
-        row["empt_number"] = _safe_str(card.get("kart_id", ""))
-
     # --- dor_usl (условия дороги) ---
     dor_usl = card.get("dor_usl", {}) or {}
     row["s_pch"] = _safe_str(dor_usl.get("s_pch", ""))
